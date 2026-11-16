@@ -1,0 +1,390 @@
+//! Example: decode cross-language Python results, including ones that carry a
+//! pickle5 section.
+//!
+//! Ray's Python serializer writes a 9-byte header whose integer field records
+//! only the length of the msgpack part. When a return value cannot be
+//! represented in msgpack, msgpack holds a placeholder index and the real
+//! object goes into a pickle5 section appended after the msgpack part, so the
+//! declared length is smaller than the remaining bytes. Rust cannot decode
+//! that section; such a value must come back as `RayError::Serialization`.
+//!
+//! The cluster mode (argv[1] = "cluster") runs six checks:
+//!   1. return_list → a msgpack array with the expected elements
+//!   2. return_custom_object(7) → Err(RayError::Serialization)
+//!   3. return_list_with_custom_object(3) → Err(RayError::Serialization)
+//!   4. the raw bytes of that ref split into msgpack part + a tail > 0
+//!   5. Rust put/get and put_xlang/get_value still round-trip
+//!   6. a normal Python call still works after the rejections
+//!
+//! The local mode (argv[1] = "local") runs the Rust round-trip of check 5 plus
+//! one check of its own: a C++/Rust driver's local mode runs tasks in-process
+//! through a C++ function descriptor (`local_mode_task_submitter.cc`), so
+//! Python functions cannot run there and `task_call_python` returns the
+//! in-process `nil + [3, "unknown function: ..."]` error instead of a
+//! cross-language payload. Checks 1-4 and 6 need the cluster mode.
+//!
+//! Environment for the cluster mode: RAY_ADDRESS, RAY_NODE_IP, RAY_WORKER_SO.
+
+use rayrust::prelude::*;
+
+/// Python module holding the test tasks; the worker must be able to import it.
+const PYTHON_MODULE: &str = "rayrust_test";
+
+/// Length of the header Ray puts in front of a cross-language payload.
+const XLANG_HEADER_LEN: usize = 9;
+
+/// Directory of PYTHON_MODULE, passed to the worker through runtime_env.
+fn python_module_dir() -> String {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/python");
+    let path = std::fs::canonicalize(dir).expect("canonicalize the Python test module directory");
+    path.to_str()
+        .expect("the Python module path is valid UTF-8")
+        .to_string()
+}
+
+/// Read the msgpack integer the 9-byte header starts with.
+///
+/// Written out here so the check reads the payload the same way Python's
+/// `split_buffer` does, independently of the library's own header parsing.
+fn declared_msgpack_len(data: &[u8]) -> usize {
+    assert!(
+        data.len() >= XLANG_HEADER_LEN,
+        "the payload is {} bytes, shorter than the {} byte header",
+        data.len(),
+        XLANG_HEADER_LEN
+    );
+    match data[0] {
+        // 正 fixint
+        v if v <= 0x7f => v as usize,
+        // uint8
+        0xcc => data[1] as usize,
+        // uint16
+        0xcd => u16::from_be_bytes([data[1], data[2]]) as usize,
+        // uint32
+        0xce => u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize,
+        other => panic!(
+            "the payload starts with msgpack marker {:#04x}, not a length",
+            other
+        ),
+    }
+}
+
+/// Connect in the mode named on the command line.
+fn connect(mode: &str) -> Ray {
+    match mode {
+        "local" => {
+            println!("Mode: local");
+            match Ray::local() {
+                Ok(ray) => {
+                    println!("✓ Ray initialized (local mode)");
+                    ray
+                }
+                Err(e) => {
+                    eprintln!("✗ Failed to init Ray (local mode): {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        "cluster" => {
+            let address =
+                std::env::var("RAY_ADDRESS").unwrap_or_else(|_| "192.168.42.141:6379".to_string());
+            let node_ip =
+                std::env::var("RAY_NODE_IP").unwrap_or_else(|_| "192.168.42.106".to_string());
+            let worker_so = std::env::var("RAY_WORKER_SO").unwrap_or_else(|_| {
+                eprintln!("ERROR: RAY_WORKER_SO not set. Build the worker first:");
+                eprintln!("  cargo build --release -p rayrust-example-worker");
+                std::process::exit(1);
+            });
+            let python_dir = python_module_dir();
+            println!("Mode: cluster");
+            println!("Address: {}", address);
+            println!("Node IP: {}", node_ip);
+            println!("Worker .so: {}", worker_so);
+            println!("Python module dir: {}", python_dir);
+
+            let runtime_env = format!(r#"{{"env_vars": {{"PYTHONPATH": "{}"}}}}"#, python_dir);
+            let config = RayConfig::new(&address)
+                .node_ip(&node_ip)
+                .code_search_path(vec![worker_so])
+                .runtime_env(runtime_env);
+
+            match Ray::connect(&config) {
+                Ok(ray) => {
+                    println!("✓ Ray initialized (cluster mode)");
+                    ray
+                }
+                Err(e) => {
+                    eprintln!("✗ Failed to init Ray: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        other => {
+            eprintln!(
+                "ERROR: unknown mode {:?}; pass \"local\" or \"cluster\"",
+                other
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Check 1: a value msgpack can represent comes back as an array.
+fn check_plain_list(ray: &Ray) {
+    println!("\n--- 1. return_list → msgpack array ---");
+    let obj_ref = ray
+        .task_call_python(PYTHON_MODULE, "return_list", &[], &[])
+        .expect("submit return_list()");
+    println!("  ray.{}.return_list() → {}", PYTHON_MODULE, obj_ref.id_hex());
+
+    let value = match obj_ref.get_value() {
+        Ok(value) => value,
+        Err(e) => panic!("return_list() did not decode: {}", e),
+    };
+    let items = value
+        .as_array()
+        .unwrap_or_else(|| panic!("return_list() decoded to {:?}, not an array", value));
+    let numbers: Vec<i64> = items.iter().map(|v| v.as_i64().expect("an integer element")).collect();
+    assert_eq!(numbers, vec![1, 2, 3, 4, 5], "return_list() returned {:?}", numbers);
+    println!("  value → {:?} ✓", numbers);
+
+    check_raw_bytes(&obj_ref, 0);
+}
+
+/// Check 4: split the raw payload on the declared length.
+///
+/// `expected_tail` is 0 for a plain msgpack payload and greater than 0 for one
+/// that carries a pickle5 section.
+fn check_raw_bytes(obj_ref: &ObjectRef<()>, expected_tail: u64) {
+    let raw = obj_ref.get_raw_bytes().expect("get_raw_bytes()");
+    let declared = declared_msgpack_len(&raw);
+    let after_header = raw.len() - XLANG_HEADER_LEN;
+    let tail = after_header
+        .checked_sub(declared)
+        .unwrap_or_else(|| {
+            panic!(
+                "the header declares {} msgpack bytes but only {} follow it",
+                declared, after_header
+            )
+        });
+    println!(
+        "  raw bytes: {} total, {} header, {} msgpack, {} tail; header first bytes {:02x?}",
+        raw.len(),
+        XLANG_HEADER_LEN,
+        declared,
+        tail,
+        &raw[..XLANG_HEADER_LEN]
+    );
+    if expected_tail > 0 {
+        assert!(
+            tail > 0,
+            "the payload carries no pickle5 section, so it cannot show the reported shape"
+        );
+    } else {
+        assert_eq!(tail, 0, "the payload carries an unexpected {} byte tail", tail);
+    }
+}
+
+/// Check 2: a value that only exists in the pickle5 section is rejected.
+fn check_custom_object(ray: &Ray) {
+    println!("\n--- 2. return_custom_object(7) → rejected ---");
+    let arg = serialize(&7i64).expect("serialize the argument");
+    let obj_ref = ray
+        .task_call_python(PYTHON_MODULE, "return_custom_object", &[&arg], &[])
+        .expect("submit return_custom_object(7)");
+    println!(
+        "  ray.{}.return_custom_object(7) → {}",
+        PYTHON_MODULE,
+        obj_ref.id_hex()
+    );
+
+    match obj_ref.get_value() {
+        Ok(value) => panic!(
+            "return_custom_object(7) decoded to {:?}; the value lives in the pickle5 section and has no msgpack form",
+            value
+        ),
+        Err(RayError::Serialization(msg)) => {
+            // Deliberate exception to the "match the error variant only" rule: a
+            // msgpack type mismatch also returns Serialization (casting an
+            // integer payload to Vec<i64> does), so the variant cannot tell the
+            // pickle5 rejection from a decode failure. The message text is that
+            // difference, and the unit tests assert the same text.
+            assert!(
+                msg.contains("pickle5"),
+                "get_value() failed with a msgpack decode error instead of the pickle5 rejection: {}",
+                msg
+            );
+            println!("  get_value() → Err(RayError::Serialization)");
+            println!("  message: {}", msg);
+        }
+        Err(other) => panic!(
+            "return_custom_object(7) returned {:?}, expected RayError::Serialization",
+            other
+        ),
+    }
+
+    check_raw_bytes(&obj_ref, 1);
+}
+
+/// Check 3: a container holding such a value is rejected too, and does not
+/// come back as a list of integers.
+fn check_list_with_custom_object(ray: &Ray) {
+    println!("\n--- 3. return_list_with_custom_object(3) → rejected ---");
+    let arg = serialize(&3i64).expect("serialize the argument");
+    let obj_ref = ray
+        .task_call_python(PYTHON_MODULE, "return_list_with_custom_object", &[&arg], &[])
+        .expect("submit return_list_with_custom_object(3)");
+    println!(
+        "  ray.{}.return_list_with_custom_object(3) → {}",
+        PYTHON_MODULE,
+        obj_ref.id_hex()
+    );
+
+    match obj_ref.get_value() {
+        Ok(value) => panic!(
+            "return_list_with_custom_object(3) decoded to {:?}; the element lives in the pickle5 section",
+            value
+        ),
+        Err(RayError::Serialization(msg)) => {
+            // Same exception to the "match the error variant only" rule as in
+            // check 2: only the message tells the pickle5 rejection from a
+            // msgpack type mismatch.
+            assert!(
+                msg.contains("pickle5"),
+                "get_value() failed with a msgpack decode error instead of the pickle5 rejection: {}",
+                msg
+            );
+            println!("  get_value() → Err(RayError::Serialization)");
+            println!("  message: {}", msg);
+        }
+        Err(other) => panic!(
+            "return_list_with_custom_object(3) returned {:?}, expected RayError::Serialization",
+            other
+        ),
+    }
+}
+
+/// Local mode: a Python task never reaches a Python worker, so its payload is
+/// the in-process error, not a cross-language value.
+///
+/// The local-mode task submitter always builds a C++ function descriptor
+/// (`local_mode_task_submitter.cc`) and the in-process executor answers an
+/// unknown function with `nil + [3, "unknown function: ..."]`
+/// (`task_executor.cc:48`). Neither shape carries a 9-byte header, so this run
+/// proves that a local run can produce no pickle5 payload at all.
+fn check_local_mode_python_task(ray: &Ray) {
+    println!("\n--- local mode: task_call_python returns the in-process error ---");
+    let obj_ref = ray
+        .task_call_python(PYTHON_MODULE, "return_list", &[], &[])
+        .expect("submit return_list() in local mode");
+
+    let raw = obj_ref.get_raw_bytes().expect("get_raw_bytes()");
+    println!(
+        "  raw bytes ({} total): {:02x?} / {:?}",
+        raw.len(),
+        raw,
+        String::from_utf8_lossy(&raw)
+    );
+    assert!(
+        raw.len() >= 3 && raw[..3] == [0xc0, 0x92, 0x03],
+        "expected the local-mode error nil + [3, \"unknown function: ...\"], got {} bytes starting with {:02x?}",
+        raw.len(),
+        &raw[..raw.len().min(3)]
+    );
+
+    let value = obj_ref
+        .get_value()
+        .expect("get_value() of the local-mode error");
+    assert!(
+        value.is_nil(),
+        "the local-mode error decoded to {:?}, not Nil; raw bytes {:02x?}",
+        value,
+        raw
+    );
+    println!("  get_value() → Nil ✓ (no cross-language payload exists in local mode)");
+}
+
+/// Check 5: values Rust wrote itself still round-trip through both paths.
+fn check_rust_roundtrip(ray: &Ray) {
+    println!("\n--- 5. Rust put/get is unaffected ---");
+    let obj = ray.put(&42i32).expect("put(42i32)");
+    let value: i32 = obj.get().expect("get() of put(42i32)");
+    assert_eq!(value, 42, "put/get returned {}", value);
+    println!("  put(42i32) → get() → {} ✓", value);
+
+    let obj = ray.put(&vec![1i64, 2, 3]).expect("put(vec![1, 2, 3])");
+    let value = obj.get_value().expect("get_value() of put(vec![1, 2, 3])");
+    let numbers: Vec<i64> = value
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|v| v.as_i64().expect("an integer element"))
+        .collect();
+    assert_eq!(numbers, vec![1, 2, 3], "put/get returned {:?}", numbers);
+    println!("  put(vec![1, 2, 3]) → get_value() → {:?} ✓", numbers);
+
+    let obj = ray.put_xlang(&vec![7i64, 8, 9]).expect("put_xlang(vec![7, 8, 9])");
+    let value = obj
+        .get_value()
+        .expect("get_value() of put_xlang(vec![7, 8, 9])");
+    let numbers: Vec<i64> = value
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|v| v.as_i64().expect("an integer element"))
+        .collect();
+    assert_eq!(numbers, vec![7, 8, 9], "put_xlang/get_value returned {:?}", numbers);
+    println!("  put_xlang(vec![7, 8, 9]) → get_value() → {:?} ✓", numbers);
+}
+
+/// Check 6: a rejection does not leave the process unable to talk to Ray.
+fn check_after_rejections(ray: &Ray) {
+    println!("\n--- 6. a normal call still works after the rejections ---");
+    let arg_a = serialize(&2i64).expect("serialize the first argument");
+    let arg_b = serialize(&40i64).expect("serialize the second argument");
+    let obj_ref = ray
+        .task_call_python(PYTHON_MODULE, "add", &[&arg_a, &arg_b], &[])
+        .expect("submit add(2, 40)");
+    let value: i64 = obj_ref.cast().get().expect("get() of add(2, 40)");
+    assert_eq!(value, 42, "add(2, 40) returned {}", value);
+    println!("  ray.{}.add(2, 40) → {} ✓", PYTHON_MODULE, value);
+
+    let obj_ref = ray
+        .task_call_python(PYTHON_MODULE, "return_dict", &[], &[])
+        .expect("submit return_dict()");
+    let value = obj_ref.get_value().expect("get_value() of return_dict()");
+    let entries = value
+        .as_map()
+        .unwrap_or_else(|| panic!("return_dict() decoded to {:?}, not a map", value));
+    println!("  ray.{}.return_dict() → {} map entries ✓", PYTHON_MODULE, entries.len());
+    let a = entries
+        .iter()
+        .find(|(k, _)| k.as_str() == Some("a"))
+        .map(|(_, v)| v)
+        .unwrap_or_else(|| panic!("return_dict() has no key \"a\""));
+    assert_eq!(a.as_i64(), Some(1), "return_dict()[\"a\"] is {:?}", a);
+}
+
+fn main() {
+    let mode = std::env::args().nth(1).unwrap_or_else(|| "local".to_string());
+    println!("=== Ray Cross-Language Decode ===");
+
+    let ray = connect(&mode);
+
+    if mode == "local" {
+        // C++/Rust driver 的本地模式固定用 C++ 函数描述符提交任务，Python 函数
+        // 在那里跑不了，所以本地模式只能验证「产生不了跨语言载荷」这一点。
+        check_local_mode_python_task(&ray);
+        check_rust_roundtrip(&ray);
+    } else {
+        check_plain_list(&ray);
+        check_custom_object(&ray);
+        check_list_with_custom_object(&ray);
+        check_rust_roundtrip(&ray);
+        check_after_rejections(&ray);
+    }
+
+    println!("\n--- Shutdown ---");
+    drop(ray);
+    println!("✓ All cross-language decode checks passed");
+}
