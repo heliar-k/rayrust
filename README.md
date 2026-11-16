@@ -259,7 +259,7 @@ rayrust follows idiomatic Rust patterns, not C-in-Rust:
 
 ### RAII Context — `Ray`
 
-All operations are methods on a `Ray` context object. `Drop` automatically calls `shutdown()` — impossible to forget cleanup, even on panic. `Ray` is `!Clone` (pass `&Ray` to share).
+All operations are methods on a `Ray` context object. All handles in a process share one runtime, and `shutdown()` runs when the last handle is dropped — impossible to forget cleanup, even on panic. A second `connect` with the same config returns the runtime that is already live instead of initializing it again; a different config is refused with `RayError::Runtime`. `Ray` is `!Clone` (pass `&Ray` to share).
 
 ```rust
 let ray = Ray::connect(&config)?;  // init
