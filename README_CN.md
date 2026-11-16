@@ -10,7 +10,8 @@ Ray 的 Rust SDK —— 通过 FFI 封装 Ray C++ SDK，提供地道的 Rust API
 |---|:---:|:---:|
 | `Ray::connect` / `drop`（RAII 生命周期管理） | ✅ | ✅ |
 | `put` / `get` / `wait` | ✅ | ✅ |
-| `get_many`（批量获取） | ✅ | ✅ |
+| `get_many` / `get_many_timeout`（批量获取，可带期限） | ✅ | ✅ |
+| `get_many_async` / `get_many_timeout_async` / `wait_async`（批量 `Get` 与 `Wait` 跑在 tokio blocking pool 上） | ✅ | ✅ |
 | `#[remote]` 同步任务 | ✅ | ✅ |
 | `#[remote]` 异步任务（持久化 runtime） | ✅ | ✅ |
 | `#[actor]` 宏（自动生成 factory + 方法） | ✅ | ✅ |

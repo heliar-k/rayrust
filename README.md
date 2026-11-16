@@ -12,7 +12,8 @@ rayrust wraps the Ray C++ SDK (`libray_api.so`) via a C ABI layer, providing idi
 |---|:---:|:---:|
 | `Ray::connect` / `drop` (RAII lifecycle) | ✅ | ✅ |
 | `put` / `get` / `wait` | ✅ | ✅ |
-| `get_many` (batch get) | ✅ | ✅ |
+| `get_many` / `get_many_timeout` (batch get, optional deadline) | ✅ | ✅ |
+| `get_many_async` / `get_many_timeout_async` / `wait_async` (batch `Get` and `Wait` on the tokio blocking pool) | ✅ | ✅ |
 | `#[remote]` sync task | ✅ | ✅ |
 | `#[remote]` async task (persistent runtime) | ✅ | ✅ |
 | `#[actor]` macro (auto-generate factory + methods) | ✅ | ✅ |

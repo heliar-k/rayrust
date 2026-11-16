@@ -211,7 +211,10 @@ impl Ray {
     }
 
     /// Wait for objects to be locally available.
-    pub fn wait<T: Clone>(
+    ///
+    /// `timeout_ms` 是 `-1`（永久等待）或非负的毫秒数，其他值返回
+    /// `RayError::Ffi`。
+    pub fn wait<T>(
         &self,
         object_refs: &[ObjectRef<T>],
         num_objects: usize,
@@ -220,12 +223,75 @@ impl Ray {
         wait(object_refs, num_objects, timeout_ms)
     }
 
+    /// 异步等待一组引用在本地就绪。
+    ///
+    /// 一次 `ray_wait` 跑在 tokio blocking pool 上，等待的 tokio 工作线程不被占用。
+    /// `timeout` 限制整次等待。
+    pub async fn wait_async<T>(
+        &self,
+        object_refs: &[ObjectRef<T>],
+        num_objects: usize,
+        timeout: std::time::Duration,
+    ) -> WaitResult<T>
+    where
+        T: Send + 'static,
+    {
+        let refs: Vec<ObjectRef<T>> = object_refs.to_vec();
+        let timeout_ms = duration_to_ms(timeout);
+        tokio::task::spawn_blocking(move || wait(&refs, num_objects, timeout_ms))
+            .await
+            .map_err(|e| RayError::Runtime(format!("wait join error: {}", e)))?
+    }
+
     /// Get multiple objects from the object store (blocks until all ready).
     pub fn get_many<T: serde::de::DeserializeOwned>(
         &self,
         refs: &[ObjectRef<T>],
     ) -> Result<Vec<T>, RayError> {
         get_many(refs)
+    }
+
+    /// 批量取，超过 `timeout_ms` 毫秒就返回。
+    ///
+    /// `timeout_ms` 是 `-1`（永久等待）或非负的毫秒数，其他值返回
+    /// `RayError::Ffi`。
+    pub fn get_many_timeout<T: serde::de::DeserializeOwned>(
+        &self,
+        refs: &[ObjectRef<T>],
+        timeout_ms: i32,
+    ) -> Result<Vec<T>, RayError> {
+        get_many_with_timeout(refs, timeout_ms)
+    }
+
+    /// 异步批量取。
+    ///
+    /// 默认期限 300 秒，自定义期限用 `get_many_timeout_async`。整批是 blocking
+    /// pool 上的一次 `Get`。
+    pub async fn get_many_async<T>(&self, refs: &[ObjectRef<T>]) -> Result<Vec<T>, RayError>
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+    {
+        self.get_many_timeout_async(refs, std::time::Duration::from_secs(300))
+            .await
+    }
+
+    /// 异步批量取，带自定义期限。
+    ///
+    /// Ray 在一次 `Get` 内部限制整批的等待，期限覆盖每一个元素。与
+    /// `get_timeout_async` 一样，期限从 blocking pool 的线程接到这次调用时开始计时。
+    pub async fn get_many_timeout_async<T>(
+        &self,
+        refs: &[ObjectRef<T>],
+        timeout: std::time::Duration,
+    ) -> Result<Vec<T>, RayError>
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+    {
+        let refs: Vec<ObjectRef<T>> = refs.to_vec();
+        let timeout_ms = duration_to_ms(timeout);
+        tokio::task::spawn_blocking(move || get_many_with_timeout(&refs, timeout_ms))
+            .await
+            .map_err(|e| RayError::Runtime(format!("get_many join error: {}", e)))?
     }
 
     // ── Tasks ─────────────────────────────────────────────────
@@ -565,20 +631,43 @@ where
     Ok(ObjectRef::from_id(id))
 }
 
+/// Ray 的 `Get` / `Wait` 只接受 `-1` 或非负的毫秒期限，其他负值会让内部的
+/// `RAY_CHECK` 终止整个进程，必须在进入 FFI 之前拒绝。
+fn validate_timeout(timeout_ms: i32) -> Result<(), RayError> {
+    if timeout_ms < -1 {
+        return Err(RayError::Ffi(format!(
+            "timeout_ms must be -1 (wait forever) or non-negative, got {}",
+            timeout_ms
+        )));
+    }
+    Ok(())
+}
+
+/// Convert a duration to the millisecond timeout Ray's `Get` takes.
+///
+/// Capped at `i32::MAX` (about 24 days). A `Duration` is never negative, so the
+/// result can never become Ray's -1, which means wait forever.
+pub(crate) fn duration_to_ms(timeout: std::time::Duration) -> i32 {
+    timeout.as_millis().min(i32::MAX as u128) as i32
+}
+
 /// Wait for objects to be locally available.
 ///
 /// # Arguments
 /// * `object_refs` - References to wait for.
 /// * `num_objects` - Minimum number of objects to wait for.
-/// * `timeout_ms` - Timeout in milliseconds. -1 for infinite.
+/// * `timeout_ms` - Timeout in milliseconds. -1 for infinite, other negative
+///   values are rejected with `RayError::Ffi`.
 ///
 /// # Returns
 /// A tuple of (ready, unready) object references.
-pub(crate) fn wait<T: Clone>(
+pub(crate) fn wait<T>(
     object_refs: &[ObjectRef<T>],
     num_objects: usize,
     timeout_ms: i32,
 ) -> WaitResult<T> {
+    validate_timeout(timeout_ms)?;
+
     let ids: Vec<RayBytes> = object_refs
         .iter()
         .map(|r| RayBytes {
@@ -634,6 +723,8 @@ pub(crate) fn get_raw(id: &[u8]) -> Result<Vec<u8>, RayError> {
 
 /// Get raw bytes from the object store by binary ID with timeout.
 pub(crate) fn get_raw_timeout(id: &[u8], timeout_ms: i32) -> Result<Vec<u8>, RayError> {
+    validate_timeout(timeout_ms)?;
+
     // Clear first so the kind read below belongs to this call.
     rayrust_sys::clear_error();
     let bytes = unsafe {
@@ -1266,34 +1357,78 @@ pub(crate) fn cancel(obj_id: &[u8], force_kill: bool, recursive: bool) -> Result
     Ok(())
 }
 
-/// Get multiple objects from the object store.
-/// Blocks until all objects are available.
-pub(crate) fn get_many<T: serde::de::DeserializeOwned>(refs: &[ObjectRef<T>]) -> Result<Vec<T>, RayError> {
+/// `ray_get_many` 分配的 `ray_bytes_t` 数组的守卫。
+///
+/// C 侧先把数组与每个元素都填好才返回，因此数组与全部 buffer 必须一起释放，
+/// 包括解码到一半失败的那条路径。
+struct CBytesArrayGuard {
+    array: *mut RayBytes,
+    count: usize,
+}
+
+impl CBytesArrayGuard {
+    fn from_raw(array: *mut RayBytes, count: usize) -> Result<Self, RayError> {
+        if array.is_null() {
+            Err(ffi_error("ray_get_many"))
+        } else {
+            Ok(CBytesArrayGuard { array, count })
+        }
+    }
+
+    fn get(&self, index: usize) -> &RayBytes {
+        debug_assert!(index < self.count, "index {} outside the array", index);
+        unsafe { &*self.array.add(index) }
+    }
+}
+
+impl Drop for CBytesArrayGuard {
+    fn drop(&mut self) {
+        unsafe { rayrust_sys::ray_free_bytes_array(self.array, self.count) }
+    }
+}
+
+/// 批量取，超过 `timeout_ms` 毫秒就返回。
+///
+/// `timeout_ms` 是 `-1`（永久等待）或非负的毫秒数，其他值返回 `RayError::Ffi`。
+pub(crate) fn get_many_with_timeout<T: serde::de::DeserializeOwned>(
+    refs: &[ObjectRef<T>],
+    timeout_ms: i32,
+) -> Result<Vec<T>, RayError> {
+    validate_timeout(timeout_ms)?;
+
+    // 空 slice 的 as_ptr() 得到的是非空却不指向任何元素的指针，交给 C 侧做 0
+    // 个元素的 malloc 没有意义。
+    if refs.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let ids: Vec<RayBytes> = refs.iter().map(|r| RayBytes {
         data: r.id().as_ptr() as *const std::os::raw::c_char,
         len: r.id().len(),
     }).collect();
 
-    let result = unsafe { rayrust_sys::ray_get_many(ids.as_ptr(), ids.len(), -1) };
-    if result.is_null() {
-        return Err(ffi_error("ray_get_many"));
-    }
+    let array = unsafe { rayrust_sys::ray_get_many(ids.as_ptr(), ids.len(), timeout_ms) };
+    let array = CBytesArrayGuard::from_raw(array, refs.len())?;
 
     let mut results = Vec::with_capacity(refs.len());
-    for i in 0..refs.len() {
-        let bytes = unsafe { &*result.add(i) };
+    for (i, obj_ref) in refs.iter().enumerate() {
+        let bytes = array.get(i);
         if bytes.data.is_null() {
-            unsafe { rayrust_sys::ray_free_bytes_array(result, refs.len()) };
             return Err(RayError::ObjectNotFound(format!("object {} not found", i)));
         }
         let slice = unsafe { std::slice::from_raw_parts(bytes.data as *const u8, bytes.len) };
-        let val = if refs[i].is_xlang {
+        let val = if obj_ref.is_xlang {
             crate::serialize::deserialize_xlang(slice)?
         } else {
             crate::serialize::deserialize(slice)?
         };
         results.push(val);
     }
-    unsafe { rayrust_sys::ray_free_bytes_array(result, refs.len()) };
     Ok(results)
+}
+
+/// Get multiple objects from the object store.
+/// Blocks until all objects are available.
+pub(crate) fn get_many<T: serde::de::DeserializeOwned>(refs: &[ObjectRef<T>]) -> Result<Vec<T>, RayError> {
+    get_many_with_timeout(refs, -1)
 }
