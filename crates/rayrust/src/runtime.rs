@@ -5,7 +5,7 @@
 
 use std::os::raw::c_int;
 
-use rayrust_sys::{self, build_args_array, to_cstring, CBytesGuard, RayBytes};
+use rayrust_sys::{self, build_args_array, to_cstring, CBytesGuard, ErrorKind, RayBytes};
 
 use crate::error::RayError;
 use crate::object_ref::ObjectRef;
@@ -14,18 +14,33 @@ use crate::serialize::serialize;
 /// Result of `wait()`: (ready, unready) object references.
 pub type WaitResult<T> = Result<(Vec<ObjectRef<T>>, Vec<ObjectRef<T>>), RayError>;
 
+/// Map the class Ray recorded for a failure onto a `RayError` variant.
+fn error_from_kind(kind: ErrorKind, msg: String) -> RayError {
+    match kind {
+        ErrorKind::None | ErrorKind::Generic | ErrorKind::Ray => RayError::Ffi(msg),
+        ErrorKind::Actor => RayError::Actor(msg),
+        ErrorKind::Task => RayError::Task(msg),
+        ErrorKind::Worker => RayError::Worker(msg),
+        ErrorKind::Unreconstructable => RayError::Unreconstructable(msg),
+        ErrorKind::Timeout => RayError::Timeout(msg),
+    }
+}
+
 /// Build an FFI error with the C-side last_error message if available.
 fn ffi_error(context: &str) -> RayError {
     let msg = rayrust_sys::last_error()
         .unwrap_or_else(|| "unknown FFI error".to_string());
-    RayError::Ffi(format!("{}: {}", context, msg))
+    error_from_kind(rayrust_sys::last_error_kind(), format!("{}: {}", context, msg))
 }
 
 /// Build an FFI error with context and a formatted detail string.
 fn ffi_error_detail(context: &str, detail: impl std::fmt::Display) -> RayError {
     let msg = rayrust_sys::last_error()
         .unwrap_or_else(|| "unknown FFI error".to_string());
-    RayError::Ffi(format!("{} ({}): {}", context, detail, msg))
+    error_from_kind(
+        rayrust_sys::last_error_kind(),
+        format!("{} ({}): {}", context, detail, msg),
+    )
 }
 
 // ─── Config ───────────────────────────────────────────────────
@@ -370,10 +385,8 @@ impl Ray {
         actor_kill_inner(handle.id(), no_restart);
         // C ABI returns void, but sets last_error on exception.
         // Best-effort: check if an error was set.
-        if let Some(err) = rayrust_sys::last_error() {
-            if !err.is_empty() {
-                return Err(RayError::Ffi(format!("ray_actor_kill: {}", err)));
-            }
+        if rayrust_sys::last_error().is_some() {
+            return Err(ffi_error("ray_actor_kill"));
         }
         Ok(())
     }
@@ -464,11 +477,7 @@ pub(crate) fn init_with_config(config: &RayConfig) -> Result<(), RayError> {
         )
     };
     if ret != 0 {
-        return Err(RayError::Runtime(format!(
-            "ray_init failed (code {}): {}",
-            ret,
-            rayrust_sys::last_error().unwrap_or_default()
-        )));
+        return Err(ffi_error("ray_init"));
     }
 
     // Warn if C++ SDK (default_worker) is not installed on this node.
@@ -625,6 +634,8 @@ pub(crate) fn get_raw(id: &[u8]) -> Result<Vec<u8>, RayError> {
 
 /// Get raw bytes from the object store by binary ID with timeout.
 pub(crate) fn get_raw_timeout(id: &[u8], timeout_ms: i32) -> Result<Vec<u8>, RayError> {
+    // Clear first so the kind read below belongs to this call.
+    rayrust_sys::clear_error();
     let bytes = unsafe {
         rayrust_sys::ray_get(
             id.as_ptr() as *const std::os::raw::c_char,
@@ -633,7 +644,14 @@ pub(crate) fn get_raw_timeout(id: &[u8], timeout_ms: i32) -> Result<Vec<u8>, Ray
         )
     };
     let guard = CBytesGuard::from(bytes).ok_or_else(|| {
-        RayError::ObjectNotFound(format!("<{} bytes>", id.len()))
+        if rayrust_sys::last_error_kind() == ErrorKind::None {
+            RayError::Ffi(format!(
+                "ray_get returned no data and recorded no error for a {} byte id",
+                id.len()
+            ))
+        } else {
+            ffi_error("ray_get")
+        }
     })?;
     Ok(guard.as_slice().to_vec())
 }
@@ -1221,10 +1239,8 @@ pub(crate) fn get_actor(name: &str, namespace: &str) -> Result<Option<ActorHandl
         None => {
             // C returns null both for "not found" and "error".
             // Check last_error to distinguish.
-            if let Some(err) = rayrust_sys::last_error() {
-                if !err.is_empty() {
-                    return Err(RayError::Ffi(format!("ray_get_actor: {}", err)));
-                }
+            if rayrust_sys::last_error().is_some() {
+                return Err(ffi_error("ray_get_actor"));
             }
             Ok(None)
         }
