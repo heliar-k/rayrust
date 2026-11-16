@@ -109,6 +109,25 @@ def process_nested(data):
     }
 
 
+# ── 返回自定义对象：检验跨语言解码对 pickle5 段的处理 ─────────────
+
+class Box:
+    def __init__(self, v):
+        self.v = v
+
+
+@ray.remote
+def return_custom_object(v):
+    """返回值无法用 msgpack 表示，Ray 会把它放进 pickle5 段。"""
+    return Box(v)
+
+
+@ray.remote
+def return_list_with_custom_object(v):
+    """容器里含自定义对象：msgpack 段只留占位下标，真实对象在 pickle5 段。"""
+    return [Box(v)]
+
+
 # ── Actor ─────────────────────────────────────────────────────────
 
 @ray.remote

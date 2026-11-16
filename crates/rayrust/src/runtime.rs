@@ -316,6 +316,11 @@ impl Ray {
     }
 
     /// Get multiple objects from the object store (blocks until all ready).
+    ///
+    /// If any element's cross-language payload carries a pickle5 section, the
+    /// whole batch returns `RayError::Serialization`: the plain values already
+    /// read from the same batch are dropped too, because
+    /// `get_many_with_timeout` returns on the first error.
     pub fn get_many<T: serde::de::DeserializeOwned>(
         &self,
         refs: &[ObjectRef<T>],
@@ -326,7 +331,9 @@ impl Ray {
     /// 批量取，超过 `timeout_ms` 毫秒就返回。
     ///
     /// `timeout_ms` 是 `-1`（永久等待）或非负的毫秒数，其他值返回
-    /// `RayError::Ffi`。
+    /// `RayError::Ffi`。批里任一元素的载荷带 pickle5 段时整批返回
+    /// `RayError::Serialization`，同一批里已经取到的普通值也拿不到
+    /// （`get_many_with_timeout` 用 `?` 直接返回）。
     pub fn get_many_timeout<T: serde::de::DeserializeOwned>(
         &self,
         refs: &[ObjectRef<T>],
@@ -338,7 +345,8 @@ impl Ray {
     /// 异步批量取。
     ///
     /// 默认期限 300 秒，自定义期限用 `get_many_timeout_async`。整批是 blocking
-    /// pool 上的一次 `Get`。
+    /// pool 上的一次 `Get`。批里任一元素的载荷带 pickle5 段时整批返回
+    /// `RayError::Serialization`，同一批里已经取到的普通值也拿不到。
     pub async fn get_many_async<T>(&self, refs: &[ObjectRef<T>]) -> Result<Vec<T>, RayError>
     where
         T: serde::de::DeserializeOwned + Send + 'static,
@@ -351,6 +359,8 @@ impl Ray {
     ///
     /// Ray 在一次 `Get` 内部限制整批的等待，期限覆盖每一个元素。与
     /// `get_timeout_async` 一样，期限从 blocking pool 的线程接到这次调用时开始计时。
+    /// 批里任一元素的载荷带 pickle5 段时整批返回 `RayError::Serialization`，
+    /// 同一批里已经取到的普通值也拿不到。
     pub async fn get_many_timeout_async<T>(
         &self,
         refs: &[ObjectRef<T>],
