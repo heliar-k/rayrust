@@ -17,7 +17,7 @@ rayrust wraps the Ray C++ SDK (`libray_api.so`) via a C ABI layer, providing idi
 | `#[remote]` async task (persistent runtime) | ✅ | ✅ |
 | `#[actor]` macro (auto-generate factory + methods) | ✅ | ✅ |
 | `actor_call_async` (non-blocking) | ✅ | ✅ |
-| `get_async` (eventfd + AsyncFd, zero threads blocked) | ✅ | ✅ |
+| `get_async` (bounded `Get` on the tokio blocking pool) | ✅ | ✅ |
 | Python task (cross-language, complex types) | ✅ | ✅ |
 | Python actor (cross-language) | ✅ | ✅ |
 | Resource scheduling (`TaskOptions` / `ActorOptions` builder) | ✅ | ✅ |
@@ -87,7 +87,7 @@ async fn fetch(url: String) -> Vec<u8> { /* ... */ }
 async fn main() -> Result<(), RayError> {
     let ray = Ray::connect(&RayConfig::new("127.0.0.1:6379"))?;
 
-    // Sync submission + async get (zero threads blocked)
+    // Async get: one bounded Get runs on the tokio blocking pool, so no tokio thread is held
     let r = add_remote(&ray, 1, 2);
     let v: i32 = r.get_async().await?;
     println!("add(1, 2) = {}", v);
@@ -212,7 +212,7 @@ rayrust (safe Rust API)
     Ray (RAII context: connect / drop)
     ObjectRef<T>, ActorHandle, ActorOptions, TaskOptions
     #[remote]/#[actor] macros → &Ray callers
-    get_async (eventfd + AsyncFd), persistent tokio runtime
+    get_async (bounded `Get` on the tokio blocking pool), persistent tokio runtime
     |
     v
 rayrust-sys (FFI bindings)

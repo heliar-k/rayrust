@@ -2,18 +2,25 @@
 //!
 //! ## Async architecture
 //!
-//! `get_async()` uses a polling thread + eventfd + AsyncFd pattern:
-//! - C++ polling thread: `Get(timeout=100ms)` loop, signals via eventfd
-//! - Rust side: `tokio::io::AsyncFd` polls eventfd — zero threads blocked
-//! - After eventfd fires: fast `Get()` (instant, object is local) + deserialize
+//! `get_async()` runs one bounded synchronous `Get` on tokio's blocking pool:
+//! - the call blocks inside `core_worker.Get(ids, timeout_ms, …)` in the C++
+//!   SDK, so the tokio worker thread awaiting the future stays free
+//! - Ray enforces the deadline inside `core_worker.Get`, starting when a pool
+//!   thread picks the call up; a call queued behind a full pool waits for a
+//!   free thread first and can take up to one more deadline to return
+//! - the pool defaults to `max_blocking_threads` = 512 threads on top of the
+//!   runtime's own threads; calls beyond that wait for a free thread instead
+//!   of failing
+//! - dropping the future does not cancel the `Get`: the pool thread stays on
+//!   it until the deadline, and shutting the runtime down waits for that
+//!   thread
+//! - a failed task surfaces as `RayError::Task`/`Actor`/`Worker`/
+//!   `Unreconstructable`, an expired wait as `RayError::Timeout`
 //!
 //! For cross-language (Python) results, the data has a 9-byte XLANG header
 //! that is stripped before deserialization.
 
 use std::marker::PhantomData;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-
-use tokio::io::unix::AsyncFd;
 
 use crate::error::RayError;
 use crate::serialize::{deserialize, deserialize_xlang};
@@ -99,7 +106,9 @@ impl<T> ObjectRef<T> {
 
     /// Asynchronously retrieve the object value.
     ///
-    /// Uses polling thread + eventfd + AsyncFd — zero tokio threads blocked.
+    /// The blocking `Get` runs on tokio's blocking pool; the awaiting task does
+    /// not hold a tokio worker thread. The deadline is 300 seconds by default;
+    /// `get_timeout_async` describes how it is applied.
     pub async fn get_async(&self) -> Result<T, RayError>
     where
         T: serde::de::DeserializeOwned + Send + 'static,
@@ -108,36 +117,27 @@ impl<T> ObjectRef<T> {
     }
 
     /// Asynchronously retrieve the object value with a custom timeout.
+    ///
+    /// The deadline is handed to Ray's `Get`, which bounds the whole wait,
+    /// including the wait for a lost object to be reconstructed. The deadline
+    /// starts when a blocking-pool thread picks the call up, so a call queued
+    /// behind a full pool waits for a free thread first and can take up to one
+    /// more deadline to return. Dropping the future does not cancel the `Get`:
+    /// the pool thread stays on it until the deadline, and shutting the runtime
+    /// down waits for that thread too.
     pub async fn get_timeout_async(&self, timeout: std::time::Duration) -> Result<T, RayError>
     where
         T: serde::de::DeserializeOwned + Send + 'static,
     {
         let id = self.id.clone();
+        let timeout_ms = duration_to_ms(timeout);
+        let bytes = tokio::task::spawn_blocking(move || {
+            crate::runtime::get_raw_timeout(&id, timeout_ms)
+        })
+        .await
+        .map_err(|e| RayError::Runtime(format!("spawn_blocking join error: {}", e)))??;
 
-        let handle = AsyncGetHandle::new(id);
-
-        let efd = handle.eventfd();
-        if efd < 0 {
-            return Err(RayError::Ffi("invalid eventfd".into()));
-        }
-
-        let ready = poll_eventfd(efd, timeout).await;
-        drop(handle);
-
-        if !ready {
-            return Err(RayError::Runtime(format!(
-                "get_async timed out after {:?}", timeout
-            )));
-        }
-
-        // Object is now local — fast Get (instant)
-        let id_for_get = self.id.clone();
-        let is_xlang = self.is_xlang;
-        let bytes = tokio::task::spawn_blocking(move || crate::runtime::get_raw(&id_for_get))
-            .await
-            .map_err(|e| RayError::Runtime(format!("spawn_blocking join error: {}", e)))??;
-
-        if is_xlang {
+        if self.is_xlang {
             deserialize_xlang(&bytes)
         } else {
             deserialize(&bytes)
@@ -146,7 +146,7 @@ impl<T> ObjectRef<T> {
 
     /// Asynchronously retrieve the object as a generic msgpack Value.
     ///
-    /// Uses the same polling mechanism as `get_async()`.
+    /// Same blocking-pool `Get` as `get_async()`.
     /// Useful for Python cross-language calls with unknown return types.
     pub async fn get_value_async(&self) -> Result<rmpv::Value, RayError> {
         self.get_value_timeout_async(std::time::Duration::from_secs(300)).await
@@ -155,24 +155,14 @@ impl<T> ObjectRef<T> {
     /// Asynchronously retrieve the object as a generic msgpack Value with timeout.
     pub async fn get_value_timeout_async(&self, timeout: std::time::Duration) -> Result<rmpv::Value, RayError> {
         let id = self.id.clone();
-        let handle = AsyncGetHandle::new(id);
-        let efd = handle.eventfd();
-        if efd < 0 {
-            return Err(RayError::Ffi("invalid eventfd".into()));
-        }
-        let ready = poll_eventfd(efd, timeout).await;
-        drop(handle);
-        if !ready {
-            return Err(RayError::Runtime(format!(
-                "get_value_async timed out after {:?}", timeout
-            )));
-        }
-        let id_for_get = self.id.clone();
-        let is_xlang = self.is_xlang;
-        let bytes = tokio::task::spawn_blocking(move || crate::runtime::get_raw(&id_for_get))
-            .await
-            .map_err(|e| RayError::Runtime(format!("spawn_blocking join error: {}", e)))??;
-        if is_xlang {
+        let timeout_ms = duration_to_ms(timeout);
+        let bytes = tokio::task::spawn_blocking(move || {
+            crate::runtime::get_raw_timeout(&id, timeout_ms)
+        })
+        .await
+        .map_err(|e| RayError::Runtime(format!("spawn_blocking join error: {}", e)))??;
+
+        if self.is_xlang {
             crate::serialize::deserialize_xlang_value(&bytes)
         } else {
             crate::serialize::deserialize_value(&bytes)
@@ -206,70 +196,10 @@ impl<T> From<ObjectRef<T>> for Vec<u8> {
     }
 }
 
-// ── RAII handle for async get ─────────────────────────────────
-
-struct AsyncGetHandle(*mut std::ffi::c_void);
-unsafe impl Send for AsyncGetHandle {}
-unsafe impl Sync for AsyncGetHandle {}
-
-impl AsyncGetHandle {
-    fn new(id: Vec<u8>) -> Self {
-        let id_ptr = id.as_ptr() as *const std::os::raw::c_char;
-        let id_len = id.len();
-        let ptr = unsafe { rayrust_sys::ray_async_get_start(id_ptr, id_len) };
-        AsyncGetHandle(ptr)
-    }
-
-    fn eventfd(&self) -> i32 {
-        if self.0.is_null() { return -1; }
-        unsafe { rayrust_sys::ray_async_get_fd(self.0) }
-    }
-}
-
-impl Drop for AsyncGetHandle {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { rayrust_sys::ray_async_get_destroy(self.0) }
-        }
-    }
-}
-
-async fn poll_eventfd(efd: RawFd, timeout: std::time::Duration) -> bool {
-    let dup_fd = unsafe { libc::dup(efd) };
-    if dup_fd < 0 { return false; }
-
-    let flags = unsafe { libc::fcntl(dup_fd, libc::F_GETFL) };
-    unsafe { libc::fcntl(dup_fd, libc::F_SETFL, flags | libc::O_NONBLOCK); }
-
-    let file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
-    let async_fd = match AsyncFd::new(file) {
-        Ok(fd) => fd,
-        Err(_) => return false,
-    };
-
-    let poll = async {
-        loop {
-            let mut guard = match async_fd.readable().await {
-                Ok(g) => g,
-                Err(_) => return false,
-            };
-
-            let mut buf = [0u8; 8];
-            let raw_fd = guard.get_ref().as_raw_fd();
-            let ret = unsafe {
-                libc::read(raw_fd, buf.as_mut_ptr() as *mut libc::c_void, 8)
-            };
-
-            if ret > 0 { return true; }
-
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                guard.clear_ready();
-                continue;
-            }
-            return false;
-        }
-    };
-
-    tokio::time::timeout(timeout, poll).await.unwrap_or(false)
+/// Convert a duration to the millisecond timeout Ray's `Get` takes.
+///
+/// Capped at `i32::MAX` (about 24 days). A `Duration` is never negative, so the
+/// result can never become Ray's -1, which means wait forever.
+fn duration_to_ms(timeout: std::time::Duration) -> i32 {
+    timeout.as_millis().min(i32::MAX as u128) as i32
 }

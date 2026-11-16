@@ -15,7 +15,7 @@ Ray 的 Rust SDK —— 通过 FFI 封装 Ray C++ SDK，提供地道的 Rust API
 | `#[remote]` 异步任务（持久化 runtime） | ✅ | ✅ |
 | `#[actor]` 宏（自动生成 factory + 方法） | ✅ | ✅ |
 | `actor_call_async`（非阻塞） | ✅ | ✅ |
-| `get_async`（eventfd + AsyncFd，零线程阻塞） | ✅ | ✅ |
+| `get_async`（带期限的 `Get` 跑在 tokio blocking pool 上） | ✅ | ✅ |
 | Python 任务（跨语言，复杂类型） | ✅ | ✅ |
 | Python Actor（跨语言） | ✅ | ✅ |
 | 资源调度（`TaskOptions` / `ActorOptions` builder） | ✅ | ✅ |
@@ -85,7 +85,7 @@ async fn fetch(url: String) -> Vec<u8> { /* ... */ }
 async fn main() -> Result<(), RayError> {
     let ray = Ray::connect(&RayConfig::new("127.0.0.1:6379"))?;
 
-    // 同步提交 + 异步获取（零线程阻塞）
+    // 异步获取：一次带期限的 Get 跑在 tokio blocking pool 上，tokio 线程不被占用
     let r = add_remote(&ray, 1, 2);
     let v: i32 = r.get_async().await?;
     println!("add(1, 2) = {}", v);
@@ -210,7 +210,7 @@ rayrust（安全 Rust API）
     Ray (RAII context: connect / drop)
     ObjectRef<T>, ActorHandle, ActorOptions, TaskOptions
     #[remote]/#[actor] 宏 → &Ray 调用器
-    get_async (eventfd + AsyncFd), 持久化 tokio runtime
+    get_async (带期限的 `Get` 跑在 tokio blocking pool 上), 持久化 tokio runtime
     |
     v
 rayrust-sys（FFI 绑定）

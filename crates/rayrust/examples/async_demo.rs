@@ -1,6 +1,6 @@
 //! Example: Async remote tasks with tokio + Ray cluster.
 //!
-//! Uses a polling thread + eventfd for non-blocking async gets.
+//! Uses one bounded `Get` on the tokio blocking pool for async gets.
 
 use rayrust::prelude::*;
 
@@ -26,7 +26,7 @@ async fn main() {
             std::process::exit(1);
         });
 
-    println!("=== Ray Async Demo (polling thread + eventfd) ===");
+    println!("=== Ray Async Demo (bounded Get on the blocking pool) ===");
     println!("Address: {}, Node: {}", address, node_ip);
 
     let config = RayConfig::new(&address)
@@ -49,7 +49,7 @@ async fn main() {
     let r2: ObjectRef<i32> = r2.expect("add(100,200) failed");
     let r3: ObjectRef<String> = r3.expect("greet failed");
 
-    // get_async blocks one detached std::thread in Get(id, 100); the tokio side stays free
+    // get_async blocks one blocking-pool thread inside Get(id, timeout_ms); the tokio side stays free
     let (v1, v2, v3) = tokio::join!(
         r1.get_async(),
         r2.get_async(),
