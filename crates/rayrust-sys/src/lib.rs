@@ -127,7 +127,7 @@ extern "C" {
     pub fn ray_get_many(ids: *const RayBytes, count: usize, timeout_ms: c_int) -> *mut RayBytes;
     pub fn ray_free_bytes_array(array: *mut RayBytes, count: usize);
 
-    // Async Get (CoreWorker::GetAsync + eventfd)
+    // Async Get (polling thread + eventfd)
     // RayAsyncGet is an opaque C struct — we use c_void as the pointee.
     pub fn ray_async_get_start(id_data: *const c_char, id_len: usize) -> *mut std::ffi::c_void;
     pub fn ray_async_get_fd(handle: *const std::ffi::c_void) -> c_int;

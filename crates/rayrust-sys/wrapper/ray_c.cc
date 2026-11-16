@@ -19,6 +19,7 @@
 // ─── Thread-local error storage ─────────────────────────────────
 // Instead of fprintf(stderr), we store the error message in a thread-local
 // string so the Rust side can retrieve it via ray_last_error().
+#include <cstdint>
 #include <string>
 #include <cstring>
 
@@ -50,22 +51,60 @@ namespace ray { namespace internal {
     FunctionManager &GetFunctionManager();
 }}
 
-// Forward declarations for CoreWorker (used by ray_cancel, ray_async_get, etc).
-// These symbols are exported from libray_api.so as T (text) symbols.
-// We match the ABI with minimal type declarations — no core_worker.h needed.
+// Forward declarations for the private symbols ray_cancel calls. Neither type
+// is declared in the headers the wheel ships (ray/api/*.h), so the layout below
+// is copied by hand from the Ray 2.51.1 sources. The static_asserts compare it
+// against constants restated in this same file: they catch a mistyped constant,
+// not a layout change in the SDK. Only a version check at connect time (#12) or
+// a build against two adjacent releases (#14) can catch such a change.
+//   - ray::ObjectID is BaseID<ObjectID> under #pragma pack(1): a mutable
+//     size_t hash_ at offset 0, then uint8_t id_[kLength], with
+//     kLength = sizeof(uint32_t) + TaskID::kLength = 28 (src/ray/common/id.h).
+//     BaseID<T>::Data() is `this + sizeof(hash_)`, i.e. id_ at offset 8.
+//   - ray::Status is a single State* that is nullptr iff the status is ok
+//     (src/ray/common/status.h).
 namespace ray {
-    class RayObject;
-    class ObjectID { char _data[28]; };
-    class ActorID { char _data[16]; };
+#pragma pack(push, 1)
+    class ObjectID {
+    public:
+        static constexpr size_t kLength = 28;
+
+        // hash_ stays 0, which BaseID<T>::Hash() reads as "not computed yet".
+        ObjectID(const char *data, size_t len) {
+            hash_ = 0;
+            std::memcpy(id_, data, len);
+        }
+
+    private:
+        mutable size_t hash_;
+        uint8_t id_[kLength];
+    };
+#pragma pack(pop)
+
+    static_assert(sizeof(ray::ObjectID) == ObjectID::kLength + sizeof(size_t),
+                  "ray::ObjectID stand-in does not match the SDK layout");
+
+    class Status {
+    public:
+        bool ok() const { return state_ == nullptr; }
+        // Defined in libray_api.so (the SDK emits it as a weak symbol) and
+        // deleted through `delete state_`.
+        ~Status();
+
+    private:
+        struct State;
+        State *state_;
+    };
+
+    static_assert(sizeof(ray::Status) == sizeof(void *),
+                  "ray::Status stand-in does not match the SDK layout");
 }
 namespace ray::core {
-    using SetResultCallback =
-        std::function<void(std::shared_ptr<ray::RayObject>, ray::ObjectID, void*)>;
     class CoreWorker {
     public:
-        void GetAsync(const ray::ObjectID&, SetResultCallback, void*);
-        void CancelTask(const ray::ObjectID &, bool, bool);
-        void KillActor(const ray::ActorID &, bool, bool);
+        ray::Status CancelTask(const ray::ObjectID &object_id,
+                               bool force_kill,
+                               bool recursive);
     };
     class CoreWorkerProcess {
     public:
@@ -805,16 +844,28 @@ ray_bytes_t ray_get_actor(const char *name, const char *ray_namespace) {
 
 int ray_cancel(const char *id_data, size_t id_len, bool force_kill, bool recursive) {
     try {
-        if (!id_data || id_len == 0) return -1;
+        if (!id_data) {
+            set_last_error("object id is null");
+            return -1;
+        }
+        if (id_len != ray::ObjectID::kLength) {
+            std::string msg = "object id must be "
+                + std::to_string(ray::ObjectID::kLength) + " bytes, got "
+                + std::to_string(id_len) + " bytes";
+            set_last_error(msg.c_str());
+            return -1;
+        }
 
-        // Construct ObjectID from binary data (28 bytes)
-        ray::ObjectID object_id;
-        std::memset(&object_id, 0, sizeof(object_id));
-        size_t copy_len = id_len < sizeof(object_id) ? id_len : sizeof(object_id);
-        std::memcpy(&object_id, id_data, copy_len);
-
+        ray::ObjectID object_id(id_data, id_len);
         auto &core_worker = ray::core::CoreWorkerProcess::GetCoreWorker();
-        core_worker.CancelTask(object_id, force_kill, recursive);
+        ray::Status status = core_worker.CancelTask(object_id, force_kill, recursive);
+        if (!status.ok()) {
+            // The SDK exports ~Status but not ToString/CodeAsString/message(), so
+            // no Ray failure text is readable here, and cancelling an already
+            // finished task returns OK, so a no-op cancel is not reported either.
+            set_last_error("the core worker refused the cancellation");
+            return -1;
+        }
         return 0;
     } catch (const std::exception &e) {
         set_last_error_exception("ray_cancel", e);
@@ -880,9 +931,8 @@ void ray_free_bools(bool *ptr) {
     if (ptr) std::free(ptr);
 }
 
-// ─── Async Get (CoreWorker::GetAsync + eventfd) ──────────────
+// ─── Async Get (polling thread + eventfd) ────────────────────
 //
-// Uses CoreWorker forward declarations from the top of this file.
 // Polling thread: Get(timeout=100ms) loop + eventfd notification.
 
 #include <sys/eventfd.h>
@@ -894,25 +944,6 @@ struct ray_async_get {
     bool ready;
     bool error;
 };
-
-// Callback invoked by CoreWorker's io_context thread when object arrives.
-// NOTE: This callback is registered via CoreWorker::GetAsync but in practice
-// the io_context in driver mode may not fire it. The polling thread in
-// ray_async_get_start is the actual notification mechanism.
-static void ray_async_callback(std::shared_ptr<ray::RayObject> obj,
-                                ray::ObjectID /*id*/,
-                                void *user_data) {
-    auto *handle = static_cast<ray_async_get *>(user_data);
-    if (!obj) {
-        handle->error = true;
-    }
-    handle->ready = true;
-
-    uint64_t val = 1;
-    if (write(handle->efd, &val, sizeof(val)) < 0) {
-        // eventfd write failed — nothing we can do
-    }
-}
 
 ray_async_get_t *ray_async_get_start(const char *id_data, size_t id_len) {
     try {
