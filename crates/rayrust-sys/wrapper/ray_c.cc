@@ -10,6 +10,7 @@
 #include "ray_c.h"
 
 #include <ray/api.h>
+#include <ray/api/ray_exception.h>
 #include <ray/api/ray_runtime.h>
 #include <ray/api/ray_runtime_holder.h>
 #include <ray/api/serializer.h>
@@ -24,21 +25,38 @@
 #include <cstring>
 
 static thread_local std::string g_last_error;
+static thread_local int g_last_error_kind = RAY_ERROR_KIND_NONE;
 
 /// Store an error message (called from catch blocks).
 static void set_last_error(const char *msg) {
     g_last_error = msg ? msg : "";
+    g_last_error_kind = RAY_ERROR_KIND_GENERIC;
 }
 
-/// Store an error message from a C++ exception.
-static void set_last_error_exception(const char *func, const std::exception &e) {
-    g_last_error = std::string(func) + ": " + e.what();
+/// Classify a C++ exception by the Ray exception hierarchy.
+static int ray_exception_kind(const std::exception &e) {
+    using namespace ray::internal;
+    if (dynamic_cast<const RayActorException *>(&e)) return RAY_ERROR_KIND_ACTOR;
+    if (dynamic_cast<const RayTaskException *>(&e)) return RAY_ERROR_KIND_TASK;
+    if (dynamic_cast<const RayWorkerException *>(&e)) return RAY_ERROR_KIND_WORKER;
+    if (dynamic_cast<const UnreconstructableException *>(&e)) {
+        return RAY_ERROR_KIND_UNRECONSTRUCTABLE;
+    }
+    if (dynamic_cast<const RayTimeoutException *>(&e)) return RAY_ERROR_KIND_TIMEOUT;
+    if (dynamic_cast<const RayException *>(&e)) return RAY_ERROR_KIND_RAY;
+    return RAY_ERROR_KIND_GENERIC;
+}
+
+/// Store an error message from a C++ exception, with its class.
+static void set_last_error_exception(const std::exception &e) {
+    g_last_error = e.what();
+    g_last_error_kind = ray_exception_kind(e);
 }
 
 // Macro to reduce boilerplate in catch blocks.
-#define RAY_CATCH(func_name) \
+#define RAY_CATCH \
     catch (const std::exception &e) { \
-        set_last_error_exception(func_name, e); \
+        set_last_error_exception(e); \
     }
 
 // Declare the exported function from libray_api.so.
@@ -398,7 +416,7 @@ int ray_init(const char *address, int local_mode, const char *node_ip,
         ray::Init(config, argc, const_cast<char**>(arg_ptrs.data()));
         return 0;
     } catch (const std::exception &e) {
-        set_last_error_exception("ray_init", e);
+        set_last_error_exception(e);
         return -1;
     }
 }
@@ -429,7 +447,7 @@ ray_bytes_t ray_put(const char *data, size_t len) {
         std::string id = runtime->Put(buffer);
         return dup_bytes(id);
     } catch (const std::exception &e) {
-        set_last_error_exception("ray_put", e);
+        set_last_error_exception(e);
         return ray_bytes_t{nullptr, 0};
     }
 }
@@ -437,18 +455,27 @@ ray_bytes_t ray_put(const char *data, size_t len) {
 ray_bytes_t ray_get(const char *id_data, size_t id_len, int timeout_ms) {
     try {
         auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) return ray_bytes_t{nullptr, 0};
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return ray_bytes_t{nullptr, 0};
+        }
 
         std::string id(id_data, id_len);
         auto buffer = runtime->Get(id, timeout_ms);
-        if (!buffer) return ray_bytes_t{nullptr, 0};
+        if (!buffer) {
+            set_last_error("the object store returned no buffer");
+            return ray_bytes_t{nullptr, 0};
+        }
 
         char *data = static_cast<char *>(std::malloc(buffer->size()));
-        if (!data) return ray_bytes_t{nullptr, 0};
+        if (!data) {
+            set_last_error("out of memory copying the object");
+            return ray_bytes_t{nullptr, 0};
+        }
         std::memcpy(data, buffer->data(), buffer->size());
         return ray_bytes_t{data, buffer->size()};
     } catch (const std::exception &e) {
-        set_last_error_exception("ray_get", e);
+        set_last_error_exception(e);
         return ray_bytes_t{nullptr, 0};
     }
 }
@@ -473,7 +500,7 @@ bool *ray_wait(const ray_bytes_t *ids, size_t count, int num_objects, int timeou
         }
         return out;
     } catch (const std::exception &e) {
-        set_last_error_exception("ray_wait", e);
+        set_last_error_exception(e);
         return nullptr;
     }
 }
@@ -582,7 +609,7 @@ ray_bytes_t ray_task_call(const char *func_name,
         ray::internal::CallOptions options;
         std::string id = runtime->Call(holder, task_args, options);
         return dup_bytes(id);
-    } RAY_CATCH("ray_task_call")
+    } RAY_CATCH
     return ray_bytes_t{nullptr, 0};
 }
 
@@ -611,7 +638,7 @@ ray_bytes_t ray_task_call_with_resources(const char *func_name,
         }
         std::string id = runtime->Call(holder, task_args, options);
         return dup_bytes(id);
-    } RAY_CATCH("ray_task_call_with_resources")
+    } RAY_CATCH
     return ray_bytes_t{nullptr, 0};
 }
 
@@ -637,7 +664,7 @@ ray_bytes_t ray_task_call_python(const char *module_name,
         std::string id = runtime->Call(holder, task_args, options);
         return dup_bytes(id);
     } catch (const std::exception &e) {
-        set_last_error_exception("ray_task_call_python", e);
+        set_last_error_exception(e);
         return ray_bytes_t{nullptr, 0};
     }
 }
@@ -663,7 +690,7 @@ ray_bytes_t ray_actor_create_with_options(const char *func_name,
         parse_actor_options(options_json, options);
         std::string id = runtime->CreateActor(holder, task_args, options);
         return dup_bytes(id);
-    } RAY_CATCH("ray_actor_create_with_options")
+    } RAY_CATCH
     return ray_bytes_t{nullptr, 0};
 }
 
@@ -688,7 +715,7 @@ ray_bytes_t ray_actor_create_python_with_options(const char *module_name,
         std::string id = runtime->CreateActor(holder, task_args, options);
         return dup_bytes(id);
     } catch (const std::exception &e) {
-        set_last_error_exception("ray_actor_create_python_with_options", e);
+        set_last_error_exception(e);
         return ray_bytes_t{nullptr, 0};
     }
 }
@@ -716,7 +743,7 @@ ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
         std::string id = runtime->CallActor(holder, actor_id, task_args, options);
         return dup_bytes(id);
     } catch (const std::exception &e) {
-        set_last_error_exception("ray_actor_call", e);
+        set_last_error_exception(e);
         return ray_bytes_t{nullptr, 0};
     }
 }
@@ -743,7 +770,7 @@ ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len
         std::string id = runtime->CallActor(holder, actor_id, task_args, options);
         return dup_bytes(id);
     } catch (const std::exception &e) {
-        set_last_error_exception("ray_actor_call_python", e);
+        set_last_error_exception(e);
         return ray_bytes_t{nullptr, 0};
     }
 }
@@ -756,7 +783,7 @@ void ray_actor_kill(const char *actor_id_data, size_t actor_id_len, bool no_rest
             runtime->KillActor(actor_id, no_restart);
         }
     } catch (const std::exception &e) {
-        set_last_error_exception("ray_actor_kill", e);
+        set_last_error_exception(e);
     }
 }
 
@@ -792,7 +819,7 @@ ray_bytes_t ray_placement_group_create(const char *name,
         auto group = runtime->CreatePlacementGroup(options);
         return dup_bytes(group.GetID());
     } catch (const std::exception &e) {
-        set_last_error_exception("ray_placement_group_create", e);
+        set_last_error_exception(e);
         return ray_bytes_t{nullptr, 0};
     }
 }
@@ -805,7 +832,7 @@ void ray_placement_group_remove(const char *group_id_data, size_t group_id_len) 
             runtime->RemovePlacementGroup(group_id);
         }
     } catch (const std::exception &e) {
-        set_last_error_exception("ray_placement_group_remove", e);
+        set_last_error_exception(e);
     }
 }
 
@@ -823,7 +850,12 @@ ray_bytes_t ray_get_namespace(void) {
     try {
         auto runtime = ray::internal::GetRayRuntime();
         if (runtime) return dup_bytes(runtime->GetNamespace());
-    } catch (...) {}
+        set_last_error("Ray runtime is not initialized");
+    } catch (const std::exception &e) {
+        set_last_error_exception(e);
+    } catch (...) {
+        set_last_error("unknown exception");
+    }
     return ray_bytes_t{nullptr, 0};
 }
 
@@ -837,7 +869,7 @@ ray_bytes_t ray_get_actor(const char *name, const char *ray_namespace) {
         if (actor_id.empty()) return ray_bytes_t{nullptr, 0};
         return dup_bytes(actor_id);
     } catch (const std::exception &e) {
-        set_last_error_exception("ray_get_actor", e);
+        set_last_error_exception(e);
         return ray_bytes_t{nullptr, 0};
     }
 }
@@ -868,7 +900,7 @@ int ray_cancel(const char *id_data, size_t id_len, bool force_kill, bool recursi
         }
         return 0;
     } catch (const std::exception &e) {
-        set_last_error_exception("ray_cancel", e);
+        set_last_error_exception(e);
         return -1;
     }
 }
@@ -876,7 +908,10 @@ int ray_cancel(const char *id_data, size_t id_len, bool force_kill, bool recursi
 ray_bytes_t *ray_get_many(const ray_bytes_t *ids, size_t count, int timeout_ms) {
     try {
         auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) return nullptr;
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return nullptr;
+        }
 
         std::vector<std::string> id_vec;
         id_vec.reserve(count);
@@ -887,7 +922,10 @@ ray_bytes_t *ray_get_many(const ray_bytes_t *ids, size_t count, int timeout_ms) 
         auto results = runtime->Get(id_vec, timeout_ms);
 
         auto *out = static_cast<ray_bytes_t *>(std::malloc(count * sizeof(ray_bytes_t)));
-        if (!out) return nullptr;
+        if (!out) {
+            set_last_error("out of memory allocating the result array");
+            return nullptr;
+        }
 
         for (size_t i = 0; i < count && i < results.size(); i++) {
             if (results[i]) {
@@ -904,7 +942,7 @@ ray_bytes_t *ray_get_many(const ray_bytes_t *ids, size_t count, int timeout_ms) 
         }
         return out;
     } catch (const std::exception &e) {
-        set_last_error_exception("ray_get_many", e);
+        set_last_error_exception(e);
         return nullptr;
     }
 }
@@ -992,7 +1030,7 @@ ray_async_get_t *ray_async_get_start(const char *id_data, size_t id_len) {
 
         return handle;
     } catch (const std::exception &e) {
-        set_last_error_exception("ray_async_get_start", e);
+        set_last_error_exception(e);
         return nullptr;
     }
 }
@@ -1025,6 +1063,11 @@ const char *ray_last_error(void) {
     return g_last_error.empty() ? nullptr : g_last_error.c_str();
 }
 
+int ray_last_error_kind(void) {
+    return g_last_error_kind;
+}
+
 void ray_clear_error(void) {
     g_last_error.clear();
+    g_last_error_kind = RAY_ERROR_KIND_NONE;
 }

@@ -86,17 +86,16 @@ fn expect_refused(ray: &Ray) {
 }
 
 /// A cancelled ref must resolve to a failure on its own and quickly. An expired
-/// get_timeout is not distinguishable by text: get_raw_timeout reports the null
-/// buffer of an expiry as RayError::ObjectNotFound, so that variant is what this
-/// rejects. Elapsed time is checked separately against the timeout.
+/// get_timeout is the failure an unresolved object gives, so that variant is
+/// what this rejects. Elapsed time is checked separately against the timeout.
 fn expect_fast_failure<T: DeserializeOwned>(obj_ref: &ObjectRef<T>, label: &str) {
     let start = Instant::now();
     let result = obj_ref.get_timeout(GET_TIMEOUT_MS);
     let elapsed = start.elapsed().as_millis();
     match result {
         Ok(_) => panic!("{}: the cancelled task still delivered a value", label),
-        Err(RayError::ObjectNotFound(detail)) => panic!(
-            "{}: get_timeout expired for object {} instead of the ref failing",
+        Err(RayError::Timeout(detail)) => panic!(
+            "{}: get_timeout expired ({}) instead of the ref failing",
             label, detail
         ),
         Err(e) => {
@@ -113,7 +112,7 @@ fn expect_fast_failure<T: DeserializeOwned>(obj_ref: &ObjectRef<T>, label: &str)
 }
 
 /// The object must still be unresolved, i.e. its task has not finished. An
-/// expired get_timeout reports the missing object, which is the only accepted
+/// expired get_timeout reports RayError::Timeout, which is the only accepted
 /// evidence; any other error means the task already failed and is reported.
 fn expect_unresolved<T: DeserializeOwned>(obj_ref: &ObjectRef<T>, label: &str, probe_ms: i32) {
     match obj_ref.get_timeout(probe_ms) {
@@ -121,7 +120,7 @@ fn expect_unresolved<T: DeserializeOwned>(obj_ref: &ObjectRef<T>, label: &str, p
             "{}: task already finished within {} ms, the state this check needs did not hold",
             label, probe_ms
         ),
-        Err(RayError::ObjectNotFound(_)) => {
+        Err(RayError::Timeout(_)) => {
             println!("  {} still unresolved after {} ms", label, probe_ms)
         }
         Err(e) => panic!("{}: the ref failed before it was cancelled: {}", label, e),

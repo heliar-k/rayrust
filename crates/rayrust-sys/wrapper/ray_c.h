@@ -273,12 +273,39 @@ void ray_free_bools(bool *ptr);
 
 // ─── Error Handling ───────────────────────────────────────────
 
+/// Class of the last error, mirroring Ray's C++ exception hierarchy
+/// (`ray/api/ray_exception.h`).
+///
+/// `RayFunctionNotFound` and `RayRuntimeEnvException` have no constant here:
+/// neither class ever reaches this side. A missing function is thrown only on
+/// the worker, where `TaskExecutor`'s catch turns it into `Status::Invalid`
+/// (`cpp/src/ray/runtime/task/task_executor.cc:101-110`), so the driver sees
+/// a `RayTaskException`. A malformed runtime_env is deserialized before
+/// `ray_init`'s `try`, so it aborts the process instead of being recorded.
+typedef enum {
+    /// No error recorded on this thread.
+    RAY_ERROR_KIND_NONE = 0,
+    /// A plain `std::exception`, or a message set directly.
+    RAY_ERROR_KIND_GENERIC = 1,
+    /// `ray::internal::RayException`, the base of the five below.
+    RAY_ERROR_KIND_RAY = 2,
+    RAY_ERROR_KIND_ACTOR = 3,
+    RAY_ERROR_KIND_TASK = 4,
+    RAY_ERROR_KIND_WORKER = 5,
+    RAY_ERROR_KIND_UNRECONSTRUCTABLE = 6,
+    RAY_ERROR_KIND_TIMEOUT = 7,
+} ray_error_kind_t;
+
 /// Get the last error message (thread-local).
 /// Returns NULL if no error. The returned pointer is valid until the next
 /// ray_* call on the same thread.
 const char *ray_last_error(void);
 
-/// Clear the last error message.
+/// Get the class of the last error (thread-local), one of ray_error_kind_t.
+/// Returns RAY_ERROR_KIND_NONE when ray_last_error() returns NULL.
+int ray_last_error_kind(void);
+
+/// Clear the last error message and its kind.
 void ray_clear_error(void);
 
 #ifdef __cplusplus

@@ -141,7 +141,45 @@ extern "C" {
 
     // Error Handling
     pub fn ray_last_error() -> *const c_char;
+    pub fn ray_last_error_kind() -> c_int;
     pub fn ray_clear_error();
+}
+
+// ─── Error kinds ──────────────────────────────────────────────
+
+/// Class of the last error, mirroring `ray_error_kind_t` in wrapper/ray_c.h.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// No error recorded on this thread.
+    None = 0,
+    /// A plain `std::exception`, or a message set without an exception.
+    Generic = 1,
+    /// `RayException`, the base of Ray's exception hierarchy.
+    Ray = 2,
+    Actor = 3,
+    Task = 4,
+    Worker = 5,
+    Unreconstructable = 6,
+    Timeout = 7,
+}
+
+impl ErrorKind {
+    /// Map a `ray_error_kind_t` constant; `Generic` for a value this enum does
+    /// not know, so the accompanying message keeps its class instead of being
+    /// dropped.
+    pub fn from_raw(raw: c_int) -> ErrorKind {
+        match raw {
+            0 => ErrorKind::None,
+            2 => ErrorKind::Ray,
+            3 => ErrorKind::Actor,
+            4 => ErrorKind::Task,
+            5 => ErrorKind::Worker,
+            6 => ErrorKind::Unreconstructable,
+            7 => ErrorKind::Timeout,
+            _ => ErrorKind::Generic,
+        }
+    }
 }
 
 // ─── Safe wrapper helpers ─────────────────────────────────────
@@ -193,9 +231,14 @@ pub fn last_error() -> Option<String> {
     }
 }
 
-/// Clear the last error message.
+/// Clear the last error message and its kind.
 pub fn clear_error() {
     unsafe { ray_clear_error() }
+}
+
+/// Kind of the last error recorded by the C wrapper on this thread.
+pub fn last_error_kind() -> ErrorKind {
+    ErrorKind::from_raw(unsafe { ray_last_error_kind() })
 }
 
 /// Build a `Vec<RayBytes>` from a slice of byte slices.
