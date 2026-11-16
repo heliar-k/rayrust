@@ -414,6 +414,7 @@ impl Ray {
     }
 
     /// Cancel a remote task by object ID.
+    /// `obj_id` must be exactly 28 bytes (the Ray 2.51.1 ObjectID length).
     pub fn cancel(&self, obj_id: &[u8], force_kill: bool, recursive: bool) -> Result<(), RayError> {
         cancel(obj_id, force_kill, recursive)
     }
@@ -1231,6 +1232,7 @@ pub(crate) fn get_actor(name: &str, namespace: &str) -> Result<Option<ActorHandl
 }
 
 /// Cancel a remote task by object ID.
+/// `obj_id` must be exactly 28 bytes; the C side rejects any other length.
 /// `force_kill` kills the worker process if true.
 /// `recursive` cancels dependent tasks.
 pub(crate) fn cancel(obj_id: &[u8], force_kill: bool, recursive: bool) -> Result<(), RayError> {
@@ -1243,7 +1245,7 @@ pub(crate) fn cancel(obj_id: &[u8], force_kill: bool, recursive: bool) -> Result
         )
     };
     if ret != 0 {
-        return Err(RayError::Runtime(format!("ray_cancel failed (code {})", ret)));
+        return Err(ffi_error("ray_cancel"));
     }
     Ok(())
 }

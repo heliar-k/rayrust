@@ -191,6 +191,8 @@ ray_bytes_t ray_get_namespace(void);
 ray_bytes_t ray_get_actor(const char *name, const char *ray_namespace);
 
 /// Cancel a remote task by object ID.
+/// `id_data` must be exactly 28 bytes (the Ray 2.51.1 ObjectID length); any
+/// other length is rejected without touching Ray.
 /// `force_kill` kills the worker if true. `recursive` cancels dependent tasks.
 /// Returns 0 on success, -1 on error.
 int ray_cancel(const char *id_data, size_t id_len, bool force_kill, bool recursive);
@@ -235,7 +237,7 @@ typedef ray_bytes_t (*ray_member_callback_t)(uint64_t actor_ptr,
 /// `callback` is the C callback invoked when the actor method executes.
 void ray_register_member_function(const char *func_name, ray_member_callback_t callback);
 
-// ─── Async Get (CoreWorker::GetAsync + eventfd) ──────────────
+// ─── Async Get (polling thread + eventfd) ───────────────────
 
 /// Opaque handle for an async get request.
 /// Internally holds an eventfd and a pending result buffer.
