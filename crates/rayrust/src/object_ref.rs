@@ -38,11 +38,22 @@ use crate::serialize::{deserialize, deserialize_xlang};
 /// dropped, the runtime shuts down and `ObjectRef` operations will fail
 /// at runtime — but this is not enforced at compile time, matching the
 /// semantics of Ray in Python and C++.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ObjectRef<T> {
     pub(crate) id: Vec<u8>,
     pub(crate) is_xlang: bool,
     _marker: PhantomData<T>,
+}
+
+/// 手写 Clone：派生版本会额外要求 `T: Clone`，而引用本身只需要复制 id。
+impl<T> Clone for ObjectRef<T> {
+    fn clone(&self) -> Self {
+        ObjectRef {
+            id: self.id.clone(),
+            is_xlang: self.is_xlang,
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl<T> ObjectRef<T> {
@@ -92,6 +103,8 @@ impl<T> ObjectRef<T> {
     }
 
     /// Retrieve the object value with a timeout (in milliseconds).
+    ///
+    /// `-1` waits forever; other negative values return `RayError::Ffi`.
     pub fn get_timeout(&self, timeout_ms: i32) -> Result<T, RayError>
     where
         T: serde::de::DeserializeOwned,
@@ -130,7 +143,7 @@ impl<T> ObjectRef<T> {
         T: serde::de::DeserializeOwned + Send + 'static,
     {
         let id = self.id.clone();
-        let timeout_ms = duration_to_ms(timeout);
+        let timeout_ms = crate::runtime::duration_to_ms(timeout);
         let bytes = tokio::task::spawn_blocking(move || {
             crate::runtime::get_raw_timeout(&id, timeout_ms)
         })
@@ -155,7 +168,7 @@ impl<T> ObjectRef<T> {
     /// Asynchronously retrieve the object as a generic msgpack Value with timeout.
     pub async fn get_value_timeout_async(&self, timeout: std::time::Duration) -> Result<rmpv::Value, RayError> {
         let id = self.id.clone();
-        let timeout_ms = duration_to_ms(timeout);
+        let timeout_ms = crate::runtime::duration_to_ms(timeout);
         let bytes = tokio::task::spawn_blocking(move || {
             crate::runtime::get_raw_timeout(&id, timeout_ms)
         })
@@ -194,12 +207,4 @@ impl<T> From<ObjectRef<T>> for Vec<u8> {
     fn from(obj: ObjectRef<T>) -> Vec<u8> {
         obj.id
     }
-}
-
-/// Convert a duration to the millisecond timeout Ray's `Get` takes.
-///
-/// Capped at `i32::MAX` (about 24 days). A `Duration` is never negative, so the
-/// result can never become Ray's -1, which means wait forever.
-fn duration_to_ms(timeout: std::time::Duration) -> i32 {
-    timeout.as_millis().min(i32::MAX as u128) as i32
 }
