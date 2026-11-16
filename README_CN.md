@@ -257,7 +257,7 @@ rayrust 遵循地道的 Rust 设计模式，而非 C 风格的全局函数：
 
 ### RAII Context — `Ray`
 
-所有操作都是 `Ray` 上下文对象的方法。`Drop` 自动调用 `shutdown()` —— 不可能忘记清理，即使 panic 也能正确关闭。`Ray` 是 `!Clone`（传 `&Ray` 共享）。
+所有操作都是 `Ray` 上下文对象的方法。同一进程里的所有句柄共享一个运行时，`shutdown()` 在最后一个句柄 drop 时执行 —— 不可能忘记清理，即使 panic 也能正确关闭。同配置的第二次 `connect` 返回已经在运行的运行时，不会重新初始化；配置不同则返回 `RayError::Runtime`。`Ray` 是 `!Clone`（传 `&Ray` 共享）。
 
 ```rust
 let ray = Ray::connect(&config)?;  // 初始化

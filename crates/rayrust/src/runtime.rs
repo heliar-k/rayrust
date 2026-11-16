@@ -4,11 +4,12 @@
 //! We store them as `Vec<u8>` internally, not as Rust `String`.
 
 use std::os::raw::c_int;
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use rayrust_sys::{self, build_args_array, to_cstring, CBytesGuard, ErrorKind, RayBytes};
 
 use crate::error::RayError;
-use crate::object_ref::ObjectRef;
+use crate::object_ref::{check_epoch, ObjectRef};
 use crate::serialize::serialize;
 
 /// Result of `wait()`: (ready, unready) object references.
@@ -57,7 +58,7 @@ pub enum ActorLifetime {
 }
 
 /// Configuration for connecting to a Ray cluster.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RayConfig {
     /// Address of the head node, e.g. "192.168.42.141:6379".
     /// If empty, uses local mode.
@@ -143,33 +144,104 @@ impl RayConfig {
 
 /// Ray runtime context — owns the init→shutdown lifecycle.
 ///
-/// Created via [`Ray::connect`] or [`Ray::local`]. When dropped, the
-/// Ray runtime is automatically shut down. All Ray operations (put,
-/// get, task_call, actor_create, …) are methods on this struct.
+/// Created via [`Ray::connect`] or [`Ray::local`]. All handles in a process
+/// share one runtime: Ray is initialized once for as long as the runtime lives,
+/// and it is shut down when the last handle is dropped; a `connect` after that
+/// initializes a new runtime. A second `connect` with the same config returns
+/// a handle to the live runtime without re-initializing it; a config that
+/// differs returns [`RayError::Runtime`] naming the fields that differ.
 ///
-/// `Ray` is `!Clone` to prevent double-shutdown. Pass `&Ray` to
-/// share it across call sites.
+/// `Ray` is `!Clone`: [`Ray::connect`] is the only way to obtain a handle, and
+/// it is what checks the config against the live runtime. Share one handle by
+/// passing `&Ray`.
 ///
 /// # Example
 /// ```no_run
 /// use rayrust::prelude::*;
 ///
 /// let ray = Ray::connect(&RayConfig::new("127.0.0.1:6379")).unwrap();
-/// let obj = ray.put(&42i32);
+/// let obj = ray.put(&42i32).unwrap();
 /// let val: i32 = obj.get().unwrap();
-/// // drop(ray) → automatic shutdown
+/// // drop(ray) → shutdown when this is the last handle
 /// ```
 pub struct Ray {
-    _priv: (),
+    // 只为在最后一个句柄 drop 时触发 `RayInner` 的析构而持有，没有读取方。
+    #[allow(dead_code)]
+    inner: Arc<RayInner>,
 }
+
+/// 句柄共享的运行时。最后一个 `Arc` 释放时关闭 Ray。
+pub(crate) struct RayInner {
+    /// 初始化时用的配置，第二次 `connect` 用它判断配置是否一致。
+    config: RayConfig,
+}
+
+impl Drop for RayInner {
+    fn drop(&mut self) {
+        // 锁必须活到 `shutdown()` 返回：否则新 `connect` 会在关闭过程中重新初始化。
+        let mut live = LIVE.lock().expect("live runtime registry poisoned");
+        *live = None;
+        // 关闭之前先撤掉活着的代次：从这一刻起这个运行时的引用全部过期，
+        // 等待中的线程不会拿着过期引用进入正在关闭的 C++ 运行时。
+        crate::object_ref::retract_live_epoch();
+        shutdown();
+        // 登记表已经清空、C++ 侧已经关掉，等着的 `connect` 可以初始化新运行时了。
+        LIVE_CHANGED.notify_all();
+    }
+}
+
+/// 进程里活着的运行时。`Weak` 让登记表不延长运行时的存活期。
+static LIVE: Mutex<Option<Weak<RayInner>>> = Mutex::new(None);
+
+/// 登记表清空时唤醒正在等它的 `connect`。
+static LIVE_CHANGED: Condvar = Condvar::new();
 
 impl Ray {
     /// Connect to a Ray cluster with the given config.
     ///
-    /// Returns a `Ray` context that auto-shuts-down on drop.
+    /// A second call with the same config returns a handle to the runtime that
+    /// is already live. A config that differs returns [`RayError::Runtime`]
+    /// listing the fields that differ.
     pub fn connect(config: &RayConfig) -> Result<Self, RayError> {
+        // 初始化与登记期间持有同一把锁：`Drop for RayInner` 不能在这中间
+        // 执行 `shutdown()`，新运行时就不会被旧运行时的关闭动作带走。
+        let mut live = LIVE.lock().expect("live runtime registry poisoned");
+        let existing = loop {
+            match live.as_ref() {
+                // 没有登记运行时，下面初始化。
+                None => break None,
+                Some(handle) => match handle.upgrade() {
+                    Some(inner) => break Some(inner),
+                    // 强引用计数归零时就升级不到，而那时 `Drop for RayInner`
+                    // 可能还没拿到锁：等它把 C++ 侧关掉、清空登记表再初始化，
+                    // 否则新运行时会随后被那个迟到的 `shutdown()` 关掉。
+                    None => {
+                        live = LIVE_CHANGED
+                            .wait(live)
+                            .expect("live runtime registry poisoned")
+                    }
+                },
+            }
+        };
+        if let Some(inner) = existing {
+            let live_config = inner.config.clone();
+            // 先放锁：这里的 `Arc` 可能是最后一个，在锁内释放会让
+            // `Drop for RayInner` 再来取同一把锁。
+            drop(live);
+            if live_config == *config {
+                return Ok(Ray { inner });
+            }
+            return Err(RayError::Runtime(config_mismatch_message(
+                &live_config,
+                config,
+            )));
+        }
         init_with_config(config)?;
-        Ok(Ray { _priv: () })
+        let inner = Arc::new(RayInner {
+            config: config.clone(),
+        });
+        *live = Some(Arc::downgrade(&inner));
+        Ok(Ray { inner })
     }
 
     /// Connect in local mode (no cluster, single process).
@@ -317,6 +389,10 @@ impl Ray {
     ///
     /// Returns a `'static` future — does not borrow `&self`.
     /// This allows the future to be spawned on `JoinSet` or similar.
+    /// The future does not keep the runtime alive either: the epoch is taken
+    /// when the future is created, and the blocking-pool closure checks it
+    /// again right before the call to C++, so a future polled after the last
+    /// `Ray` handle was dropped fails with `RayError::Runtime`.
     /// Pass `&TaskOptions::new()` for no resource requirements.
     pub fn task_call_async(
         &self,
@@ -326,6 +402,7 @@ impl Ray {
         opts: &TaskOptions,
     ) -> impl std::future::Future<Output = Result<ObjectRef<()>, RayError>> + Send + 'static {
         let func_name = func_name.to_string();
+        let epoch = crate::object_ref::live_epoch();
         let has_resources = opts.has_resources();
         let resources_json = if has_resources {
             Some(opts.resources_json())
@@ -337,6 +414,7 @@ impl Ray {
                 // For async + resources, we use spawn_blocking on the sync FFI path
                 // (the C ABI for resources is sync-only).
                 tokio::task::spawn_blocking(move || {
+                    check_epoch(epoch)?;
                     let args_ref: Vec<&[u8]> = args.iter().map(|v| v.as_slice()).collect();
                     let is_ref_ref: &[bool] = if is_ref.is_empty() { &[] } else { &is_ref };
                     let func_c = to_cstring(&func_name);
@@ -363,7 +441,7 @@ impl Ray {
                 .await
                 .map_err(|e| RayError::Runtime(format!("task_call join error: {}", e)))?
             } else {
-                task_call_inner_async(func_name, args, is_ref).await
+                task_call_inner_async(func_name, args, is_ref, epoch).await
             }
         }
     }
@@ -419,6 +497,10 @@ impl Ray {
     ///
     /// Returns a `'static` future — does not borrow `&self`.
     /// This allows the future to be spawned on `JoinSet` or similar.
+    /// The future does not keep the runtime alive either: the epoch is taken
+    /// when the future is created, and the blocking-pool closure checks it
+    /// again right before the call to C++, so a future polled after the last
+    /// `Ray` handle was dropped fails with `RayError::Runtime`.
     pub fn actor_call_async(
         &self,
         actor_id: &[u8],
@@ -427,9 +509,8 @@ impl Ray {
     ) -> impl std::future::Future<Output = Result<ObjectRef<()>, RayError>> + Send + 'static {
         let actor_id = actor_id.to_vec();
         let func_name = func_name.to_string();
-        async move {
-            actor_call_inner_async(actor_id, func_name, args).await
-        }
+        let epoch = crate::object_ref::live_epoch();
+        async move { actor_call_inner_async(actor_id, func_name, args, epoch).await }
     }
 
     /// Call a method on a Python actor.
@@ -509,17 +590,68 @@ impl Ray {
     }
 }
 
-impl Drop for Ray {
-    fn drop(&mut self) {
-        if is_initialized() {
-            shutdown();
-        }
-    }
-}
-
 // ─── Lifecycle ────────────────────────────────────────────────
 
+/// 列出两份配置里不同的字段，用来说明第二次 `connect` 为什么被拒。
+fn config_mismatch_message(live: &RayConfig, requested: &RayConfig) -> String {
+    let mut differences: Vec<String> = Vec::new();
+    if live.address != requested.address {
+        differences.push(format!(
+            "address: {} -> {}",
+            live.address, requested.address
+        ));
+    }
+    if live.local_mode != requested.local_mode {
+        differences.push(format!(
+            "local_mode: {} -> {}",
+            live.local_mode, requested.local_mode
+        ));
+    }
+    if live.node_ip != requested.node_ip {
+        differences.push(format!(
+            "node_ip: {} -> {}",
+            live.node_ip, requested.node_ip
+        ));
+    }
+    if live.namespace != requested.namespace {
+        differences.push(format!(
+            "namespace: {} -> {}",
+            live.namespace, requested.namespace
+        ));
+    }
+    if live.runtime_env != requested.runtime_env {
+        differences.push(format!(
+            "runtime_env: {} -> {}",
+            live.runtime_env, requested.runtime_env
+        ));
+    }
+    if live.log_dir != requested.log_dir {
+        differences.push(format!(
+            "log_dir: {} -> {}",
+            live.log_dir, requested.log_dir
+        ));
+    }
+    if live.code_search_path != requested.code_search_path {
+        differences.push(format!(
+            "code_search_path: {:?} -> {:?}",
+            live.code_search_path, requested.code_search_path
+        ));
+    }
+    if live.default_actor_lifetime != requested.default_actor_lifetime {
+        differences.push(format!(
+            "default_actor_lifetime: {:?} -> {:?}",
+            live.default_actor_lifetime, requested.default_actor_lifetime
+        ));
+    }
+    format!(
+        "Ray is already initialized with a different config: {}",
+        differences.join(", ")
+    )
+}
+
 /// Initialize Ray runtime with full config.
+///
+/// 成功之后发布新的运行时代次：此前创建的 `ObjectRef` 全部属于已经关闭的运行时。
 pub(crate) fn init_with_config(config: &RayConfig) -> Result<(), RayError> {
     let address_c = to_cstring(&config.address);
     let local_mode = if config.local_mode { 1 } else { 0 };
@@ -545,6 +677,8 @@ pub(crate) fn init_with_config(config: &RayConfig) -> Result<(), RayError> {
     if ret != 0 {
         return Err(ffi_error("ray_init"));
     }
+
+    crate::object_ref::publish_live_epoch();
 
     // Warn if C++ SDK (default_worker) is not installed on this node.
     // This is needed for cluster-mode Rust actors — raylet launches default_worker
@@ -666,6 +800,9 @@ pub(crate) fn wait<T>(
     num_objects: usize,
     timeout_ms: i32,
 ) -> WaitResult<T> {
+    for obj_ref in object_refs {
+        check_epoch(obj_ref.epoch)?;
+    }
     validate_timeout(timeout_ms)?;
 
     let ids: Vec<RayBytes> = object_refs
@@ -822,8 +959,10 @@ pub(crate) async fn task_call_inner_async(
     func_name: String,
     args: Vec<Vec<u8>>,
     is_ref: Vec<bool>,
+    epoch: u64,
 ) -> Result<ObjectRef<()>, RayError> {
     tokio::task::spawn_blocking(move || {
+        check_epoch(epoch)?;
         let args_ref: Vec<&[u8]> = args.iter().map(|v| v.as_slice()).collect();
         task_call_inner(&func_name, &args_ref, &is_ref)
     })
@@ -1204,8 +1343,10 @@ pub(crate) async fn actor_call_inner_async(
     actor_id: Vec<u8>,
     func_name: String,
     args: Vec<Vec<u8>>,
+    epoch: u64,
 ) -> Result<ObjectRef<()>, RayError> {
     tokio::task::spawn_blocking(move || {
+        check_epoch(epoch)?;
         let args_ref: Vec<&[u8]> = args.iter().map(|v| v.as_slice()).collect();
         actor_call_inner(&actor_id, &func_name, &args_ref)
     })
@@ -1394,6 +1535,9 @@ pub(crate) fn get_many_with_timeout<T: serde::de::DeserializeOwned>(
     refs: &[ObjectRef<T>],
     timeout_ms: i32,
 ) -> Result<Vec<T>, RayError> {
+    for obj_ref in refs {
+        check_epoch(obj_ref.epoch)?;
+    }
     validate_timeout(timeout_ms)?;
 
     // 空 slice 的 as_ptr() 得到的是非空却不指向任何元素的指针，交给 C 侧做 0
