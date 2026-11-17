@@ -20,7 +20,9 @@
 // ─── Thread-local error storage ─────────────────────────────────
 // Instead of fprintf(stderr), we store the error message in a thread-local
 // string so the Rust side can retrieve it via ray_last_error().
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <cstring>
 
@@ -346,6 +348,8 @@ static void parse_actor_options(const char *options_json,
 
 // ─── Lifecycle ────────────────────────────────────────────────
 
+static void reopen_ref_count_gate(void);
+
 int ray_init(const char *address, int local_mode, const char *node_ip,
              const char *code_search_path,
              const char *runtime_env_json,
@@ -414,6 +418,7 @@ int ray_init(const char *address, int local_mode, const char *node_ip,
 
     try {
         ray::Init(config, argc, const_cast<char**>(arg_ptrs.data()));
+        reopen_ref_count_gate();
         return 0;
     } catch (const std::exception &e) {
         set_last_error_exception(e);
@@ -425,7 +430,90 @@ bool ray_is_initialized(void) {
     return ray::IsInitialized();
 }
 
+/// 引用计数调用与 `ray_shutdown` 互斥。
+///
+/// `CoreWorkerProcess::Shutdown()` 先 `ShutdownDriver()` 把 `core_worker_` 置空，
+/// 再 `core_worker_process.reset()`（src/ray/core_worker/core_worker_process.cc:101-108、
+/// 952-956）；在这两步之间 `IsInitialized()` 仍为真，而 `GetCoreWorker()` 发现
+/// `core_worker_` 为空就走 `QuickExit()` 直接终止进程（同文件 964-981），Rust 侧
+/// 没有捕获机会。
+///
+/// 闸门用「在途计数 + 关闭标志」而不是读写锁：`std::shared_mutex` 在 glibc 上是
+/// 读者优先，读者在共享锁里等 Ray 自己的引用计数互斥锁，关闭线程会一直拿不到独占
+/// 锁。这里关闭一开始就拒绝新的引用计数调用，随后等已进入的调用退出，后者只有微秒
+/// 级，所以关闭一定能推进。
+///
+/// 只有引用计数这两个函数进闸门：`get`/`put`/`wait` 这类阻塞调用不能进，
+/// 否则关闭要等一个可能无限的 `Get`。
+namespace {
+
+std::mutex &ref_count_gate_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::condition_variable &ref_count_gate_drained() {
+    static std::condition_variable drained;
+    return drained;
+}
+
+int &ref_count_in_flight() {
+    static int in_flight = 0;
+    return in_flight;
+}
+
+bool &ref_count_closing() {
+    static bool closing = false;
+    return closing;
+}
+
+}  // namespace
+
+/// 进入一次引用计数调用。关闭已经开始时返回 false，调用方跳过计数。
+static bool enter_ref_count(void) {
+    std::lock_guard<std::mutex> lock(ref_count_gate_mutex());
+    if (ref_count_closing()) return false;
+    ++ref_count_in_flight();
+    return true;
+}
+
+static void leave_ref_count(void) {
+    std::lock_guard<std::mutex> lock(ref_count_gate_mutex());
+    --ref_count_in_flight();
+    if (ref_count_in_flight() == 0) ref_count_gate_drained().notify_all();
+}
+
+/// 关闭之前调用：拒绝新的引用计数调用，等已经进入的那些退出。
+static void close_ref_count_gate(void) {
+    std::unique_lock<std::mutex> lock(ref_count_gate_mutex());
+    ref_count_closing() = true;
+    ref_count_gate_drained().wait(lock, [] { return ref_count_in_flight() == 0; });
+}
+
+/// `ray_init` 成功之后调用：重新打开闸门。
+///
+/// 只清关闭标志。在途计数不能在这里抹平：`ray_init` 与引用计数调用没有互斥，
+/// 清零之后那几次在途调用的 `leave` 会把计数减成负数，`close_ref_count_gate`
+/// 的谓词从此不成立，关闭永远等下去。不变量成立时它本来就是 0。
+static void reopen_ref_count_gate(void) {
+    std::lock_guard<std::mutex> lock(ref_count_gate_mutex());
+    ref_count_closing() = false;
+}
+
+/// 一次引用计数调用的在途凭证：析构时退出闸门，异常路径也不会漏掉。
+struct RefCountTicket {
+    RefCountTicket() : entered(enter_ref_count()) {}
+    ~RefCountTicket() {
+        if (entered) leave_ref_count();
+    }
+    RefCountTicket(const RefCountTicket &) = delete;
+    RefCountTicket &operator=(const RefCountTicket &) = delete;
+
+    bool entered;
+};
+
 void ray_shutdown(void) {
+    close_ref_count_gate();
     ray::Shutdown();
 }
 
@@ -478,6 +566,60 @@ ray_bytes_t ray_get(const char *id_data, size_t id_len, int timeout_ms) {
         set_last_error_exception(e);
         return ray_bytes_t{nullptr, 0};
     }
+}
+
+// ─── Reference Counting ──────────────────────────────────────
+
+/// 引用计数入口的共同前置检查：id 非空且正好 28 字节。
+/// `ObjectID::FromBinary` 对非空且长度不符的输入 RAY_CHECK 终止进程，对空串返回
+/// nil（src/ray/common/id.h:430-440），长度必须先在这里拒掉。
+static int check_object_id(const char *id_data, size_t id_len) {
+    if (!id_data) {
+        set_last_error("object id is null");
+        return -1;
+    }
+    if (id_len != ray::ObjectID::kLength) {
+        std::string msg = "object id must be "
+            + std::to_string(ray::ObjectID::kLength) + " bytes, got "
+            + std::to_string(id_len) + " bytes";
+        set_last_error(msg.c_str());
+        return -1;
+    }
+    return 0;
+}
+
+int ray_add_local_reference(const char *id_data, size_t id_len) {
+    ray_clear_error();
+    RefCountTicket ticket;
+    if (!ticket.entered) return 0;  // 关闭已经开始：core worker 即将消失，无需计数
+    try {
+        if (check_object_id(id_data, id_len) != 0) return -1;
+        auto runtime = ray::internal::GetRayRuntime();
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return -1;
+        }
+        runtime->AddLocalReference(std::string(id_data, id_len));
+        return 0;
+    } RAY_CATCH
+    return -1;
+}
+
+int ray_remove_local_reference(const char *id_data, size_t id_len) {
+    ray_clear_error();
+    RefCountTicket ticket;
+    if (!ticket.entered) return 0;  // 关闭已经开始：core worker 即将消失，无需计数
+    try {
+        if (check_object_id(id_data, id_len) != 0) return -1;
+        auto runtime = ray::internal::GetRayRuntime();
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return -1;
+        }
+        runtime->RemoveLocalReference(std::string(id_data, id_len));
+        return 0;
+    } RAY_CATCH
+    return -1;
 }
 
 bool *ray_wait(const ray_bytes_t *ids, size_t count, int num_objects, int timeout_ms) {

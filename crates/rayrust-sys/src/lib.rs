@@ -37,6 +37,8 @@ extern "C" {
     // Object Store
     pub fn ray_put(data: *const c_char, len: usize) -> RayBytes;
     pub fn ray_get(id_data: *const c_char, id_len: usize, timeout_ms: c_int) -> RayBytes;
+    pub fn ray_add_local_reference(id_data: *const c_char, id_len: usize) -> c_int;
+    pub fn ray_remove_local_reference(id_data: *const c_char, id_len: usize) -> c_int;
     pub fn ray_wait(
         ids: *const RayBytes,
         count: usize,

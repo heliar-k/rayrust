@@ -152,3 +152,11 @@ class Counter:
             "is_positive": self.value > 0,
             "history": [self.value - 2, self.value - 1, self.value],
         }
+
+
+# ── 嵌套引用：返回一个装着 ObjectRef 的 dict ───────────────────
+
+@ray.remote
+def return_dict_with_ref():
+    """返回一个装着 ObjectRef 的 dict：嵌套引用记在返回对象的 nested_refs 里。"""
+    return {"ref": ray.put(1)}
