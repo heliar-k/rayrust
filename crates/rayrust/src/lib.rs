@@ -19,6 +19,7 @@
 //! # Ok::<(), rayrust::RayError>(())
 //! ```
 
+pub mod actor_exit;
 pub mod async_runtime;
 pub mod error;
 pub mod object_ref;
@@ -34,8 +35,13 @@ pub use ctor;
 
 pub use error::RayError;
 pub use object_ref::ObjectRef;
-pub use runtime::{ActorHandle, ActorLifetime, ActorOptions, Ray, RayConfig, TaskOptions};
+pub use runtime::{
+    ActorHandle, ActorLifetime, ActorOptions, PlacementGroupInfo, Ray, RayConfig, TaskOptions,
+};
 pub use task_args::{TaskArg, TaskArgs};
+
+/// 在当前 actor 的方法里结束它。
+pub use actor_exit::exit_actor;
 
 /// Re-export block_on_async for the `#[remote]` proc macro.
 pub use async_runtime::block_on_async;
@@ -68,12 +74,14 @@ pub fn register_member_function(
 pub mod prelude {
     pub use crate::error::RayError;
     pub use crate::object_ref::ObjectRef;
-    pub use crate::runtime::{ActorHandle, ActorLifetime, ActorOptions, Ray, RayConfig, TaskOptions};
+    pub use crate::runtime::{
+        ActorHandle, ActorLifetime, ActorOptions, PlacementGroupInfo, Ray, RayConfig, TaskOptions,
+    };
     pub use crate::serialize::{
         deserialize, deserialize_value, deserialize_xlang, deserialize_xlang_value,
         serialize, serialize_xlang,
     };
     pub use crate::task_args::{TaskArg, TaskArgs};
-    pub use crate::{register_member_function, rmpv};
+    pub use crate::{exit_actor, register_member_function, rmpv};
     pub use rayrust_macros::{actor, remote};
 }

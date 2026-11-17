@@ -17,6 +17,51 @@
 #include <ray/api/function_manager.h>
 #include <ray/api/internal_api.h>
 
+// `RayIntentionalSystemExitException` 定义在 `cpp/src/ray/runtime/abstract_ray_runtime.h`，
+// wheel 只带 `include/ray/api/*`，所以这里按上游定义重述一次：与 `RayException` 同构，
+// 只有一个构造函数。
+//
+// 它能工作靠的是 C++ ABI 的异常匹配规则。本仓库 `.so` 里这份重述类的 typeinfo 是本地
+// 符号：Rust cdylib 的 version script 把编进去的 C++ 符号全部本地化，
+// `nm -D --defined-only target/release/librayrust_worker.so` 里没有任何
+// `_ZTIN3ray8internal33...` 条目，所以动态链接器没有把它与 libray_api.so 导出的那份统一
+// 过，两份 typeinfo 的地址不同。`GetExecuteResult` 的
+// `catch (RayIntentionalSystemExitException &)` 仍然能接住，是因为 libstdc++ 在 typeinfo
+// 指针不同时退到比较 mangled name：`type_info::operator==` 走
+// `strcmp(__name, __arg.name())`，前提是 `__GXX_MERGED_TYPEINFO_NAMES` 为 0（本机
+// libstdc++ 的默认值）。两份 typeinfo 的名字都是
+// `N3ray8internal33RayIntentionalSystemExitExceptionE`。
+//
+// 前提是重述类与 SDK 的类**同命名空间、同类名、同布局**。命名空间与类名由名字本身
+// 保证；布局用下面的 static_assert 卡住——本类没有数据成员，布局就是基类的布局，SDK
+// 给它加成员或换基类时这里编译不过。改名、换基类的重述实测都停在
+// `task_executor.cc:101` 的通用 catch（它的日志行在 `:110`）。
+//
+// 前提不成立时的可观察现象：`__GXX_MERGED_TYPEINFO_NAMES` 为 1 的平台不做名字比较，
+// 异常掉到 `GetExecuteResult` 的通用 catch（`cpp/src/ray/runtime/task/task_executor.cc:101`，
+// 日志行 `:110`），actor 不会退出、那次方法调用报
+// `RayError::Task`。两组对照（C1 抛基类 `RayException`、C2 只把重述类改名）都停在那里，
+// actor 继续活着；`crates/rayrust/examples/runtime_api_test.rs` 第 4 项
+// （`exit()` 之后的方法必须报错）在那种环境下会失败。
+namespace ray {
+namespace internal {
+class RayIntentionalSystemExitException : public RayException {
+ public:
+  RayIntentionalSystemExitException(const std::string &msg) : RayException(msg){};
+};
+
+static_assert(std::is_base_of_v<RayException, RayIntentionalSystemExitException>,
+              "the restated exception must derive from ray::internal::RayException: the "
+              "SDK's catch hierarchy is built on that base");
+static_assert(sizeof(RayIntentionalSystemExitException) == sizeof(RayException),
+              "the restated exception has no data members, so its layout is the base "
+              "class's; a member added to the SDK's class would make the thrown object's "
+              "layout wrong while the mangled name still matches");
+static_assert(alignof(RayIntentionalSystemExitException) == alignof(RayException),
+              "the restated exception must keep the SDK class's alignment");
+}  // namespace internal
+}  // namespace ray
+
 // ─── Thread-local error storage ─────────────────────────────────
 // Instead of fprintf(stderr), we store the error message in a thread-local
 // string so the Rust side can retrieve it via ray_last_error().
@@ -25,6 +70,7 @@
 #include <mutex>
 #include <string>
 #include <cstring>
+#include <type_traits>
 
 static thread_local std::string g_last_error;
 static thread_local int g_last_error_kind = RAY_ERROR_KIND_NONE;
@@ -150,6 +196,25 @@ static std::unordered_map<std::string, ray_func_callback_t> &get_rust_functions(
     return map;
 }
 
+/// Rust 回调用哨兵长度表示「这次调用要按退出处理」。判断必须在
+/// `std::free(result.data)` 之前：哨兵没有 data，长度也不能进 `msgpack::sbuffer`。
+/// 抛出的异常穿过 C++ 帧回到 `GetExecuteResult` 的 try，那里才是决定成败的地方。
+static void throw_for_exit_sentinel(size_t len) {
+    if (len == RAY_INTENTIONAL_EXIT_SENTINEL) {
+        // 与 AbstractRayRuntime::ExitActor 抛的是同一个类：GetExecuteResult 的
+        // `catch (RayIntentionalSystemExitException &)`（cpp/src/ray/runtime/task/task_executor.cc:97，
+        // 日志行 `:98`）用它把「故意退出」与「失败」分开。
+        throw ray::internal::RayIntentionalSystemExitException("SystemExit");
+    }
+    if (len == RAY_EXIT_OUTSIDE_ACTOR_SENTINEL) {
+        // 任务与 actor 构造函数走这条：GetExecuteResult 的通用
+        // `catch (const std::exception &)`（同文件 `:101`，日志行 `:110`）把它变成该次
+        // 调用的失败。
+        throw ray::internal::RayException(
+            "exit_actor() can only be called from inside an actor method");
+    }
+}
+
 static msgpack::sbuffer invoke_rust_function(const std::string &func_name,
                                               const ray::internal::ArgsBufferList &args_buffer) {
     auto &fns = get_rust_functions();
@@ -167,6 +232,9 @@ static msgpack::sbuffer invoke_rust_function(const std::string &func_name,
 
     // Call the Rust callback
     ray_bytes_t result = it->second(args_arr.data(), args_arr.size());
+
+    // actor 构造函数通过这个回调进入（ray_register_function），所以哨兵在这里截住。
+    throw_for_exit_sentinel(result.len);
 
     // Copy result into msgpack::sbuffer and free the C-allocated data
     msgpack::sbuffer sbuf(result.len);
@@ -228,6 +296,9 @@ static msgpack::sbuffer invoke_rust_member_function(
 
     // Call the Rust callback
     ray_bytes_t result = it->second(actor_ptr, args_arr.data(), args_arr.size());
+
+    // 只有成员回调会返回 RAY_INTENTIONAL_EXIT_SENTINEL。
+    throw_for_exit_sentinel(result.len);
 
     // Copy result into msgpack::sbuffer and free the C-allocated data
     msgpack::sbuffer sbuf(result.len);
@@ -302,6 +373,33 @@ static std::string hex_decode(const std::string &hex) {
         out.push_back(static_cast<char>((hi << 4) | lo));
     }
     return out;
+}
+
+/// `ray::PlacementGroupID::kLength`：14 个唯一字节 + 4 字节 JobID
+/// （src/ray/common/id.h:300-306）。wheel 不带 id.h（见 #19），常量在此手抄；
+/// `PlacementGroupID::FromBinary` 对非空且长度不符的输入 RAY_CHECK 终止进程，
+/// 所以每个拿到 group id 的入口都在进 SDK 之前按它检查长度。
+static constexpr size_t kPlacementGroupIdLength = 18;
+
+/// `ray::ActorID` 的长度：12 个唯一字节 + 4 字节 JobID
+/// （src/ray/common/id.h:124-142）。手抄的原因与 group id 相同：
+/// `ActorID::FromBinary` 对非空且长度不符的输入 RAY_CHECK。
+static constexpr size_t kActorIdLength = 16;
+
+/// group id 的共同前置检查：非空且正好 18 字节。
+static int check_placement_group_id(const char *group_id_data, size_t group_id_len) {
+    if (!group_id_data || group_id_len == 0) {
+        set_last_error("placement group id is empty");
+        return -1;
+    }
+    if (group_id_len != kPlacementGroupIdLength) {
+        std::string msg = "placement group id must be " +
+                          std::to_string(kPlacementGroupIdLength) + " bytes, got " +
+                          std::to_string(group_id_len) + " bytes";
+        set_last_error(msg.c_str());
+        return -1;
+    }
+    return 0;
 }
 
 /// Parse an options JSON string and fill an ActorCreationOptions struct.
@@ -413,9 +511,8 @@ static void parse_call_options(const char *options_json,
         }
         // ray::PlacementGroupID::kLength from src/ray/common/id.h: 14 unique
         // bytes + a 4-byte JobID. The wheel ships no id.h (see #19), so the
-        // constant is restated here; FromBinary RAY_CHECKs it and would abort
-        // the process instead of returning an error.
-        constexpr size_t kPlacementGroupIdLength = 18;
+        // constant is restated in this file; FromBinary RAY_CHECKs it and would
+        // abort the process instead of returning an error.
         if (pg_id.size() != kPlacementGroupIdLength) {
             throw std::runtime_error(
                 "placement group id must be " +
@@ -1074,6 +1171,96 @@ void ray_actor_kill(const char *actor_id_data, size_t actor_id_len, bool no_rest
     }
 }
 
+ray_bytes_t ray_actor_handle_serialize(const char *actor_id_data, size_t actor_id_len) {
+    ray_clear_error();
+    if (!actor_id_data || actor_id_len != kActorIdLength) {
+        std::string msg = "actor id must be " + std::to_string(kActorIdLength) +
+                          " bytes, got " + std::to_string(actor_id_len) + " bytes";
+        set_last_error(msg.c_str());
+        return ray_bytes_t{nullptr, 0};
+    }
+    try {
+        auto runtime = ray::internal::GetRayRuntime();
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return ray_bytes_t{nullptr, 0};
+        }
+        if (runtime->IsLocalMode()) {
+            // AbstractRayRuntime::SerializeActorHandle 的第一句就是
+            // CoreWorkerProcess::GetCoreWorker()，本地模式从不启动 core worker 进程，
+            // 那里直接 QuickExit()（_Exit(1)，src/ray/util/process.cc）。
+            set_last_error(
+                "actor handles cannot be serialized in local mode: local mode never "
+                "starts a core worker process");
+            return ray_bytes_t{nullptr, 0};
+        }
+        std::string serialized =
+            runtime->SerializeActorHandle(std::string(actor_id_data, actor_id_len));
+        if (serialized.empty()) {
+            set_last_error("the core worker returned no serialized actor handle");
+            return ray_bytes_t{nullptr, 0};
+        }
+        return dup_bytes(serialized);
+    } RAY_CATCH
+    return ray_bytes_t{nullptr, 0};
+}
+
+ray_bytes_t ray_actor_handle_deserialize(const char *serialized_data,
+                                         size_t serialized_len) {
+    ray_clear_error();
+    if (!serialized_data || serialized_len == 0) {
+        set_last_error("the serialized actor handle is empty");
+        return ray_bytes_t{nullptr, 0};
+    }
+    try {
+        auto runtime = ray::internal::GetRayRuntime();
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return ray_bytes_t{nullptr, 0};
+        }
+        if (runtime->IsLocalMode()) {
+            // 本地模式从不创建 core worker 进程：DeserializeAndRegisterActorHandle 走
+            // CoreWorkerProcess::GetCoreWorker()，那里的 EnsureInitialized 直接
+            // QuickExit()，也就是 _Exit(1)（src/ray/util/process.cc），Rust 侧没有
+            // 任何捕获机会。
+            set_last_error(
+                "actor handles cannot be deserialized in local mode: local mode never "
+                "starts a core worker process");
+            return ray_bytes_t{nullptr, 0};
+        }
+        std::string actor_id = runtime->DeserializeAndRegisterActorHandle(
+            std::string(serialized_data, serialized_len));
+        if (actor_id.size() != kActorIdLength) {
+            set_last_error(
+                ("the core worker returned a " + std::to_string(actor_id.size()) +
+                 " byte actor id instead of " + std::to_string(kActorIdLength) + " bytes")
+                    .c_str());
+            return ray_bytes_t{nullptr, 0};
+        }
+        // 畸形字节：上游丢弃 `ParseFromString` 的结果（actor_handle.cc:66、:135），
+        // 空 actor id 变成 `ActorID::Nil()` 并登记成 nil actor。合法 actor id 是
+        // `ActorID::Of(job_id, task_id, counter)` 算出来的散列，不会是全 0xff（
+        // `BaseID()` 的填充）也不会是全 0x00。拒掉它，因为 nil handle 在调用方手里
+        // 没有任何明确的失败：调用提交成功但永远不就绪（`get` 到期才报超时），
+        // `serialize()` 把登记的那份 protobuf 再交出来（长度与登记时相同，protobuf
+        // 重新序列化可能改写长度前缀；重新序列化结果为空时报错），坏 handle 因此会一路传播。
+        bool all_ff = true;
+        bool all_zero = true;
+        for (char byte : actor_id) {
+            if (byte != static_cast<char>(0xff)) all_ff = false;
+            if (byte != '\0') all_zero = false;
+        }
+        if (all_ff || all_zero) {
+            set_last_error(
+                "the bytes are not a valid actor handle: they register as the nil actor, "
+                "which never answers a call");
+            return ray_bytes_t{nullptr, 0};
+        }
+        return dup_bytes(actor_id);
+    } RAY_CATCH
+    return ray_bytes_t{nullptr, 0};
+}
+
 // ─── Placement Group ──────────────────────────────────────────
 
 // nlohmann/json is shipped with the Ray C++ SDK headers.
@@ -1127,6 +1314,135 @@ void ray_placement_group_remove(const char *group_id_data, size_t group_id_len) 
     }
 }
 
+/// 把一个组打包成 4 元数组 [id(bin), name(str), state(int), strategy(int)]。
+/// id 用 bin、name 用 str：id 是二进制、可能含 0 字节，name 是 UTF-8 文本。
+static void pack_placement_group(msgpack::packer<msgpack::sbuffer> &packer,
+                                 ray::PlacementGroup &group) {
+    std::string id = group.GetID();
+    std::string name = group.GetName();
+    packer.pack_array(4);
+    packer.pack_bin(id.size());
+    packer.pack_bin_body(id.data(), id.size());
+    packer.pack_str(name.size());
+    packer.pack_str_body(name.data(), name.size());
+    packer.pack_int(static_cast<int>(group.GetState()));
+    packer.pack_int(static_cast<int>(group.GetStrategy()));
+}
+
+/// 把若干组打包成 msgpack 数组，复制到 C 堆上交给 Rust。
+static ray_bytes_t dup_placement_groups(std::vector<ray::PlacementGroup> &groups) {
+    msgpack::sbuffer buffer;
+    msgpack::packer<msgpack::sbuffer> packer(&buffer);
+    packer.pack_array(groups.size());
+    for (auto &group : groups) {
+        pack_placement_group(packer, group);
+    }
+    return dup_bytes(std::string(buffer.data(), buffer.size()));
+}
+
+int ray_placement_group_wait_ready(const char *group_id_data, size_t group_id_len,
+                                   int timeout_seconds) {
+    ray_clear_error();
+    if (check_placement_group_id(group_id_data, group_id_len) != 0) return -1;
+    try {
+        auto runtime = ray::internal::GetRayRuntime();
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return -1;
+        }
+        if (runtime->IsLocalMode()) {
+            // 接口默认实现是 `return true`（task_submitter.h:49-52），本地模式没有
+            // 覆盖它，报「ready」等于对任何 id 都说就绪。
+            set_last_error(
+                "placement groups are not supported in local mode: waiting would "
+                "report every group as ready without waiting");
+            return -1;
+        }
+        bool ready = runtime->WaitPlacementGroupReady(
+            std::string(group_id_data, group_id_len),
+            static_cast<int64_t>(timeout_seconds));
+        return ready ? 1 : 0;
+    } RAY_CATCH
+    return -1;
+}
+
+ray_bytes_t ray_placement_group_get_all(void) {
+    ray_clear_error();
+    try {
+        auto runtime = ray::internal::GetRayRuntime();
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return ray_bytes_t{nullptr, 0};
+        }
+        if (runtime->IsLocalMode()) {
+            set_last_error(
+                "placement group queries are not supported in local mode: the GCS "
+                "accessor they read is null there");
+            return ray_bytes_t{nullptr, 0};
+        }
+        auto groups = runtime->GetAllPlacementGroups();
+        return dup_placement_groups(groups);
+    } RAY_CATCH
+    return ray_bytes_t{nullptr, 0};
+}
+
+ray_bytes_t ray_placement_group_get_by_id(const char *group_id_data, size_t group_id_len) {
+    ray_clear_error();
+    if (check_placement_group_id(group_id_data, group_id_len) != 0) {
+        return ray_bytes_t{nullptr, 0};
+    }
+    try {
+        auto runtime = ray::internal::GetRayRuntime();
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return ray_bytes_t{nullptr, 0};
+        }
+        if (runtime->IsLocalMode()) {
+            set_last_error(
+                "placement group queries are not supported in local mode: the GCS "
+                "accessor they read is null there");
+            return ray_bytes_t{nullptr, 0};
+        }
+        // 查不到时上游返回空组（`PlacementGroup::Empty()`），空数组让调用方把
+        // 「查不到」与「查到了」分开。
+        std::vector<ray::PlacementGroup> groups;
+        auto group = runtime->GetPlacementGroupById(std::string(group_id_data, group_id_len));
+        if (!group.Empty()) {
+            groups.push_back(std::move(group));
+        }
+        return dup_placement_groups(groups);
+    } RAY_CATCH
+    return ray_bytes_t{nullptr, 0};
+}
+
+ray_bytes_t ray_placement_group_get_by_name(const char *name) {
+    ray_clear_error();
+    if (!name) {
+        set_last_error("placement group name is null");
+        return ray_bytes_t{nullptr, 0};
+    }
+    try {
+        auto runtime = ray::internal::GetRayRuntime();
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return ray_bytes_t{nullptr, 0};
+        }
+        if (runtime->IsLocalMode()) {
+            set_last_error(
+                "placement group queries are not supported in local mode: the GCS "
+                "accessor they read is null there");
+            return ray_bytes_t{nullptr, 0};
+        }
+        std::vector<ray::PlacementGroup> groups;
+        auto group = runtime->GetPlacementGroup(std::string(name));
+        if (!group.Empty()) {
+            groups.push_back(std::move(group));
+        }
+        return dup_placement_groups(groups);
+    } RAY_CATCH
+    return ray_bytes_t{nullptr, 0};
+}
+
 // ─── Misc ─────────────────────────────────────────────────────
 
 bool ray_was_current_actor_restarted(void) {
@@ -1135,6 +1451,11 @@ bool ray_was_current_actor_restarted(void) {
         if (runtime) return runtime->WasCurrentActorRestarted();
     } catch (...) {}
     return false;
+}
+
+bool ray_is_local_mode(void) {
+    auto runtime = ray::internal::GetRayRuntime();
+    return runtime ? runtime->IsLocalMode() : false;
 }
 
 ray_bytes_t ray_get_namespace(void) {

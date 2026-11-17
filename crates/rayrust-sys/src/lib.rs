@@ -17,6 +17,22 @@ pub struct RayBytes {
     pub len: usize,
 }
 
+// ─── Rust 回调的哨兵长度 ──────────────────
+
+/// Rust 回调返回「actor 方法里调用了 `exit_actor()`」的长度，`data` 为空指针。
+///
+/// C 侧看到这个值就不读 `data`、也不把它当结果，而是在 Rust 帧返回之后抛
+/// `ray::internal::RayIntentionalSystemExitException("SystemExit")`。真实结果不可能
+/// 这么长（malloc 申请不到 2^64-1 字节）。必须与 `wrapper/ray_c.h` 的
+/// `RAY_INTENTIONAL_EXIT_SENTINEL` 一致。
+pub const RAY_INTENTIONAL_EXIT_SENTINEL: usize = usize::MAX;
+
+/// Rust 回调返回「在任务或 actor 构造函数里调用了 `exit_actor()`」的长度，`data`
+/// 为空指针。C 侧看到这个值就抛 `ray::internal::RayException`，`GetExecuteResult`
+/// 把它变成该次调用的失败。必须与 `wrapper/ray_c.h` 的
+/// `RAY_EXIT_OUTSIDE_ACTOR_SENTINEL` 一致。
+pub const RAY_EXIT_OUTSIDE_ACTOR_SENTINEL: usize = usize::MAX - 1;
+
 // ─── extern "C" function declarations ─────────────────────────
 
 extern "C" {
@@ -93,6 +109,14 @@ extern "C" {
         is_ref: *const bool,
     ) -> RayBytes;
     pub fn ray_actor_kill(actor_id_data: *const c_char, actor_id_len: usize, no_restart: bool);
+    pub fn ray_actor_handle_serialize(
+        actor_id_data: *const c_char,
+        actor_id_len: usize,
+    ) -> RayBytes;
+    pub fn ray_actor_handle_deserialize(
+        serialized_data: *const c_char,
+        serialized_len: usize,
+    ) -> RayBytes;
 
     // Placement Group
     pub fn ray_placement_group_create(
@@ -101,6 +125,17 @@ extern "C" {
         strategy: c_int,
     ) -> RayBytes;
     pub fn ray_placement_group_remove(group_id_data: *const c_char, group_id_len: usize);
+    pub fn ray_placement_group_wait_ready(
+        group_id_data: *const c_char,
+        group_id_len: usize,
+        timeout_seconds: c_int,
+    ) -> c_int;
+    pub fn ray_placement_group_get_all() -> RayBytes;
+    pub fn ray_placement_group_get_by_id(
+        group_id_data: *const c_char,
+        group_id_len: usize,
+    ) -> RayBytes;
+    pub fn ray_placement_group_get_by_name(name: *const c_char) -> RayBytes;
 
     // Function Registration
     pub fn ray_register_function(
@@ -118,6 +153,7 @@ extern "C" {
 
     // Misc
     pub fn ray_was_current_actor_restarted() -> bool;
+    pub fn ray_is_local_mode() -> bool;
     pub fn ray_get_namespace() -> RayBytes;
     pub fn ray_get_actor(name: *const c_char, ray_namespace: *const c_char) -> RayBytes;
     pub fn ray_cancel(id_data: *const c_char, id_len: usize, force_kill: bool, recursive: bool) -> c_int;

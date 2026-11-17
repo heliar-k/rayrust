@@ -25,6 +25,29 @@ typedef struct {
     size_t len;
 } ray_bytes_t;
 
+/// Rust 回调返回的哨兵长度（`data` 为空指针），配合 `ray_func_callback_t` 与
+/// `ray_member_callback_t` 使用。真实结果不可能有这么长（`std::malloc` 申请不到
+/// 2^64-1 字节），所以它们不会与合法结果相撞。
+///
+/// - `RAY_INTENTIONAL_EXIT_SENTINEL`：actor 方法里调用了 `exit_actor()`。C 侧在
+///   Rust 帧返回之后抛 `ray::internal::RayIntentionalSystemExitException`，与
+///   `AbstractRayRuntime::ExitActor` 抛的是同一个类；`GetExecuteResult` 把它变成
+///   `Status::IntentionalSystemExit`（`cpp/src/ray/runtime/task/task_executor.cc:97-100`），
+///   `ExecuteTask` 见到该状态直接返回、不写 meta buffer（同文件 209-211），actor
+///   因此被关闭、不会被 `max_restarts` 重启。
+/// - `RAY_EXIT_OUTSIDE_ACTOR_SENTINEL`：在任务或 actor 构造函数里调用了
+///   `exit_actor()`。C 侧抛 `ray::internal::RayException`，`GetExecuteResult` 的
+///   `catch (const std::exception &)` 把它变成该次调用的失败。
+///
+/// 本地模式（`ray::RayConfig::local_mode`）不会走到这两个哨兵：本地模式没有 core worker，
+/// 退出语义没有承接方，Rust 侧的 `exit_actor()` 在那里是空操作（不置标志），见
+/// `crates/rayrust/src/actor_exit.rs` 的模块文档。
+///
+/// 必须与 `crates/rayrust-sys/src/lib.rs` 的 `RAY_INTENTIONAL_EXIT_SENTINEL` 与
+/// `RAY_EXIT_OUTSIDE_ACTOR_SENTINEL` 一致。
+#define RAY_INTENTIONAL_EXIT_SENTINEL ((size_t)-1)
+#define RAY_EXIT_OUTSIDE_ACTOR_SENTINEL ((size_t)-1 - 1)
+
 // ─── Lifecycle ────────────────────────────────────────────────
 
 /// Initialize Ray runtime.
@@ -217,6 +240,44 @@ ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len
 /// `actor_id_data`/`actor_id_len` is the binary actor ID.
 void ray_actor_kill(const char *actor_id_data, size_t actor_id_len, bool no_restart);
 
+/// Serialize a registered actor handle.
+/// `actor_id_data`/`actor_id_len` must be exactly 16 bytes (the Ray 2.51.1
+/// ActorID length, `src/ray/common/id.h:124-142`); any other length is rejected
+/// without touching Ray, because `ActorID::FromBinary` RAY_CHECKs the length
+/// (`src/ray/common/id.h:430-441`).
+/// The id must belong to a handle this process registered. The SDK's
+/// `ActorManager::GetActorHandle` RAY_CHECKs an unknown id and terminates the
+/// process (`src/ray/core_worker/actor_manager.cc:52-59`), so the Rust side only
+/// exposes this on handles obtained from creation, `ray_get_actor` or
+/// `ray_actor_handle_deserialize`. Measured: a handle held across a shutdown and
+/// re-init of the runtime aborts the process here, the same way `ray_actor_call`
+/// does for the same stale id.
+/// Local mode returns an error: `AbstractRayRuntime::SerializeActorHandle` starts
+/// with `CoreWorkerProcess::GetCoreWorker()`, whose `EnsureInitialized` calls
+/// `QuickExit()` (`_Exit(1)`, `src/ray/util/process.cc`) because local mode never
+/// starts a core worker process.
+/// Returns the serialized handle bytes, or data=NULL with last_error set.
+ray_bytes_t ray_actor_handle_serialize(const char *actor_id_data, size_t actor_id_len);
+
+/// Register an actor handle from its serialized bytes and return its binary
+/// actor id (16 bytes).
+/// Empty input is rejected without touching Ray. Upstream
+/// `ActorHandle(serialized)` discards the `ParseFromString` result
+/// (`src/ray/core_worker/actor_handle.cc:66`, `:135`), so bytes that are not a
+/// valid protobuf register as the nil actor and come back as 16 bytes of 0xff.
+/// Such bytes are rejected here as well, and so are 16 bytes of 0x00: a real
+/// actor id is a hash and never either pattern. What a nil handle does instead is
+/// why: its calls are submitted but never become ready (`get` waits out its
+/// deadline), and `serialize()` hands the registered protobuf back — the same
+/// length as the bytes that were registered, with protobuf re-serialization free
+/// to rewrite a length prefix — or an error when re-serializing produces nothing,
+/// so a bad handle would keep spreading.
+/// Local mode returns an error: `DeserializeAndRegisterActorHandle` reads
+/// `CoreWorkerProcess::GetCoreWorker()`, whose `EnsureInitialized` calls
+/// `QuickExit()` (`_Exit(1)`, `src/ray/util/process.cc`) because local mode never
+/// starts a core worker process.
+ray_bytes_t ray_actor_handle_deserialize(const char *serialized_data, size_t serialized_len);
+
 // ─── Placement Group ──────────────────────────────────────────
 
 /// Create a placement group.
@@ -232,10 +293,66 @@ ray_bytes_t ray_placement_group_create(const char *name,
 /// `group_id_data`/`group_id_len` is the binary group ID.
 void ray_placement_group_remove(const char *group_id_data, size_t group_id_len);
 
+/// Wait for a placement group to be ready.
+/// `group_id_data`/`group_id_len` must be exactly 18 bytes
+/// (`PlacementGroupID::kLength`); any other length is rejected without touching
+/// Ray, because `PlacementGroupID::FromBinary` RAY_CHECKs the length
+/// (`src/ray/common/id.h:430-441`). Empty is rejected for the same reason the
+/// other entries reject it: the nil id names no group.
+/// `timeout_seconds` is passed to GCS as-is and becomes the RPC deadline: a
+/// positive value waits that long, `0` sets the deadline to now, a negative value
+/// puts it in the past. Measured on an already-ready group (three runs, same
+/// result): `0` still returns 1 because the reply arrives within the millisecond,
+/// while a **negative value returns 0 without looking at the group**, even when
+/// the group is ready. An unready group returns 0 when the deadline passes.
+/// Returns 1 = ready, 0 = not ready, -1 = error with the message in
+/// ray_last_error().
+/// Local mode returns -1: `LocalModeTaskSubmitter` does not override the
+/// interface default `return true` (`cpp/src/ray/runtime/task/task_submitter.h:49-52`),
+/// so the SDK would answer "ready" without waiting for anything.
+int ray_placement_group_wait_ready(const char *group_id_data, size_t group_id_len,
+                                   int timeout_seconds);
+
+/// Query placement groups. Each returns a msgpack array of groups, where a group
+/// is a 4-element array [id (bin), name (str), state (int), strategy (int)].
+/// - `ray_placement_group_get_all`: every row in the GCS table, including the
+///   ones whose state is REMOVED. GCS rewrites the row to REMOVED instead of
+///   deleting it (`src/ray/gcs/gcs_placement_group_manager.cc:458-469`), so "all"
+///   is not "all live" and the caller has to read `state`.
+/// - `ray_placement_group_get_by_id`: a removed group still comes back with
+///   `state == 3`; an empty array means the id never named a group.
+/// - `ray_placement_group_get_by_name`: looked up in the current job's namespace
+///   only (`AbstractRayRuntime::GetPlacementGroup` passes
+///   `GetJobConfig().ray_namespace()`), so a group created in another namespace
+///   reads as "no such group". The name mapping is erased when the group is
+///   removed (`gcs_placement_group_manager.cc:414-427`), so this one starts
+///   returning an empty array before `_by_id` does.
+///
+/// `state` and `strategy` keep the SDK's integer encoding
+/// (`cpp/include/ray/api/task_options.h:44-58`): PlacementGroupState PENDING 0,
+/// PREPARED 1, CREATED 2, REMOVED 3, RESCHEDULING 4, UNRECOGNIZED -1;
+/// PlacementStrategy PACK 0, SPREAD 1, STRICT_PACK 2, STRICT_SPREAD 3.
+/// Bundles are not returned: `AbstractRayRuntime::GeneratePlacementGroup` builds
+/// an empty bundle vector and copies from it
+/// (`cpp/src/ray/runtime/abstract_ray_runtime.cc:326-340`), so `GetBundles()` is
+/// always empty.
+///
+/// `_by_id` requires exactly 18 bytes, like ray_placement_group_wait_ready.
+/// All three return data=NULL with last_error set on error, and all three fail in
+/// local mode: `global_state_accessor_` is null there and these three read it
+/// directly (`cpp/src/ray/runtime/abstract_ray_runtime.cc:342-370`).
+ray_bytes_t ray_placement_group_get_all(void);
+ray_bytes_t ray_placement_group_get_by_id(const char *group_id_data, size_t group_id_len);
+ray_bytes_t ray_placement_group_get_by_name(const char *name);
+
 // ─── Misc ─────────────────────────────────────────────────────
 
 /// Returns true if the current actor was restarted.
 bool ray_was_current_actor_restarted(void);
+
+/// Returns true if this process is in local mode.
+/// Returns false before `ray_init`: there is no runtime to ask.
+bool ray_is_local_mode(void);
 
 /// Get the namespace of this job.
 /// Returns a ray_bytes_t containing the namespace string.
@@ -309,7 +426,8 @@ void ray_free_bools(bool *ptr);
 /// `RayFunctionNotFound` and `RayRuntimeEnvException` have no constant here:
 /// neither class ever reaches this side. A missing function is thrown only on
 /// the worker, where `TaskExecutor`'s catch turns it into `Status::Invalid`
-/// (`cpp/src/ray/runtime/task/task_executor.cc:101-110`), so the driver sees
+/// (`cpp/src/ray/runtime/task/task_executor.cc:101-111`, the catch at `:101` and the
+/// `Status::Invalid` it returns at `:111`), so the driver sees
 /// a `RayTaskException`. A malformed runtime_env is deserialized before
 /// `ray_init`'s `try`, so it aborts the process instead of being recorded.
 typedef enum {
