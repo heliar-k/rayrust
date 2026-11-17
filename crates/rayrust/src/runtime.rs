@@ -1443,7 +1443,7 @@ fn check_task_options(opts: &TaskOptions) -> Result<(), RayError> {
 ///     .max_concurrency(10)
 ///     .resource("CPU", 2.0);
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ActorOptions {
     /// Named actor name. Empty = anonymous actor.
     pub name: String,
@@ -1457,10 +1457,38 @@ pub struct ActorOptions {
     pub max_concurrency: i32,
     /// Serialized runtime environment info string.
     pub serialized_runtime_env_info: String,
-    /// Hex-encoded placement group ID (binary). Empty = no placement group.
+    /// Binary placement group ID, exactly 18 bytes when non-empty.
+    /// Empty = do not bind to a placement group.
     pub placement_group_id: Vec<u8>,
-    /// Bundle index within the placement group.
+    /// Bundle index within the placement group: -1 (default) = any bundle in the
+    /// group, otherwise non-negative; -1 is the smallest negative value. Only
+    /// meaningful together with `placement_group_id`.
     pub bundle_index: i32,
+}
+
+impl Default for ActorOptions {
+    /// Same as [`ActorOptions::new`]: `bundle_index` is -1 (any bundle in the
+    /// group). A derived `Default` would give 0, so
+    /// `ActorOptions { placement_group_id, ..Default::default() }` would pin the
+    /// actor to the first bundle. `max_concurrency` is 1, the documented and
+    /// SDK-side default (#29); a derived 0 keeps running serially in 2.51.1 only
+    /// because `NeedDefaultExecutor` returns false for 0
+    /// (src/ray/core_worker/task_execution/thread_pool.h:37-39) and the queue then
+    /// runs the method in place (`actor_scheduling_queue.cc:277-284`). The SDK's
+    /// own `RAY_CHECK(max_concurrency > 0)` (`thread_pool.cc:32`) is why 0 is not
+    /// a supported concurrency value.
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            ray_namespace: String::new(),
+            resources: Vec::new(),
+            max_restarts: 0,
+            max_concurrency: 1,
+            serialized_runtime_env_info: String::new(),
+            placement_group_id: Vec::new(),
+            bundle_index: -1,
+        }
+    }
 }
 
 impl ActorOptions {
@@ -1512,8 +1540,16 @@ impl ActorOptions {
     }
 
     /// Bind the actor to a placement group bundle.
-    /// `group_id` is the binary ID returned by `placement_group_create`.
-    /// `bundle_index` is the index of the bundle within the group.
+    /// `group_id` is the binary ID returned by `placement_group_create`. An empty
+    /// id means "no placement group" (same as the field); a non-empty one must be
+    /// exactly 18 bytes and must name an existing group, otherwise the call fails
+    /// with [`RayError::Ffi`] instead of creating the actor outside the group.
+    /// `bundle_index` is the index of the bundle within the group: -1 for any
+    /// bundle in the group, otherwise non-negative. An index at or beyond the
+    /// group's bundle count is not rejected here: Ray's
+    /// `AddPlacementGroupConstraint` only checks that it is -1 or non-negative
+    /// (`src/ray/common/bundle_spec.cc:167`), so the actor simply never gets a
+    /// bundle to run in. [`TaskOptions::placement_group`] has the same limit.
     pub fn placement_group(mut self, group_id: Vec<u8>, bundle_index: i32) -> Self {
         self.placement_group_id = group_id;
         self.bundle_index = bundle_index;
@@ -1563,12 +1599,30 @@ impl ActorOptions {
     }
 }
 
+/// `ActorOptions` 里互相依赖的字段的构造期校验。
+///
+/// `to_json` 只在 `placement_group_id` 非空时输出 `bundle_index`，所以孤立的
+/// `bundle_index`（没有 group）不会进 options JSON，C 侧的 `parse_actor_options` 也就
+/// 看不到它。那个组合在文档里承诺报错，必须在创建之前拦下，否则字段被静默丢弃、
+/// actor 以默认 options 建出来。
+fn check_actor_options(opts: &ActorOptions) -> Result<(), RayError> {
+    if opts.placement_group_id.is_empty() && opts.bundle_index != -1 {
+        return Err(RayError::Ffi(format!(
+            "bundle_index {} requires placement_group_id; without a placement group the field would be dropped",
+            opts.bundle_index
+        )));
+    }
+    Ok(())
+}
+
 /// Create an actor with full creation options.
 pub(crate) fn actor_create_with_options_inner(
     func_name: &str,
     args: &[&[u8]],
     options: &ActorOptions,
 ) -> Result<ActorHandle, RayError> {
+    // 先校验再进 FFI：字段组合不合法时连 options JSON 都不生成。
+    check_actor_options(options)?;
     let func_c = to_cstring(func_name);
     let args_arr = build_args_array(args);
     let options_json = to_cstring(&options.to_json());
@@ -1598,6 +1652,8 @@ pub(crate) fn actor_create_python_with_options_inner(
     args: &[&[u8]],
     options: &ActorOptions,
 ) -> Result<ActorHandle, RayError> {
+    // 先校验再进 FFI：字段组合不合法时连 options JSON 都不生成。
+    check_actor_options(options)?;
     let module_c = to_cstring(module);
     let class_c = to_cstring(class);
     let args_arr = build_args_array(args);
@@ -2360,6 +2416,110 @@ mod tests {
     fn task_options_to_json_escapes_name() {
         let opts = TaskOptions::new().name("quote\"back\\slash\n");
         assert_eq!(opts.to_json(), "{\"name\":\"quote\\\"back\\\\slash\\n\"}");
+    }
+
+    // ── ActorOptions ─────────────────────────────────────
+
+    #[test]
+    fn actor_options_default_carries_bundle_index_minus_one() {
+        assert_eq!(ActorOptions::default().bundle_index, -1);
+        assert_eq!(ActorOptions::new().bundle_index, -1);
+        // max_concurrency 默认 1：派生实现给 0。0 在 2.51.1 里等价于 1，靠的是
+        // NeedDefaultExecutor 在 0 时提前返回、队列就地串行执行；SDK 自己的
+        // RAY_CHECK(max_concurrency > 0) 说明它不是受支持的并发值（#29）。
+        assert_eq!(ActorOptions::default().max_concurrency, 1);
+        assert_eq!(ActorOptions::new().max_concurrency, 1);
+        // 结构体更新语法不留缝：只给 group 时 bundle_index 也是 -1。
+        let opts = ActorOptions {
+            placement_group_id: vec![0x07u8; 18],
+            ..Default::default()
+        };
+        assert_eq!(opts.bundle_index, -1);
+    }
+
+    #[test]
+    fn actor_options_standalone_bundle_index_is_rejected() {
+        let opts = ActorOptions {
+            bundle_index: 2,
+            ..Default::default()
+        };
+        match check_actor_options(&opts) {
+            Err(RayError::Ffi(msg)) => assert!(
+                msg.contains("bundle_index")
+                    && msg.contains("placement_group_id")
+                    && msg.contains('2'),
+                "错误文本没有指出字段与实际值: {}",
+                msg
+            ),
+            Err(other) => panic!("孤立 bundle_index 返回了别的错误变体: {}", other),
+            Ok(()) => panic!("孤立 bundle_index 通过了校验，字段会被静默丢掉"),
+        }
+    }
+
+    #[test]
+    fn actor_options_default_bundle_index_without_group_is_accepted() {
+        assert!(check_actor_options(&ActorOptions::default()).is_ok());
+        assert!(check_actor_options(&ActorOptions::new()).is_ok());
+    }
+
+    #[test]
+    fn actor_options_bundle_index_with_group_is_accepted() {
+        for bundle_index in [-1, 0, 2] {
+            let opts = ActorOptions::new().placement_group(vec![0x01; 18], bundle_index);
+            assert!(
+                check_actor_options(&opts).is_ok(),
+                "组 + bundle_index {} 被拒了",
+                bundle_index
+            );
+        }
+    }
+
+    #[test]
+    fn actor_options_to_json_empty_is_empty_string() {
+        assert_eq!(ActorOptions::new().to_json(), "");
+        assert_eq!(ActorOptions::default().to_json(), "");
+    }
+
+    #[test]
+    fn actor_options_to_json_name_only() {
+        let opts = ActorOptions::new().name("my_actor");
+        assert_eq!(opts.to_json(), r#"{"name":"my_actor"}"#);
+    }
+
+    #[test]
+    fn actor_options_to_json_placement_group_with_bundle_index() {
+        let id = vec![0x0a, 0x1b, 0x2c];
+        let opts = ActorOptions::new().placement_group(id.clone(), 2);
+        assert_eq!(
+            opts.to_json(),
+            format!(
+                "{{\"placement_group_id\":\"{}\",\"bundle_index\":2}}",
+                hex_encode(&id)
+            )
+        );
+    }
+
+    #[test]
+    fn actor_options_to_json_placement_group_with_default_bundle_index() {
+        // 默认 bundle_index 是 -1，未显式指定时照它输出：两个键都在。
+        let id = vec![0xffu8; 18];
+        let opts = ActorOptions::new().placement_group(id.clone(), -1);
+        assert_eq!(
+            opts.to_json(),
+            format!(
+                "{{\"placement_group_id\":\"{}\",\"bundle_index\":-1}}",
+                hex_encode(&id)
+            )
+        );
+    }
+
+    #[test]
+    fn actor_options_to_json_skips_fields_at_their_defaults() {
+        // max_restarts 默认 0、max_concurrency 默认 1，与默认值相同时不出现。
+        let opts = ActorOptions::new().max_restarts(0).max_concurrency(1);
+        assert_eq!(opts.to_json(), "");
+        let opts = ActorOptions::new().max_restarts(3).max_concurrency(10);
+        assert_eq!(opts.to_json(), r#"{"max_restarts":3,"max_concurrency":10}"#);
     }
 
     // ── placement group 查询结果的解码 ───────────────────

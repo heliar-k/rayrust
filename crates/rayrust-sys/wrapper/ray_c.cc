@@ -67,6 +67,7 @@ static_assert(alignof(RayIntentionalSystemExitException) == alignof(RayException
 // string so the Rust side can retrieve it via ray_last_error().
 #include <condition_variable>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <cstring>
@@ -402,8 +403,111 @@ static int check_placement_group_id(const char *group_id_data, size_t group_id_l
     return 0;
 }
 
-/// Parse an options JSON string and fill an ActorCreationOptions struct.
-/// `options_json` may be NULL or empty (returns default options).
+/// `bundle_index` 的 JSON 解码与范围检查：-1，或 0 .. INT_MAX。
+///
+/// wheel 里的 nlohmann 是 3.9.1，`get<int>()` 走 `get_arithmetic_value`
+/// （include/nlohmann/json.hpp:3440-3463），里面只有 `static_cast`，没有范围检查。
+/// 超出 int 的值被截到低 32 位：`-4294967296` 变成 0（钉在第一个 bundle）、
+/// `-4294967297` 变成 -1（当成「组内任意 bundle」），于是「必须是 -1 或非负」的
+/// 检查看到的是截断后的值，输入从来没有被拒。所以先按 64 位读出原始值再判断。
+///
+/// `number_unsigned` 单独走一遍：大于 INT64_MAX 的无符号值读成 `int64_t` 同样只是
+/// `static_cast`，`18446744073709551615` 会回绕成 -1 并被当成合法值。调用方已判过
+/// `is_number_integer()`，它对 `number_integer` 与 `number_unsigned` 都返回真
+/// （json.hpp:18973-18976）。
+static int parse_bundle_index(const nlohmann::json &j) {
+    const std::string out_of_range =
+        "bundle_index must be -1 or between 0 and " +
+        std::to_string(std::numeric_limits<int>::max()) + ", got ";
+    if (j.is_number_unsigned()) {
+        uint64_t raw = j.get<uint64_t>();
+        if (raw > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+            throw std::runtime_error(out_of_range + std::to_string(raw));
+        }
+        return static_cast<int>(raw);
+    }
+    int64_t raw = j.get<int64_t>();
+    if (raw < -1 || raw > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error(out_of_range + std::to_string(raw));
+    }
+    return static_cast<int>(raw);
+}
+
+/// `placement_group_id` 与 `bundle_index` 两个字段的解码与校验，任务
+/// （`CallOptions`）与 actor（`ActorCreationOptions`）共用。
+///
+/// 两个字段在进 SDK 之前逐项校验，因为每条兼容路径都会静默换掉语义或终止进程：
+/// - 不是 18 字节的 `placement_group_id` 会进
+///   `AbstractRayRuntime::GetPlacementGroupById`（cpp/src/ray/runtime/
+///   abstract_ray_runtime.cc:353-361），`PlacementGroupID::FromBinary` 对长度不符的
+///   输入 RAY_CHECK 终止驱动进程（src/ray/common/id.h:435），RAY_CATCH 拦不住；
+/// - `bundle_index` 小于 -1 会进 `ray::AddPlacementGroupConstraint`
+///   （src/ray/common/bundle_spec.cc:167）的 RAY_CHECK，同样终止进程；
+/// - 查不到的合法 id 拿到空的 `PlacementGroup`（`id_.empty()`，
+///   cpp/include/ray/api/task_options.h:85），下游当成「没有组」，任务或 actor 在组外
+///   建出来且不报错；
+/// - 本地模式没有 GCS accessor，`GetPlacementGroupById` 会解引用空指针，所以本地模式的
+///   检查必须在这个调用之前。
+///
+/// `bundle_index` 由调用方先置 -1：`CallOptions` 与 `ActorCreationOptions` 里的这个
+/// 成员都没有默认成员初始化器（cpp/include/ray/api/task_options.h:100、:111），而
+/// `GetBundleID`（cpp/src/ray/runtime/task/native_task_submitter.cc:57-65）在组非空时
+/// 会读它。JSON 里没有这个键时就保持 -1。
+static void parse_placement_group_fields(const nlohmann::json &j,
+                                         ray::PlacementGroup &group,
+                                         int &bundle_index) {
+    const bool has_group = j.contains("placement_group_id");
+    if (j.contains("bundle_index")) {
+        if (!has_group) {
+            throw std::runtime_error(
+                "bundle_index requires placement_group_id, but no group was given");
+        }
+        if (!j["bundle_index"].is_number_integer()) {
+            throw std::runtime_error(
+                "bundle_index must be a JSON integer, got " +
+                j["bundle_index"].dump());
+        }
+        bundle_index = parse_bundle_index(j["bundle_index"]);
+    }
+    if (!has_group) return;
+    if (!j["placement_group_id"].is_string()) {
+        throw std::runtime_error(
+            "placement_group_id must be a JSON string of hex, got " +
+            j["placement_group_id"].dump());
+    }
+    std::string pg_hex = j["placement_group_id"].get<std::string>();
+    // hex_decode 对空串、奇数个字符、任意非 hex 字符都返回空串。
+    std::string pg_id = hex_decode(pg_hex);
+    if (pg_id.empty()) {
+        throw std::runtime_error(
+            "placement group id must be 18 bytes of hex, got \"" + pg_hex +
+            "\"");
+    }
+    if (pg_id.size() != kPlacementGroupIdLength) {
+        throw std::runtime_error(
+            "placement group id must be " +
+            std::to_string(kPlacementGroupIdLength) + " bytes, got " +
+            std::to_string(pg_id.size()));
+    }
+    auto runtime = ray::internal::GetRayRuntime();
+    if (!runtime) {
+        // 现有调用点都先判过 runtime，这条分支走不到；留着是给以后新增的调用点
+        // 兜底，避免它拿着空 runtime 进 GetPlacementGroupById。
+        throw std::runtime_error("Ray runtime is not initialized");
+    }
+    if (runtime->IsLocalMode()) {
+        throw std::runtime_error(
+            "placement groups are not supported in local mode");
+    }
+    auto found = runtime->GetPlacementGroupById(pg_id);
+    if (found.Empty()) {
+        throw std::runtime_error("placement group not found for id " + pg_hex);
+    }
+    group = found;
+}
+
+/// 解析 options JSON 并填充 ActorCreationOptions。`options_json` 可以为 NULL 或
+/// 空串（全部取默认值）。
 static void parse_actor_options(const char *options_json,
                                 ray::internal::ActorCreationOptions &options) {
     if (!options_json || options_json[0] == '\0') return;
@@ -429,33 +533,16 @@ static void parse_actor_options(const char *options_json,
         options.serialized_runtime_env_info =
             j["serialized_runtime_env_info"].get<std::string>();
     }
-    if (j.contains("placement_group_id")) {
-        std::string pg_hex = j["placement_group_id"].get<std::string>();
-        std::string pg_id = hex_decode(pg_hex);
-        if (!pg_id.empty()) {
-            auto runtime = ray::internal::GetRayRuntime();
-            if (runtime) {
-                options.group = runtime->GetPlacementGroupById(pg_id);
-                if (j.contains("bundle_index")) {
-                    options.bundle_index = j["bundle_index"].get<int>();
-                }
-            }
-        }
-    }
+    parse_placement_group_fields(j, options.group, options.bundle_index);
 }
 
 /// Parse an options JSON string and fill a CallOptions struct.
 /// `options_json` may be NULL or empty (returns default options).
 ///
-/// Every field is validated here rather than silently dropped, because both
-/// silent failure modes end with the task running somewhere the caller did not
-/// ask for:
-/// - a `placement_group_id` that is empty, not hex, or not 18 bytes used to
-///   skip the whole branch and schedule the task outside the group;
-/// - a `bundle_index` below -1 used to reach
-///   `ray::AddPlacementGroupConstraint` (src/ray/common/bundle_spec.cc:167),
-///   whose `RAY_CHECK((bundle_index == -1 || bundle_index >= 0))` aborts the
-///   driver process instead of returning an error.
+/// The placement group fields go through `parse_placement_group_fields`, which
+/// throws instead of letting the task run outside the group the caller asked
+/// for or letting an SDK RAY_CHECK abort the driver. `runtime_env` keeps its own
+/// check below because the actor path has no such field.
 static void parse_call_options(const char *options_json,
                                ray::internal::CallOptions &options) {
     if (!options_json || options_json[0] == '\0') return;
@@ -475,67 +562,7 @@ static void parse_call_options(const char *options_json,
             options.resources[it.key()] = it.value().get<double>();
         }
     }
-    const bool has_group = j.contains("placement_group_id");
-    if (j.contains("bundle_index")) {
-        if (!has_group) {
-            throw std::runtime_error(
-                "bundle_index requires placement_group_id, but no group was given");
-        }
-        if (!j["bundle_index"].is_number_integer()) {
-            throw std::runtime_error(
-                "bundle_index must be a JSON integer, got " +
-                j["bundle_index"].dump());
-        }
-        int bundle_index = j["bundle_index"].get<int>();
-        if (bundle_index < -1) {
-            throw std::runtime_error(
-                "bundle_index must be -1 or non-negative, got " +
-                std::to_string(bundle_index));
-        }
-        options.bundle_index = bundle_index;
-    }
-    if (has_group) {
-        if (!j["placement_group_id"].is_string()) {
-            throw std::runtime_error(
-                "placement_group_id must be a JSON string of hex, got " +
-                j["placement_group_id"].dump());
-        }
-        std::string pg_hex = j["placement_group_id"].get<std::string>();
-        // hex_decode returns an empty string for an empty input, an odd number
-        // of characters, and any non-hex character.
-        std::string pg_id = hex_decode(pg_hex);
-        if (pg_id.empty()) {
-            throw std::runtime_error(
-                "placement group id must be 18 bytes of hex, got \"" + pg_hex +
-                "\"");
-        }
-        // ray::PlacementGroupID::kLength from src/ray/common/id.h: 14 unique
-        // bytes + a 4-byte JobID. The wheel ships no id.h (see #19), so the
-        // constant is restated in this file; FromBinary RAY_CHECKs it and would
-        // abort the process instead of returning an error.
-        if (pg_id.size() != kPlacementGroupIdLength) {
-            throw std::runtime_error(
-                "placement group id must be " +
-                std::to_string(kPlacementGroupIdLength) + " bytes, got " +
-                std::to_string(pg_id.size()));
-        }
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            throw std::runtime_error("Ray runtime is not initialized");
-        }
-        if (runtime->IsLocalMode()) {
-            // Local mode has no GCS accessor: AbstractRayRuntime's
-            // GetPlacementGroupById would dereference a null one and abort.
-            throw std::runtime_error(
-                "placement groups are not supported in local mode");
-        }
-        auto group = runtime->GetPlacementGroupById(pg_id);
-        if (group.Empty()) {
-            throw std::runtime_error(
-                "placement group not found for id " + pg_hex);
-        }
-        options.group = group;
-    }
+    parse_placement_group_fields(j, options.group, options.bundle_index);
     if (j.contains("runtime_env")) {
         // The Rust side sends the runtime env as a JSON string value, so the
         // outer document has no splicing opportunity and a scalar never looks
@@ -1056,7 +1083,13 @@ ray_bytes_t ray_actor_create_with_options(const char *func_name,
 
         auto task_args = build_task_args_cpp(runtime.get(), args, arg_count);
 
+        // ActorCreationOptions::bundle_index 没有默认成员初始化器
+        // （cpp/include/ray/api/task_options.h:111），GetBundleID
+        // （cpp/src/ray/runtime/task/native_task_submitter.cc:57-65）在组非空时会读
+        // 它。没有 options JSON 的路径也走这里，先置 -1（组内任意 bundle），
+        // 不留未初始化的值。
         ray::internal::ActorCreationOptions options;
+        options.bundle_index = -1;
         parse_actor_options(options_json, options);
         std::string id = runtime->CreateActor(holder, task_args, options);
         return dup_bytes(id);
@@ -1084,7 +1117,9 @@ ray_bytes_t ray_actor_create_python_with_options(const char *module_name,
 
         auto task_args = build_task_args_python(args, arg_count);
 
+        // 与 ray_actor_create_with_options 同一理由：先给 bundle_index 一个确定值。
         ray::internal::ActorCreationOptions options;
+        options.bundle_index = -1;
         parse_actor_options(options_json, options);
         std::string id = runtime->CreateActor(holder, task_args, options);
         return dup_bytes(id);
