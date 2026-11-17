@@ -651,9 +651,21 @@ bool *ray_wait(const ray_bytes_t *ids, size_t count, int num_objects, int timeou
 
 /// Helper: build TaskArg vector for CPP tasks.
 /// `is_ref` array marks which args are ObjectRef references (pass by ID)
-/// vs value args (pass by serialized msgpack).
+/// vs value args (pass by serialized msgpack). It must be NULL or have one
+/// entry per arg; the Rust side rejects any other length.
+///
+/// In local mode there is no core worker to deliver the referenced object, so a
+/// reference arg is read into a value before submission, the same thing the SDK
+/// does in local mode (ray/api/arguments.h:43-52). That read has no deadline,
+/// like `get()`: a two-step graph submits a reference whose task has not
+/// finished yet, and waiting for it is the point of the feature. The `!buffer`
+/// branch therefore only covers the case where Ray itself cannot produce a
+/// value; an id of unknown origin never gets here, the Rust side rejects it.
+/// In cluster mode the id stays an id and the core worker delivers the value to
+/// the worker.
 static std::vector<ray::internal::TaskArg>
-build_task_args_cpp(const ray_bytes_t *args, size_t arg_count,
+build_task_args_cpp(ray::internal::RayRuntime *runtime,
+                    const ray_bytes_t *args, size_t arg_count,
                     const bool *is_ref = nullptr) {
     std::vector<ray::internal::TaskArg> task_args;
     task_args.reserve(arg_count);
@@ -661,7 +673,17 @@ build_task_args_cpp(const ray_bytes_t *args, size_t arg_count,
         ray::internal::TaskArg arg;
         if (is_ref && is_ref[i]) {
             // ObjectRef argument: pass by reference (object ID)
-            arg.id = std::string(args[i].data, args[i].len);
+            std::string id(args[i].data, args[i].len);
+            if (runtime->IsLocalMode()) {
+                auto buffer = runtime->Get(id);
+                if (!buffer) {
+                    throw std::runtime_error(
+                        "cannot read the object referenced by arg " + std::to_string(i));
+                }
+                arg.buf = std::move(*buffer);
+            } else {
+                arg.id = std::move(id);
+            }
         } else {
             // Value argument: raw msgpack
             arg.buf = msgpack::sbuffer(args[i].len);
@@ -746,7 +768,7 @@ ray_bytes_t ray_task_call(const char *func_name,
         std::string fn(func_name);
         ray::internal::RemoteFunctionHolder holder{std::move(fn)};
 
-        auto task_args = build_task_args_cpp(args, arg_count, is_ref);
+        auto task_args = build_task_args_cpp(runtime.get(), args, arg_count, is_ref);
 
         ray::internal::CallOptions options;
         std::string id = runtime->Call(holder, task_args, options);
@@ -769,7 +791,7 @@ ray_bytes_t ray_task_call_with_resources(const char *func_name,
         std::string fn(func_name);
         ray::internal::RemoteFunctionHolder holder{std::move(fn)};
 
-        auto task_args = build_task_args_cpp(args, arg_count, is_ref);
+        auto task_args = build_task_args_cpp(runtime.get(), args, arg_count, is_ref);
 
         ray::internal::CallOptions options;
         if (resources_json && resources_json[0] != '\0') {
@@ -826,7 +848,7 @@ ray_bytes_t ray_actor_create_with_options(const char *func_name,
                                                    std::string(func_name),
                                                    ray::internal::LangType::CPP);
 
-        auto task_args = build_task_args_cpp(args, arg_count);
+        auto task_args = build_task_args_cpp(runtime.get(), args, arg_count);
 
         ray::internal::ActorCreationOptions options;
         parse_actor_options(options_json, options);
@@ -865,7 +887,8 @@ ray_bytes_t ray_actor_create_python_with_options(const char *module_name,
 ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
                             const char *func_name,
                             const ray_bytes_t *args,
-                            size_t arg_count) {
+                            size_t arg_count,
+                            const bool *is_ref = nullptr) {
     try {
         auto runtime = ray::internal::GetRayRuntime();
         if (!runtime) return ray_bytes_t{nullptr, 0};
@@ -878,7 +901,7 @@ ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
         std::string fn(func_name);
         ray::internal::RemoteFunctionHolder holder(fn);
 
-        auto task_args = build_task_args_cpp(args, arg_count);
+        auto task_args = build_task_args_cpp(runtime.get(), args, arg_count, is_ref);
 
         std::string actor_id(actor_id_data, actor_id_len);
         ray::internal::CallOptions options;

@@ -58,7 +58,7 @@ async fn main() {
     let warmup_arg_b = rayrust::serialize(&1i64).unwrap();
     let warmup_args: Vec<&[u8]> = vec![&warmup_arg_a, &warmup_arg_b];
     let _ = ray.task_call_python("rayrust_test", "add", &warmup_args, &[]);
-    let _ = add_remote(&ray, 1, 1);
+    let _ = add_remote(&ray, 1, 1).expect("warmup submit");
     println!("✓ Warmup done\n");
 
     // ── 1. Rust → Rust: Sync throughput (sequential) ────────────
@@ -67,7 +67,7 @@ async fn main() {
     let t0 = Instant::now();
     let mut sum = 0i64;
     for i in 0..n {
-        let r = add_remote(&ray, i, 1);
+        let r = add_remote(&ray, i, 1).expect("submit add");
         let v: i32 = r.get().expect("get failed");
         sum += v as i64;
     }
@@ -134,7 +134,7 @@ async fn main() {
     let mut times_rust_sync = Vec::new();
     for _ in 0..100 {
         let t0 = Instant::now();
-        let r = add_remote(&ray, 1, 2);
+        let r = add_remote(&ray, 1, 2).expect("submit add");
         let _v: i32 = r.get().unwrap();
         times_rust_sync.push(t0.elapsed());
     }

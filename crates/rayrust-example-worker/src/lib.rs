@@ -28,6 +28,12 @@ pub fn multiply(a: i64, b: i64) -> i64 {
     a * b
 }
 
+/// Non-commutative task: a wrong argument order gives a different result.
+#[remote]
+pub fn sub(a: i32, b: i32) -> i32 {
+    a - b
+}
+
 /// CPU-intensive: sum of 0..n.
 #[remote]
 pub fn compute(n: i64) -> i64 {
@@ -39,6 +45,13 @@ pub fn compute(n: i64) -> i64 {
 pub async fn async_sum(a: i64, b: i64) -> i64 {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     a + b
+}
+
+/// 把收到的 id 字节原样交回。交回的是 28 个字节，不是引用：驱动侧没有这个 id 的
+/// owner 路径，读它得到 `ObjectUnknownOwner`，与对象是否还活着无关。
+#[remote]
+pub fn return_id_bytes(id: Vec<u8>) -> Vec<u8> {
+    id
 }
 
 // ─── Rust Actor: Counter (using #[rayrust::actor] macro) ───────

@@ -160,3 +160,22 @@ class Counter:
 def return_dict_with_ref():
     """返回一个装着 ObjectRef 的 dict：嵌套引用记在返回对象的 nested_refs 里。"""
     return {"ref": ray.put(1)}
+
+
+@ray.remote
+class Keeper:
+    """在 actor 进程里 put 一个对象并保活它。
+
+    `put` 只把 28 字节 id 交回给驱动，`kept_value` 从自己保活的那份引用读回对象，
+    所以驱动看到一个活着、但它并不认识 owner 的 id。
+    """
+
+    def __init__(self):
+        self.kept = None
+
+    def put(self, v):
+        self.kept = ray.put(v)
+        return self.kept.binary()
+
+    def kept_value(self):
+        return ray.get(self.kept)

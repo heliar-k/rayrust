@@ -37,7 +37,7 @@ async fn main() {
 
     // ── 2. Remote Task (Rust → Rust) ─────────────────────────
     println!("\n--- 2. Remote Task (Rust) ---");
-    let r = add_remote(&ray, 3, 4);
+    let r = add_remote(&ray, 3, 4).expect("submit add(3, 4)");
     let v: i32 = r.get_async().await.expect("add failed");
     println!("add(3, 4) = {} ✓", v);
 
@@ -106,7 +106,12 @@ async fn main() {
 
             let arg_n = rayrust::serialize(&5i64).unwrap();
             let args_inc: Vec<&[u8]> = vec![&arg_n];
-            match ray.actor_call(actor.id(), "__rayrust_actor_factory_counter::increment", &args_inc) {
+            match ray.actor_call(
+                actor.id(),
+                "__rayrust_actor_factory_counter::increment",
+                &args_inc,
+                &[],
+            ) {
                 Ok(obj_ref) => {
                     let obj_ref: ObjectRef<i64> = obj_ref.cast();
                     match obj_ref.get_async().await {
@@ -117,7 +122,7 @@ async fn main() {
                 Err(e) => println!("Counter.increment failed: {}", e),
             }
 
-            match ray.actor_call(actor.id(), "__rayrust_actor_factory_counter::get", &[]) {
+            match ray.actor_call(actor.id(), "__rayrust_actor_factory_counter::get", &[], &[]) {
                 Ok(obj_ref) => {
                     let obj_ref: ObjectRef<i64> = obj_ref.cast();
                     match obj_ref.get_async().await {

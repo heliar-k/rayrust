@@ -53,14 +53,15 @@ fn main() {
 
     // ── Remote Task (cluster mode) ─────────────────────────
     println!("\n--- Remote Task (cluster mode) ---");
-    let obj_ref = add_remote(&ray, 10, 32);
+    let obj_ref = add_remote(&ray, 10, 32).expect("submit add(10, 32)");
     println!("Task 'add(10, 32)' submitted");
     match obj_ref.get() {
         Ok(val) => println!("Task result: {} ✓", val),
         Err(e) => println!("Task result get failed: {}", e),
     }
 
-    let obj_ref2 = greet_remote(&ray, "Ray Cluster".to_string());
+    let obj_ref2 =
+        greet_remote(&ray, "Ray Cluster".to_string()).expect("submit greet(\"Ray Cluster\")");
     match obj_ref2.get() {
         Ok(val) => println!("Greet result: {} ✓", val),
         Err(e) => println!("Greet result get failed: {}", e),
