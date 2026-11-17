@@ -97,7 +97,7 @@ bool *ray_wait(const ray_bytes_t *ids, size_t count, int num_objects, int timeou
 
 // ─── Task ─────────────────────────────────────────────────────
 
-/// Call a remote task by function name.
+/// Call a remote task with full CallOptions.
 /// `func_name` is a null-terminated C string (function names are ASCII).
 /// `args` is an array of msgpack-serialized arguments.
 /// `is_ref` is an array of booleans (same length as args). If is_ref[i] is true,
@@ -107,22 +107,42 @@ bool *ray_wait(const ray_bytes_t *ids, size_t count, int num_objects, int timeou
 ///   An id passed here must be a reference the process holds and whose owner
 ///   Ray knows: a 28-byte id of unknown origin makes `TransformArgs` call
 ///   `GetOwnerAddressOrDie`, which terminates the process.
+/// `options_json` is a JSON string with any subset of fields:
+///   {
+///     "name": "my_task",                  // task name
+///     "resources": {"CPU":1,"GPU":0.5},  // resource requirements
+///     "placement_group_id": "a1b2c3...",  // hex-encoded binary placement group ID
+///     "bundle_index": 0,                  // bundle index (default -1 = any bundle)
+///     "runtime_env": "{\"env_vars\":{...}}"  // runtime env object JSON, as a
+///                                             // JSON string value
+///   }
+/// Every field is validated; a bad value returns an error (data=NULL) instead of
+/// falling back to the default scheduling:
+/// - `placement_group_id` must decode to exactly 18 bytes: an empty string, an
+///   odd number of hex characters, a non-hex character or any other length is
+///   an error, and so is an id that names no existing group.
+/// - `bundle_index` must be -1 or non-negative (a smaller value would hit a
+///   RAY_CHECK in the SDK and abort the process), and it requires
+///   `placement_group_id`.
+/// - `runtime_env` must be a JSON string holding a single JSON object; a
+///   non-string, malformed JSON or a non-object is an error.
+/// Local mode rejects `placement_group_id` outright (the SDK has no placement
+/// group lookup there) and drops the other three fields: LocalModeTaskSubmitter
+/// calls `Submit(invocation, {})`, so name, resources and runtime_env have no
+/// effect.
+/// Pass NULL or empty string for no options (all defaults).
 /// Returns a ray_bytes_t containing the binary object ID of the result.
 /// On error, returns ray_bytes_t with data=NULL.
-ray_bytes_t ray_task_call(const char *func_name,
-                           const ray_bytes_t *args,
-                           size_t arg_count,
-                           const bool *is_ref);
-
-/// Call a remote task with resource requirements.
-/// `resources_json` is a JSON string like `{"CPU":1,"GPU":0.5}` or NULL.
-ray_bytes_t ray_task_call_with_resources(const char *func_name,
-                                           const ray_bytes_t *args,
-                                           size_t arg_count,
-                                           const bool *is_ref,
-                                           const char *resources_json);
+ray_bytes_t ray_task_call_with_options(const char *func_name,
+                                         const ray_bytes_t *args,
+                                         size_t arg_count,
+                                         const bool *is_ref,
+                                         const char *options_json);
 
 /// Call a Python remote function.
+/// This entry point takes no options JSON: a Python task submitted here cannot be
+/// named, cannot request resources, cannot be bound to a placement group bundle
+/// and cannot be given a runtime env.
 /// `module_name` and `function_name` are null-terminated C strings.
 /// `args` are msgpack-serialized arguments (will be wrapped with xlang header).
 /// `is_ref[i] = true` means args[i] is an ObjectRef ID (pass by reference).
@@ -171,7 +191,7 @@ ray_bytes_t ray_actor_create_python_with_options(const char *module_name,
 /// `is_ref` is an array of booleans (same length as args). If is_ref[i] is true,
 ///   args[i] is treated as a binary ObjectRef ID (pass by reference).
 ///   Pass NULL to treat all args as values. Any other length is rejected by the
-///   Rust side. The same owner requirement as ray_task_call applies.
+///   Rust side. The same owner requirement as ray_task_call_with_options applies.
 /// Returns a ray_bytes_t containing the binary object ID of the result.
 ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
                             const char *func_name,
@@ -254,7 +274,7 @@ typedef ray_bytes_t (*ray_func_callback_t)(const ray_bytes_t *args, size_t arg_c
 
 /// Register a Rust function as a Ray remote task.
 /// Must be called before ray_init (or at least before the first task call).
-/// `func_name` is the name used with ray_task_call.
+/// `func_name` is the name used with ray_task_call_with_options.
 /// `callback` is the C callback that will be invoked when the task executes.
 void ray_register_function(const char *func_name, ray_func_callback_t callback);
 

@@ -6,12 +6,16 @@
 //! - A C-compatible callback that deserializes args, calls the function, serializes result
 //! - A `register()` function that registers the callback with Ray's FunctionManager
 //! - A `{name}_remote()` sync caller (returns `Result`)
+//! - A `{name}_remote_with_options()` sync caller taking `&TaskOptions`
 //! - A `{name}_remote_async()` async caller (returns `Result`)
+//! - A `{name}_remote_async_with_options()` async caller taking `&TaskOptions`
 //! - A `#[ctor]` auto-registration that runs when the .so is loaded by the Ray worker
 //!
-//! 两个入口的参数都是泛型的：值参数按 `Serialize` 序列化，`ObjectRef<T>` 与
+//! 四个调用器的参数都是泛型的：值参数按 `Serialize` 序列化，`ObjectRef<T>` 与
 //! `&ObjectRef<T>` 按引用传（任务拿到的是那个引用的值）。调用器自己持有一份引用
 //! 直到提交的 FFI 调用返回。序列化与提交错误都从返回的 `Result` 回到调用方。
+//! 带 options 的两个入口把 `&TaskOptions` 放在 `ray` 之后、参数之前；不带
+//! options 的两个是它们的薄封装，传 `&TaskOptions::new()`。
 //!
 //! ## `#[rayrust::actor]`
 //!
@@ -51,6 +55,8 @@ pub fn remote(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let remote_fn_name = format_ident!("{}_remote", fn_name);
     let remote_async_fn_name = format_ident!("{}_remote_async", fn_name);
+    let remote_fn_name_with_options = format_ident!("{}_remote_with_options", fn_name);
+    let remote_async_fn_name_with_options = format_ident!("{}_remote_async_with_options", fn_name);
     let register_fn_name = format_ident!("{}_register", fn_name);
     let callback_fn_name = format_ident!("__rayrust_callback_{}", fn_name);
     let ctor_name = format_ident!("__RAYRUST_CTOR_{}", fn_name);
@@ -115,6 +121,14 @@ pub fn remote(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let generic = generic_arg_ident(i);
             let arg_name = format_ident!("__arg{}", i);
             quote! { #arg_name: #generic }
+        })
+        .collect();
+    let arg_idents: Vec<_> = arg_data
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let arg_name = format_ident!("__arg{}", i);
+            quote! { #arg_name }
         })
         .collect();
     let arg_pushes: Vec<_> = arg_data
@@ -223,9 +237,21 @@ pub fn remote(_attr: TokenStream, item: TokenStream) -> TokenStream {
         /// 值参数照原样的类型传入；引用参数按 `ObjectRef<T>` 或 `&ObjectRef<T>`
         /// 传入，任务拿到的是那个引用的值，驱动不必先 `get`。调用器自己持有一份
         /// 引用直到提交返回，调用方不需要保证句柄活到某个时刻。序列化与提交错误
-        /// 都在返回的 `Result` 里。
+        /// 都在返回的 `Result` 里。任务不设任何选项，等价于
+        /// [`#remote_fn_name_with_options`] 传 `&TaskOptions::new()`。
         pub fn #remote_fn_name #arg_generic_list(
             ray: &::rayrust::Ray,
+            #(#caller_inputs),*
+        ) -> ::std::result::Result<::rayrust::ObjectRef<#return_type>, ::rayrust::RayError> {
+            #remote_fn_name_with_options(ray, &::rayrust::TaskOptions::new(), #(#arg_idents),*)
+        }
+
+        /// [`#remote_fn_name`] 带 [`::rayrust::TaskOptions`] 的版本：任务名、
+        /// 资源需求、placement group 绑定与 runtime env 都由 `opts` 给出，
+        /// 位置在 `ray` 之后、参数之前。
+        pub fn #remote_fn_name_with_options #arg_generic_list(
+            ray: &::rayrust::Ray,
+            opts: &::rayrust::TaskOptions,
             #(#caller_inputs),*
         ) -> ::std::result::Result<::rayrust::ObjectRef<#return_type>, ::rayrust::RayError> {
             let mut __rayrust_args = ::rayrust::TaskArgs::new();
@@ -238,7 +264,7 @@ pub fn remote(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 #fn_name_str,
                 &__rayrust_refs,
                 &__rayrust_is_ref,
-                &::rayrust::TaskOptions::new(),
+                opts,
             )?;
             drop(__rayrust_held);
             Ok(__rayrust_out.cast())
@@ -248,17 +274,29 @@ pub fn remote(_attr: TokenStream, item: TokenStream) -> TokenStream {
         ///
         /// 参数与同步入口相同。返回的 future 是 `'static` 的：`&Ray` 只用来提交，
         /// 轮询结果不再借用它；参数引用的保活随 future 一起走，调用方在轮询之前
-        /// drop 掉自己的句柄也不会让对象在提交时失去 owner。
+        /// drop 掉自己的句柄也不会让对象在提交时失去 owner。任务不设任何选项，
+        /// 等价于 [`#remote_async_fn_name_with_options`] 传 `&TaskOptions::new()`。
         pub fn #remote_async_fn_name #arg_generic_list(
             ray: &::rayrust::Ray,
             #(#caller_inputs),*
         ) -> impl ::std::future::Future<Output = ::std::result::Result<::rayrust::ObjectRef<#return_type>, ::rayrust::RayError>> + Send + 'static {
+            #remote_async_fn_name_with_options(ray, &::rayrust::TaskOptions::new(), #(#arg_idents),*)
+        }
+
+        /// [`#remote_async_fn_name`] 带 [`::rayrust::TaskOptions`] 的版本：`opts`
+        /// 在 `ray` 之后、参数之前，语义与同步版相同。
+        pub fn #remote_async_fn_name_with_options #arg_generic_list(
+            ray: &::rayrust::Ray,
+            opts: &::rayrust::TaskOptions,
+            #(#caller_inputs),*
+        ) -> impl ::std::future::Future<Output = ::std::result::Result<::rayrust::ObjectRef<#return_type>, ::rayrust::RayError>> + Send + 'static {
             let mut __rayrust_args = ::rayrust::TaskArgs::new();
             #(#arg_pushes)*
+            let __rayrust_options = opts.to_owned();
             let __rayrust_fut = ray.task_call_async_with_args(
                 #fn_name_str,
                 __rayrust_args,
-                &::rayrust::TaskOptions::new(),
+                &__rayrust_options,
             );
             async move {
                 let __rayrust_out = __rayrust_fut.await?;
