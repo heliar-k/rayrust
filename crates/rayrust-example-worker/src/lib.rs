@@ -54,6 +54,20 @@ pub fn return_id_bytes(id: Vec<u8>) -> Vec<u8> {
     id
 }
 
+/// 读进程环境变量；任务级 runtime_env 的 env_vars 是否真的到了工人进程，
+/// 由这个任务交回的值判定。
+#[remote]
+pub fn env_check(name: String) -> Option<String> {
+    std::env::var(&name).ok()
+}
+
+/// 睡眠任务：占住 CPU，用来验证 placement group 绑定与资源需求是否真的承重。
+#[remote]
+pub fn sleep_for(seconds: f64) -> i64 {
+    std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
+    0
+}
+
 // ─── Rust Actor: Counter (using #[rayrust::actor] macro) ───────
 
 /// A simple counter actor.

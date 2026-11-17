@@ -47,18 +47,12 @@ extern "C" {
     ) -> *mut bool;
 
     // Task
-    pub fn ray_task_call(
+    pub fn ray_task_call_with_options(
         func_name: *const c_char,
         args: *const RayBytes,
         arg_count: usize,
         is_ref: *const bool,
-    ) -> RayBytes;
-    pub fn ray_task_call_with_resources(
-        func_name: *const c_char,
-        args: *const RayBytes,
-        arg_count: usize,
-        is_ref: *const bool,
-        resources_json: *const c_char,
+        options_json: *const c_char,
     ) -> RayBytes;
     pub fn ray_task_call_python(
         module_name: *const c_char,

@@ -346,6 +346,120 @@ static void parse_actor_options(const char *options_json,
     }
 }
 
+/// Parse an options JSON string and fill a CallOptions struct.
+/// `options_json` may be NULL or empty (returns default options).
+///
+/// Every field is validated here rather than silently dropped, because both
+/// silent failure modes end with the task running somewhere the caller did not
+/// ask for:
+/// - a `placement_group_id` that is empty, not hex, or not 18 bytes used to
+///   skip the whole branch and schedule the task outside the group;
+/// - a `bundle_index` below -1 used to reach
+///   `ray::AddPlacementGroupConstraint` (src/ray/common/bundle_spec.cc:167),
+///   whose `RAY_CHECK((bundle_index == -1 || bundle_index >= 0))` aborts the
+///   driver process instead of returning an error.
+static void parse_call_options(const char *options_json,
+                               ray::internal::CallOptions &options) {
+    if (!options_json || options_json[0] == '\0') return;
+    auto j = nlohmann::json::parse(options_json);
+    if (j.contains("name")) {
+        if (!j["name"].is_string()) {
+            throw std::runtime_error(
+                "name must be a JSON string, got " + j["name"].dump());
+        }
+        options.name = j["name"].get<std::string>();
+    }
+    if (j.contains("resources")) {
+        if (!j["resources"].is_object()) {
+            throw std::runtime_error("resources must be a JSON object");
+        }
+        for (auto it = j["resources"].begin(); it != j["resources"].end(); ++it) {
+            options.resources[it.key()] = it.value().get<double>();
+        }
+    }
+    const bool has_group = j.contains("placement_group_id");
+    if (j.contains("bundle_index")) {
+        if (!has_group) {
+            throw std::runtime_error(
+                "bundle_index requires placement_group_id, but no group was given");
+        }
+        if (!j["bundle_index"].is_number_integer()) {
+            throw std::runtime_error(
+                "bundle_index must be a JSON integer, got " +
+                j["bundle_index"].dump());
+        }
+        int bundle_index = j["bundle_index"].get<int>();
+        if (bundle_index < -1) {
+            throw std::runtime_error(
+                "bundle_index must be -1 or non-negative, got " +
+                std::to_string(bundle_index));
+        }
+        options.bundle_index = bundle_index;
+    }
+    if (has_group) {
+        if (!j["placement_group_id"].is_string()) {
+            throw std::runtime_error(
+                "placement_group_id must be a JSON string of hex, got " +
+                j["placement_group_id"].dump());
+        }
+        std::string pg_hex = j["placement_group_id"].get<std::string>();
+        // hex_decode returns an empty string for an empty input, an odd number
+        // of characters, and any non-hex character.
+        std::string pg_id = hex_decode(pg_hex);
+        if (pg_id.empty()) {
+            throw std::runtime_error(
+                "placement group id must be 18 bytes of hex, got \"" + pg_hex +
+                "\"");
+        }
+        // ray::PlacementGroupID::kLength from src/ray/common/id.h: 14 unique
+        // bytes + a 4-byte JobID. The wheel ships no id.h (see #19), so the
+        // constant is restated here; FromBinary RAY_CHECKs it and would abort
+        // the process instead of returning an error.
+        constexpr size_t kPlacementGroupIdLength = 18;
+        if (pg_id.size() != kPlacementGroupIdLength) {
+            throw std::runtime_error(
+                "placement group id must be " +
+                std::to_string(kPlacementGroupIdLength) + " bytes, got " +
+                std::to_string(pg_id.size()));
+        }
+        auto runtime = ray::internal::GetRayRuntime();
+        if (!runtime) {
+            throw std::runtime_error("Ray runtime is not initialized");
+        }
+        if (runtime->IsLocalMode()) {
+            // Local mode has no GCS accessor: AbstractRayRuntime's
+            // GetPlacementGroupById would dereference a null one and abort.
+            throw std::runtime_error(
+                "placement groups are not supported in local mode");
+        }
+        auto group = runtime->GetPlacementGroupById(pg_id);
+        if (group.Empty()) {
+            throw std::runtime_error(
+                "placement group not found for id " + pg_hex);
+        }
+        options.group = group;
+    }
+    if (j.contains("runtime_env")) {
+        // The Rust side sends the runtime env as a JSON string value, so the
+        // outer document has no splicing opportunity and a scalar never looks
+        // like an object.
+        if (!j["runtime_env"].is_string()) {
+            throw std::runtime_error(
+                "runtime_env must be a JSON string holding a runtime env object, "
+                "got " + j["runtime_env"].dump());
+        }
+        std::string runtime_env_json = j["runtime_env"].get<std::string>();
+        auto runtime_env = nlohmann::json::parse(runtime_env_json);
+        if (!runtime_env.is_object()) {
+            throw std::runtime_error(
+                "runtime_env must be a JSON object, got " + runtime_env.dump());
+        }
+        options.serialized_runtime_env_info =
+            ray::RuntimeEnv::Deserialize(runtime_env_json)
+                .SerializeToRuntimeEnvInfo();
+    }
+}
+
 // ─── Lifecycle ────────────────────────────────────────────────
 
 static void reopen_ref_count_gate(void);
@@ -520,9 +634,13 @@ void ray_shutdown(void) {
 // ─── Object Store ─────────────────────────────────────────────
 
 ray_bytes_t ray_put(const char *data, size_t len) {
+    ray_clear_error();
     try {
         auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) return ray_bytes_t{nullptr, 0};
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return ray_bytes_t{nullptr, 0};
+        }
 
         // The data from Rust is already msgpack-serialized (by rmp-serde).
         // Write it directly into the sbuffer without wrapping in pack_bin,
@@ -541,6 +659,7 @@ ray_bytes_t ray_put(const char *data, size_t len) {
 }
 
 ray_bytes_t ray_get(const char *id_data, size_t id_len, int timeout_ms) {
+    ray_clear_error();
     try {
         auto runtime = ray::internal::GetRayRuntime();
         if (!runtime) {
@@ -757,49 +876,31 @@ build_task_args_python(const ray_bytes_t *args, size_t arg_count,
     return task_args;
 }
 
-ray_bytes_t ray_task_call(const char *func_name,
-                           const ray_bytes_t *args,
-                           size_t arg_count,
-                           const bool *is_ref) {
+/// Call a remote task with full CallOptions.
+/// `options_json` is a JSON object string; see ray_c.h for the field set.
+ray_bytes_t ray_task_call_with_options(const char *func_name,
+                                         const ray_bytes_t *args,
+                                         size_t arg_count,
+                                         const bool *is_ref,
+                                         const char *options_json) {
+    ray_clear_error();
     try {
         auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) return ray_bytes_t{nullptr, 0};
-
-        std::string fn(func_name);
-        ray::internal::RemoteFunctionHolder holder{std::move(fn)};
-
-        auto task_args = build_task_args_cpp(runtime.get(), args, arg_count, is_ref);
-
-        ray::internal::CallOptions options;
-        std::string id = runtime->Call(holder, task_args, options);
-        return dup_bytes(id);
-    } RAY_CATCH
-    return ray_bytes_t{nullptr, 0};
-}
-
-/// Call a remote task with resource requirements.
-/// `resources_json` is a JSON string like `{"CPU":1,"GPU":0.5}` or NULL to skip.
-ray_bytes_t ray_task_call_with_resources(const char *func_name,
-                                          const ray_bytes_t *args,
-                                          size_t arg_count,
-                                          const bool *is_ref,
-                                          const char *resources_json) {
-    try {
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) return ray_bytes_t{nullptr, 0};
-
-        std::string fn(func_name);
-        ray::internal::RemoteFunctionHolder holder{std::move(fn)};
-
-        auto task_args = build_task_args_cpp(runtime.get(), args, arg_count, is_ref);
-
-        ray::internal::CallOptions options;
-        if (resources_json && resources_json[0] != '\0') {
-            auto j = nlohmann::json::parse(resources_json);
-            for (auto it = j.begin(); it != j.end(); ++it) {
-                options.resources[it.key()] = it.value().get<double>();
-            }
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return ray_bytes_t{nullptr, 0};
         }
+
+        std::string fn(func_name);
+        ray::internal::RemoteFunctionHolder holder{std::move(fn)};
+
+        auto task_args = build_task_args_cpp(runtime.get(), args, arg_count, is_ref);
+
+        // The SDK leaves bundle_index uninitialized in CallOptions; -1 means
+        // "any bundle" and must be set before parse_call_options may leave it.
+        ray::internal::CallOptions options;
+        options.bundle_index = -1;
+        parse_call_options(options_json, options);
         std::string id = runtime->Call(holder, task_args, options);
         return dup_bytes(id);
     } RAY_CATCH
@@ -814,9 +915,13 @@ ray_bytes_t ray_task_call_python(const char *module_name,
                                   const ray_bytes_t *args,
                                   size_t arg_count,
                                   const bool *is_ref) {
+    ray_clear_error();
     try {
         auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) return ray_bytes_t{nullptr, 0};
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return ray_bytes_t{nullptr, 0};
+        }
 
         ray::internal::RemoteFunctionHolder holder(
             std::string(module_name), std::string(function_name),
@@ -840,9 +945,13 @@ ray_bytes_t ray_actor_create_with_options(const char *func_name,
                                             const ray_bytes_t *args,
                                             size_t arg_count,
                                             const char *options_json) {
+    ray_clear_error();
     try {
         auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) return ray_bytes_t{nullptr, 0};
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return ray_bytes_t{nullptr, 0};
+        }
 
         ray::internal::RemoteFunctionHolder holder("", std::string(func_name),
                                                    std::string(func_name),
@@ -864,9 +973,13 @@ ray_bytes_t ray_actor_create_python_with_options(const char *module_name,
                                                    const ray_bytes_t *args,
                                                    size_t arg_count,
                                                    const char *options_json) {
+    ray_clear_error();
     try {
         auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) return ray_bytes_t{nullptr, 0};
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return ray_bytes_t{nullptr, 0};
+        }
 
         ray::internal::RemoteFunctionHolder holder(
             std::string(module_name), "__init__",
@@ -889,9 +1002,13 @@ ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
                             const ray_bytes_t *args,
                             size_t arg_count,
                             const bool *is_ref = nullptr) {
+    ray_clear_error();
     try {
         auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) return ray_bytes_t{nullptr, 0};
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return ray_bytes_t{nullptr, 0};
+        }
 
         // For CPP actor calls, RemoteFunctionHolder should use single-argument
         // constructor (only function_name_, class_name_ stays empty).
@@ -920,9 +1037,13 @@ ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len
                                     const ray_bytes_t *args,
                                     size_t arg_count,
                                     const bool *is_ref) {
+    ray_clear_error();
     try {
         auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) return ray_bytes_t{nullptr, 0};
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return ray_bytes_t{nullptr, 0};
+        }
 
         ray::internal::RemoteFunctionHolder holder(
             "", std::string(method_name), "",
@@ -941,6 +1062,7 @@ ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len
 }
 
 void ray_actor_kill(const char *actor_id_data, size_t actor_id_len, bool no_restart) {
+    ray_clear_error();
     try {
         auto runtime = ray::internal::GetRayRuntime();
         if (runtime) {
@@ -960,9 +1082,13 @@ void ray_actor_kill(const char *actor_id_data, size_t actor_id_len, bool no_rest
 ray_bytes_t ray_placement_group_create(const char *name,
                                         const char *bundles_json,
                                         int strategy) {
+    ray_clear_error();
     try {
         auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) return ray_bytes_t{nullptr, 0};
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return ray_bytes_t{nullptr, 0};
+        }
 
         ray::PlacementGroupCreationOptions options;
         if (name) options.name = name;
@@ -1012,6 +1138,7 @@ bool ray_was_current_actor_restarted(void) {
 }
 
 ray_bytes_t ray_get_namespace(void) {
+    ray_clear_error();
     try {
         auto runtime = ray::internal::GetRayRuntime();
         if (runtime) return dup_bytes(runtime->GetNamespace());
@@ -1025,9 +1152,13 @@ ray_bytes_t ray_get_namespace(void) {
 }
 
 ray_bytes_t ray_get_actor(const char *name, const char *ray_namespace) {
+    ray_clear_error();
     try {
         auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) return ray_bytes_t{nullptr, 0};
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return ray_bytes_t{nullptr, 0};
+        }
 
         std::string ns_str = ray_namespace ? std::string(ray_namespace) : "";
         std::string actor_id = runtime->GetActorId(std::string(name), ns_str);

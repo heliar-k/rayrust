@@ -395,7 +395,9 @@ impl Ray {
     /// Ray knows (a handle returned by `put` or by a task/actor call); a 28-byte
     /// id of unknown origin makes Ray's `GetOwnerAddressOrDie` terminate the
     /// process. Use [`TaskArg`](crate::TaskArg) with the macro-generated callers
-    /// to get that check for free. Pass `&TaskOptions::new()` for no resources.
+    /// to get that check for free. Pass `&TaskOptions::new()` for no options;
+    /// [`TaskOptions`] carries the task name, resource requirements, placement
+    /// group binding and runtime env.
     pub fn task_call(
         &self,
         func_name: &str,
@@ -403,11 +405,7 @@ impl Ray {
         is_ref: &[bool],
         opts: &TaskOptions,
     ) -> Result<ObjectRef<()>, RayError> {
-        if opts.has_resources() {
-            task_call_with_options_inner(func_name, args, is_ref, opts)
-        } else {
-            task_call_inner(func_name, args, is_ref)
-        }
+        task_call_inner(func_name, args, is_ref, opts)
     }
 
     /// Asynchronously call a remote task.
@@ -418,7 +416,7 @@ impl Ray {
     /// when the future is created, and the blocking-pool closure checks it
     /// again right before the call to C++, so a future polled after the last
     /// `Ray` handle was dropped fails with `RayError::Runtime`.
-    /// Pass `&TaskOptions::new()` for no resource requirements.
+    /// Pass `&TaskOptions::new()` for no options (see [`TaskOptions`]).
     ///
     /// `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID (pass by
     /// reference). Such an id must be a reference this process currently holds
@@ -451,6 +449,10 @@ impl Ray {
     }
 
     /// Call a Python remote function.
+    ///
+    /// This entry point takes no [`TaskOptions`]: a Python task submitted here
+    /// cannot be named, cannot request resources, cannot be bound to a placement
+    /// group bundle and cannot be given a runtime env.
     ///
     /// `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID (pass by
     /// reference). Two requirements apply to such an id:
@@ -944,48 +946,14 @@ fn submit_task_async(
 ) -> impl std::future::Future<Output = Result<ObjectRef<()>, RayError>> + Send + 'static {
     let func_name = func_name.to_string();
     let epoch = crate::object_ref::live_epoch();
-    let has_resources = opts.has_resources();
-    let resources_json = if has_resources {
-        Some(opts.resources_json())
-    } else {
-        None
-    };
+    // 校验与 options JSON 都在创建 future 之前算好：字段组合不合法时连 JSON 都
+    // 不生成，错误在第一次轮询时返回，任务不会被提交（与 `into_parts` 的错误同一
+    // 时机）。
+    let options_json = check_task_options(opts).map(|()| opts.to_json());
     async move {
+        let options_json = options_json?;
         let (args, is_ref, held) = args.into_parts()?;
-        if has_resources {
-            // For async + resources, we use spawn_blocking on the sync FFI path
-            // (the C ABI for resources is sync-only).
-            tokio::task::spawn_blocking(move || {
-                let _held = held;
-                check_epoch(epoch)?;
-                let args_ref: Vec<&[u8]> = args.iter().map(|v| v.as_slice()).collect();
-                let is_ref_ref: &[bool] = if is_ref.is_empty() { &[] } else { &is_ref };
-                let func_c = to_cstring(&func_name);
-                let args_arr = build_args_array(&args_ref);
-                let is_ref_ptr = if is_ref_ref.is_empty() {
-                    std::ptr::null()
-                } else {
-                    is_ref_ref.as_ptr()
-                };
-                let resources_json_c = to_cstring(&resources_json.unwrap_or_default());
-                let bytes = unsafe {
-                    rayrust_sys::ray_task_call_with_resources(
-                        func_c.as_ptr(),
-                        args_arr.as_ptr(),
-                        args_arr.len(),
-                        is_ref_ptr,
-                        resources_json_c.as_ptr(),
-                    )
-                };
-                let guard = CBytesGuard::from(bytes)
-                    .ok_or_else(|| ffi_error_detail("ray_task_call_with_resources", &func_name))?;
-                Ok(ObjectRef::from_call_id(guard.as_slice().to_vec()))
-            })
-            .await
-            .map_err(|e| RayError::Runtime(format!("task_call join error: {}", e)))?
-        } else {
-            task_call_inner_async(func_name, args, is_ref, held, epoch).await
-        }
+        task_call_inner_async(func_name, args, is_ref, held, epoch, options_json).await
     }
 }
 
@@ -1011,38 +979,22 @@ pub(crate) fn task_call_inner(
     func_name: &str,
     args: &[&[u8]],
     is_ref: &[bool],
-) -> Result<ObjectRef<()>, RayError> {
-    check_is_ref_len(args.len(), is_ref)?;
-    let func_c = to_cstring(func_name);
-    let args_arr = build_args_array(args);
-    let is_ref_ptr = if is_ref.is_empty() {
-        std::ptr::null()
-    } else {
-        is_ref.as_ptr()
-    };
-
-    let bytes = unsafe {
-        rayrust_sys::ray_task_call(
-            func_c.as_ptr(),
-            args_arr.as_ptr(),
-            args_arr.len(),
-            is_ref_ptr,
-        )
-    };
-
-    let guard = CBytesGuard::from(bytes)
-        .ok_or_else(|| ffi_error_detail("ray_task_call", func_name))?;
-    Ok(ObjectRef::from_call_id(guard.as_slice().to_vec()))
-}
-
-/// Call a remote task with resource requirements via TaskOptions.
-pub(crate) fn task_call_with_options_inner(
-    func_name: &str,
-    args: &[&[u8]],
-    is_ref: &[bool],
     opts: &TaskOptions,
 ) -> Result<ObjectRef<()>, RayError> {
     check_is_ref_len(args.len(), is_ref)?;
+    check_task_options(opts)?;
+    task_call_json_inner(func_name, args, is_ref, &opts.to_json())
+}
+
+/// `task_call_inner` 的主体，`options_json` 已由调用方算好（异步路径在闭包外算，
+/// 随闭包 move 进来）。空字符串与 NULL 等价：不设任何选项。
+pub(crate) fn task_call_json_inner(
+    func_name: &str,
+    args: &[&[u8]],
+    is_ref: &[bool],
+    options_json: &str,
+) -> Result<ObjectRef<()>, RayError> {
+    check_is_ref_len(args.len(), is_ref)?;
     let func_c = to_cstring(func_name);
     let args_arr = build_args_array(args);
     let is_ref_ptr = if is_ref.is_empty() {
@@ -1050,46 +1002,45 @@ pub(crate) fn task_call_with_options_inner(
     } else {
         is_ref.as_ptr()
     };
-    let resources_json_c = if opts.has_resources() {
-        Some(to_cstring(&opts.resources_json()))
-    } else {
-        None
-    };
-    let resources_json = resources_json_c.as_ref()
-        .map(|c| c.as_ptr())
-        .unwrap_or(std::ptr::null());
+    let options_json_c = to_cstring(options_json);
 
     let bytes = unsafe {
-        rayrust_sys::ray_task_call_with_resources(
+        rayrust_sys::ray_task_call_with_options(
             func_c.as_ptr(),
             args_arr.as_ptr(),
             args_arr.len(),
             is_ref_ptr,
-            resources_json,
+            if options_json_c.as_bytes().is_empty() {
+                std::ptr::null()
+            } else {
+                options_json_c.as_ptr()
+            },
         )
     };
 
     let guard = CBytesGuard::from(bytes)
-        .ok_or_else(|| ffi_error_detail("ray_task_call_with_resources", func_name))?;
+        .ok_or_else(|| ffi_error_detail("ray_task_call_with_options", func_name))?;
     Ok(ObjectRef::from_call_id(guard.as_slice().to_vec()))
 }
 
 /// Asynchronously call a remote task by function name.
 ///
 /// `held` 是参数引用的保活集合：它被移进 `spawn_blocking` 的闭包，活到 FFI 调用
-/// 返回为止，所以提交期间对象不会被释放。
+/// 返回为止，所以提交期间对象不会被释放。`options_json` 在闭包外算好：进入
+/// 异步块之后只有 `&TaskOptions` 的借用，拿不到它了。
 pub(crate) async fn task_call_inner_async(
     func_name: String,
     args: Vec<Vec<u8>>,
     is_ref: Vec<bool>,
     held: Vec<ObjectRef<()>>,
     epoch: u64,
+    options_json: String,
 ) -> Result<ObjectRef<()>, RayError> {
     tokio::task::spawn_blocking(move || {
         let _held = held;
         check_epoch(epoch)?;
         let args_ref: Vec<&[u8]> = args.iter().map(|v| v.as_slice()).collect();
-        task_call_inner(&func_name, &args_ref, &is_ref)
+        task_call_json_inner(&func_name, &args_ref, &is_ref, &options_json)
     })
     .await
     .map_err(|e| RayError::Runtime(format!("task_call join error: {}", e)))?
@@ -1191,28 +1142,86 @@ fn resources_to_json(resources: &[(String, f64)]) -> String {
 
 // ─── Task Options (builder) ────────────────────────────────────
 
-/// Builder for Ray `CallOptions`.
+/// Builder for Ray `CallOptions`，与 C++ SDK 的 `internal::CallOptions` 五个字段
+/// 一一对应：
+/// - `name` — 任务名，空字符串表示不设，默认由函数名生成。名字进入任务规格；
+///   任务失败或被取消时，驱动进程的 core worker 日志里会以 `task_name=<名字>`
+///   打出这一行（`task_manager.cc`）。
+/// - `resources` — 资源需求，例如 `[("CPU", 2.0), ("GPU", 0.5)]`，空表示不
+///   申请额外资源。
+/// - `placement_group_id` — 绑定到 placement group 的二进制 id
+///   （[`Ray::placement_group_create`] 返回的字节），空表示不绑。非空时必须
+///   正好 18 字节（`PlacementGroupID` 的长度）；查不到的 group 报
+///   [`RayError::Ffi`]，不会退回默认调度。
+/// - `bundle_index` — 绑定到 group 内哪个 bundle；-1（默认）表示该 group 内任意
+///   bundle 都可。必须是 -1 或非负值；只设 bundle_index 而不设 group 是错误（两者
+///   都报 [`RayError::Ffi`]）。
+/// - `runtime_env` — runtime env 对象的 JSON 文本，接受 Python
+///   `ray.runtime_env.RuntimeEnv` 那种对象 JSON，例如
+///   `{"env_vars":{"FOO":"bar"}}` 或 `{"pip":["..."],"env_vars":{...}}`；
+///   空字符串表示不设。必须是 JSON 对象，非法 JSON 或非对象报
+///   [`RayError::Ffi`]。底层由 SDK 的
+///   `ray::RuntimeEnv::Deserialize(...).SerializeToRuntimeEnvInfo()` 转成 Ray 的
+///   runtime env info。
 ///
-/// Mirrors the C++ SDK's `CallOptions` struct. Use the builder methods
-/// to set resource requirements, then pass to `Ray::task_call`.
+/// 本地模式（[`RayConfig::local`]）下这些选项基本无效：
+/// `LocalModeTaskSubmitter::SubmitTask` 把 `CallOptions` 整个丢弃
+/// （`Submit(invocation, {})`），所以 `name`、`resources`、`runtime_env` 都不生效；
+/// `placement_group_id` 则直接报 [`RayError::Ffi`]（本地模式没有 GCS accessor，
+/// SDK 的 `GetPlacementGroupById` 在那里解引用空指针）。
 ///
 /// # Example
 /// ```no_run
 /// use rayrust::prelude::*;
 /// # let ray = Ray::local().unwrap();
-/// let opts = TaskOptions::new().resource("CPU", 2.0).resource("GPU", 1.0);
+/// let opts = TaskOptions::new()
+///     .name("my_task")
+///     .resource("CPU", 2.0)
+///     .runtime_env(r#"{"env_vars":{"FOO":"bar"}}"#);
 /// let obj = ray.task_call("my_task", &[], &[], &opts).unwrap();
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TaskOptions {
+    /// Task name. Empty = the default name derived from the function name.
+    pub name: String,
     /// Resource requirements, e.g. `[("CPU", 2.0), ("GPU", 0.5)]`.
     pub resources: Vec<(String, f64)>,
+    /// Binary placement group ID, exactly 18 bytes when non-empty.
+    /// Empty = do not bind to a placement group.
+    pub placement_group_id: Vec<u8>,
+    /// Bundle index within the placement group: -1 (default) = any bundle in the
+    /// group, otherwise non-negative. Only meaningful together with
+    /// `placement_group_id`.
+    pub bundle_index: i32,
+    /// Runtime env object JSON, e.g. `{"env_vars":{"FOO":"bar"}}`. Empty = none.
+    pub runtime_env: String,
+}
+
+impl Default for TaskOptions {
+    /// `bundle_index` 的值是 -1（group 内任意 bundle），与 [`TaskOptions::new`]
+    /// 相同。派生实现会给 0，则 `TaskOptions { placement_group_id, ..Default::default() }`
+    /// 会把任务固定到第 0 个 bundle。
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            resources: Vec::new(),
+            placement_group_id: Vec::new(),
+            bundle_index: -1,
+            runtime_env: String::new(),
+        }
+    }
 }
 
 impl TaskOptions {
     /// Create a new builder with no options (all defaults).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set the task name.
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
     }
 
     /// Add a resource requirement, e.g. `("CPU", 2.0)`.
@@ -1227,15 +1236,83 @@ impl TaskOptions {
         self
     }
 
+    /// Bind the task to a placement group bundle.
+    /// `group_id` is the binary ID returned by `placement_group_create`; it must
+    /// be exactly 18 bytes and must name an existing group, otherwise the call
+    /// fails with [`RayError::Ffi`] instead of running the task outside the
+    /// group. `bundle_index` is the index of the bundle within the group: -1 for
+    /// any bundle in the group, otherwise non-negative.
+    pub fn placement_group(mut self, group_id: Vec<u8>, bundle_index: i32) -> Self {
+        self.placement_group_id = group_id;
+        self.bundle_index = bundle_index;
+        self
+    }
+
+    /// Set the runtime env from its object JSON, e.g.
+    /// `{"env_vars":{"FOO":"bar"}}`. The text must be a single JSON object;
+    /// malformed JSON and non-objects fail the call with [`RayError::Ffi`].
+    pub fn runtime_env(mut self, json: impl Into<String>) -> Self {
+        self.runtime_env = json.into();
+        self
+    }
+
     /// Whether any resources are set.
     pub fn has_resources(&self) -> bool {
         !self.resources.is_empty()
     }
 
-    /// Serialize resources to JSON for the C ABI.
-    fn resources_json(&self) -> String {
-        resources_to_json(&self.resources)
+    /// Serialize to a JSON string for the C ABI `options_json` parameter.
+    /// Returns empty string if no options are set (all defaults).
+    /// `runtime_env` is embedded as a JSON string value holding the object text,
+    /// so a runtime env string can never splice keys into the outer document.
+    fn to_json(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+
+        if !self.name.is_empty() {
+            parts.push(format!("\"name\":\"{}\"", json_escape(&self.name)));
+        }
+        if !self.resources.is_empty() {
+            parts.push(format!(
+                "\"resources\":{}",
+                resources_to_json(&self.resources)
+            ));
+        }
+        if !self.placement_group_id.is_empty() {
+            parts.push(format!(
+                "\"placement_group_id\":\"{}\",\"bundle_index\":{}",
+                hex_encode(&self.placement_group_id),
+                self.bundle_index
+            ));
+        }
+        if !self.runtime_env.is_empty() {
+            parts.push(format!(
+                "\"runtime_env\":\"{}\"",
+                json_escape(&self.runtime_env)
+            ));
+        }
+
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("{{{}}}", parts.join(","))
+        }
     }
+}
+
+/// `TaskOptions` 里互相依赖的字段的构造期校验。
+///
+/// `to_json` 只在 `placement_group_id` 非空时输出 `bundle_index`，所以孤立的
+/// `bundle_index`（没有 group）不会进 options JSON，C 侧的 `parse_call_options` 也就
+/// 看不到它。那个组合在文档里承诺报错，必须在提交前拦下，否则字段被静默丢弃、任务
+/// 以默认 options 执行。
+fn check_task_options(opts: &TaskOptions) -> Result<(), RayError> {
+    if opts.placement_group_id.is_empty() && opts.bundle_index != -1 {
+        return Err(RayError::Ffi(format!(
+            "bundle_index {} requires placement_group_id; without a placement group the field would be dropped",
+            opts.bundle_index
+        )));
+    }
+    Ok(())
 }
 
 // ─── Actor Creation Options (builder) ─────────────────────────
@@ -1762,10 +1839,9 @@ mod tests {
         let flags = [true];
         let actor_id = [0u8; 16];
 
-        assert_len_rejected("task_call_inner", task_call_inner("add", &args, &flags));
         assert_len_rejected(
-            "task_call_with_options_inner",
-            task_call_with_options_inner("add", &args, &flags, &TaskOptions::new()),
+            "task_call_inner",
+            task_call_inner("add", &args, &flags, &TaskOptions::new()),
         );
         assert_len_rejected(
             "actor_call_inner",
@@ -1779,5 +1855,180 @@ mod tests {
             "actor_call_python_inner",
             actor_call_python_inner(&actor_id, "increment", &args, &flags),
         );
+    }
+
+    #[test]
+    fn task_options_to_json_empty_is_empty_string() {
+        assert_eq!(TaskOptions::new().to_json(), "");
+        assert_eq!(TaskOptions::default().to_json(), "");
+    }
+
+    #[test]
+    fn task_options_to_json_name_only() {
+        let opts = TaskOptions::new().name("my_task");
+        assert_eq!(opts.to_json(), r#"{"name":"my_task"}"#);
+    }
+
+    #[test]
+    fn task_options_to_json_resources_only() {
+        let opts = TaskOptions::new().resource("CPU", 1.0).resource("GPU", 0.5);
+        assert_eq!(opts.to_json(), r#"{"resources":{"CPU":1,"GPU":0.5}}"#);
+    }
+
+    #[test]
+    fn task_options_to_json_placement_group_with_bundle_index() {
+        let id = vec![0x0a, 0x1b, 0x2c];
+        let opts = TaskOptions::new().placement_group(id.clone(), 1);
+        assert_eq!(
+            opts.to_json(),
+            format!(
+                "{{\"placement_group_id\":\"{}\",\"bundle_index\":1}}",
+                hex_encode(&id)
+            )
+        );
+    }
+
+    #[test]
+    fn task_options_to_json_placement_group_without_bundle_index() {
+        // 两个构造入口的默认 bundle_index 都是 -1，未显式指定时照它输出。
+        let id = vec![0xffu8; 4];
+        let opts = TaskOptions::new().placement_group(id.clone(), -1);
+        assert_eq!(
+            opts.to_json(),
+            format!(
+                "{{\"placement_group_id\":\"{}\",\"bundle_index\":-1}}",
+                hex_encode(&id)
+            )
+        );
+    }
+
+    #[test]
+    fn task_options_default_carries_bundle_index_minus_one() {
+        assert_eq!(TaskOptions::default().bundle_index, -1);
+        assert_eq!(TaskOptions::new().bundle_index, -1);
+        // 结构体更新语法不留缝：只给 group 时 bundle_index 也是 -1。
+        let id = vec![0x07u8; 18];
+        let opts = TaskOptions {
+            placement_group_id: id.clone(),
+            ..Default::default()
+        };
+        assert_eq!(opts.bundle_index, -1);
+        assert_eq!(
+            opts.to_json(),
+            format!(
+                "{{\"placement_group_id\":\"{}\",\"bundle_index\":-1}}",
+                hex_encode(&id)
+            )
+        );
+    }
+
+    #[test]
+    fn task_options_to_json_runtime_env_is_a_string_value() {
+        let opts = TaskOptions::new().runtime_env(r#"{"env_vars":{"FOO":"bar"}}"#);
+        assert_eq!(
+            opts.to_json(),
+            r#"{"runtime_env":"{\"env_vars\":{\"FOO\":\"bar\"}}"}"#
+        );
+    }
+
+    #[test]
+    fn task_options_to_json_escapes_runtime_env() {
+        // 环境变量值里的引号、反斜杠与换行必须按 JSON 字符串转义，而不是把内容
+        // 原样嵌进外层文档。
+        let env = "line1\n\"q\" \\ end";
+        let opts = TaskOptions::new().runtime_env(env);
+        assert_eq!(
+            opts.to_json(),
+            "{\"runtime_env\":\"line1\\n\\\"q\\\" \\\\ end\"}"
+        );
+    }
+
+    #[test]
+    fn task_options_to_json_runtime_env_and_resources_without_a_group() {
+        let opts = TaskOptions::new()
+            .resource("CPU", 1.0)
+            .runtime_env(r#"{"env_vars":{"FOO":"bar"}}"#);
+        assert_eq!(
+            opts.to_json(),
+            r#"{"resources":{"CPU":1},"runtime_env":"{\"env_vars\":{\"FOO\":\"bar\"}}"}"#
+        );
+    }
+
+    #[test]
+    fn task_options_to_json_empty_strings_clear_set_fields() {
+        let opts = TaskOptions::new().name("x").name("");
+        assert_eq!(opts.to_json(), "");
+        let opts = TaskOptions::new()
+            .runtime_env(r#"{"env_vars":{"FOO":"bar"}}"#)
+            .runtime_env("");
+        assert_eq!(opts.to_json(), "");
+    }
+
+    #[test]
+    fn task_options_to_json_keeps_runtime_env_inside_its_string() {
+        // 注入串只能留在 runtime_env 的字符串值里，外层不会多出第二个 name 键。
+        let opts = TaskOptions::new()
+            .name("intended")
+            .runtime_env(r#"{"env_vars":{}},"name":"hijack""#);
+        assert_eq!(
+            opts.to_json(),
+            "{\"name\":\"intended\",\"runtime_env\":\"{\\\"env_vars\\\":{}},\\\"name\\\":\\\"hijack\\\"\"}"
+        );
+    }
+
+    #[test]
+    fn task_options_standalone_bundle_index_is_rejected() {
+        let opts = TaskOptions {
+            bundle_index: 0,
+            ..Default::default()
+        };
+        match check_task_options(&opts) {
+            Err(RayError::Ffi(msg)) => assert!(
+                msg.contains("bundle_index") && msg.contains("placement_group_id"),
+                "错误文本没有指出缺 placement_group_id: {}",
+                msg
+            ),
+            Err(other) => panic!("孤立 bundle_index 返回了别的错误变体: {}", other),
+            Ok(()) => panic!("孤立 bundle_index 通过了校验，字段会被静默丢掉"),
+        }
+    }
+
+    #[test]
+    fn task_options_default_bundle_index_without_group_is_accepted() {
+        assert!(check_task_options(&TaskOptions::default()).is_ok());
+        assert!(check_task_options(&TaskOptions::new()).is_ok());
+    }
+
+    #[test]
+    fn task_options_bundle_index_with_group_is_accepted() {
+        let opts = TaskOptions::new().placement_group(vec![0x01; 18], 0);
+        assert!(check_task_options(&opts).is_ok());
+        let opts = TaskOptions::new().placement_group(vec![0x01; 18], -1);
+        assert!(check_task_options(&opts).is_ok());
+    }
+
+    #[test]
+    fn task_options_to_json_combined_fields() {
+        let id = vec![0x01, 0x02];
+        let opts = TaskOptions::new()
+            .name("combined")
+            .resource("CPU", 2.0)
+            .placement_group(id.clone(), 0)
+            .runtime_env(r#"{"pip":["numpy"]}"#);
+        assert_eq!(
+            opts.to_json(),
+            format!(
+                "{{\"name\":\"combined\",\"resources\":{{\"CPU\":2}},\
+                 \"placement_group_id\":\"{}\",\"bundle_index\":0,\
+                 \"runtime_env\":\"{{\\\"pip\\\":[\\\"numpy\\\"]}}\"}}",
+                hex_encode(&id)
+            )
+        );
+    }
+
+    #[test]
+    fn task_options_to_json_escapes_name() {
+        let opts = TaskOptions::new().name("quote\"back\\slash\n");
+        assert_eq!(opts.to_json(), "{\"name\":\"quote\\\"back\\\\slash\\n\"}");
     }
 }
