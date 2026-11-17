@@ -144,9 +144,10 @@ bool *ray_wait(const ray_bytes_t *ids, size_t count, int num_objects, int timeou
 /// - `placement_group_id` must decode to exactly 18 bytes: an empty string, an
 ///   odd number of hex characters, a non-hex character or any other length is
 ///   an error, and so is an id that names no existing group.
-/// - `bundle_index` must be -1 or non-negative (a smaller value would hit a
-///   RAY_CHECK in the SDK and abort the process), and it requires
-///   `placement_group_id`.
+/// - `bundle_index` must be -1 or between 0 and 2147483647 (a smaller value
+///   would hit a RAY_CHECK in the SDK and abort the process; anything outside
+///   `int` is rejected instead of being truncated to its low 32 bits), and it
+///   requires `placement_group_id`.
 /// - `runtime_env` must be a JSON string holding a single JSON object; a
 ///   non-string, malformed JSON or a non-object is an error.
 /// Local mode rejects `placement_group_id` outright (the SDK has no placement
@@ -195,6 +196,14 @@ ray_bytes_t ray_task_call_python(const char *module_name,
 ///     "bundle_index": 0                // bundle index within the placement group
 ///   }
 /// Pass NULL or empty string for no options (all defaults).
+/// The placement group fields are validated before they reach the SDK: a
+/// `placement_group_id` that is empty, not hex, or not exactly 18 bytes, a
+/// `bundle_index` outside -1 .. 2147483647 (including values that do not fit in
+/// an `int`, which are rejected rather than truncated) or without a group, a
+/// group id that names no existing group, and any group in local mode all return
+/// an error with RAY_ERROR_KIND_GENERIC instead of letting the SDK's RAY_CHECK
+/// terminate the process. A group without a `bundle_index` key means -1 (any
+/// bundle).
 /// Constructor arguments are always values: there is no `is_ref` here.
 ray_bytes_t ray_actor_create_with_options(const char *func_name,
                                             const ray_bytes_t *args,
