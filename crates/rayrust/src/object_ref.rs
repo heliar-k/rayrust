@@ -26,6 +26,41 @@
 //! `get`/`get_async`/`wait`/批量取在进入 FFI 之前就返回 `RayError::Runtime`，
 //! 消息里带引用自己的代次与活着的运行时的代次。
 //!
+//! ## 引用计数
+//!
+//! 调用结果（`put`、`put_xlang`、`put_async`、`task_call*`、`actor_call*`）持有
+//! core worker 给每个返回 id 加的那个初始引用（`task_manager.cc` 的
+//! `AddOwnedObject(..., add_local_ref=true)`、`core_worker.cc` 的
+//! `CoreWorker::Put`）。构造时既不加也不减，`Clone` 加一个、`Drop` 减一个，
+//! 与 C++ 前端在 `ray/api/object_ref.h:42-49` 做的事相同。净计数也相同
+//! （core worker 初始 1 → C++ 构造 `ObjectRef` 加到 2 再去掉初始引用 → 1；
+//! 这里保持 1），省掉两次 FFI 调用。
+//!
+//! 从 id 字节重建的引用（`from_id`，`impl From<Vec<u8>>` 走这条）不持有 Ray 的
+//! 本地引用：构造时不加、`Clone` 时不加、`Drop` 时不减，与 Python 前端的
+//! `ray.ObjectRef(id_bytes)` 一致。对象能不能活到你读它的时候，取决于别处是否
+//! 还有引用。已释放的 id 在本地 core worker 的引用表里不存在，读取会立即返回
+//! `RayError::Ffi`（`ObjectUnknownOwner`）；对可能已释放的对象用 `get_timeout`，
+//! 没有期限的 `get` 只在对象迟迟不就绪时不返回。
+//!
+//! 转成字节（`impl From<ObjectRef<T>> for Vec<u8>`）之后引用不再由 Rust 管理，
+//! 计数保持不变、对象活到作业结束：调用方拿着 id 提交任务时，靠这一个引用保证
+//! 对象不会被提前释放。
+//!
+//! 只有属于当前活着的运行时、且 id 长度是 28 字节的引用才计数。运行时关闭
+//! （代次撤掉）之后 drop 引用只是跳过：core worker 已经关掉，引用表不存在，
+//! 没有可减的引用。这个跳过省掉一次进入 C++ 的调用；进入 C++ 的引用计数调用
+//! 与关闭之间的互斥在 C 包装层（`crates/rayrust-sys/wrapper/ray_c.cc` 的引用
+//! 计数闸门）：关闭开始时闸门拒绝新的调用，并等已经进入的那些退出（微秒级），
+//! 所以关闭一定能推进。闸门不覆盖 `get`/`put`/`wait` 这些阻塞调用。
+//! 工人进程里代次恒为 0，工人侧的引用不计数（#38）。
+//!
+//! 嵌套引用（返回的对象里装着别的对象引用）在 Rust 侧不可见：Ray 的
+//! `RayObject::GetNestedRefs()` 不在 wheel 附带的头文件里，`RayRuntime::Get`
+//! 也只交回载荷本身。Python 返回这样的值时，引用落在 pickle5 段里，Rust 解不开
+//! （`RayError::Serialization`）；它们既不会因为这个句柄而保持存活，也没有公开
+//! 途径读到那份列表（#19）。
+//!
 //! For cross-language (Python) results, the data has a 9-byte XLANG header
 //! that is stripped before deserialization.
 
@@ -55,6 +90,49 @@ pub(crate) fn publish_live_epoch() -> u64 {
 /// 运行时开始关闭：先撤掉活着的代次。此后重建的引用拿到 0，旧引用也不再相等。
 pub(crate) fn retract_live_epoch() {
     LIVE_EPOCH.store(0, Ordering::SeqCst);
+}
+
+/// Ray 2.51.1 的 ObjectID 二进制长度（`src/ray/common/id.h`）。
+const OBJECT_ID_LEN: usize = 28;
+
+/// 只有属于当前活着的运行时、且 id 长度正确的引用才参与引用计数。
+///
+/// 工人进程里 `live_epoch()` 恒为 0，运行时关闭之后引用自己的代次也不再相等，
+/// 这两种情况下都不进入 Ray 的引用计数接口；长度不对的 id 直接拒绝，因为
+/// `ObjectID::FromBinary` 对非空且长度不符的输入用 `RAY_CHECK` 终止进程，对空串
+/// 返回 nil（`src/ray/common/id.h:430-440`）。
+fn ref_counting_live(epoch: u64, id: &[u8]) -> bool {
+    epoch != 0 && epoch == live_epoch() && id.len() == OBJECT_ID_LEN
+}
+
+/// 加一个本地引用。调用方已经确认 `ref_counting_live` 成立；失败意味着守卫与
+/// C++ 侧的状态不一致，就地崩溃。
+fn add_local_reference(id: &[u8]) {
+    let rc = unsafe {
+        rayrust_sys::ray_add_local_reference(id.as_ptr() as *const std::os::raw::c_char, id.len())
+    };
+    assert_eq!(
+        rc,
+        0,
+        "ray_add_local_reference failed: {:?}",
+        rayrust_sys::last_error()
+    );
+}
+
+/// 减一个本地引用。失败条件与 `add_local_reference` 相同。
+fn remove_local_reference(id: &[u8]) {
+    let rc = unsafe {
+        rayrust_sys::ray_remove_local_reference(
+            id.as_ptr() as *const std::os::raw::c_char,
+            id.len(),
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "ray_remove_local_reference failed: {:?}",
+        rayrust_sys::last_error()
+    );
 }
 
 /// 拒绝没有活着的运行时、或者属于已经关闭的运行时的引用。
@@ -96,48 +174,115 @@ pub(crate) fn check_epoch(epoch: u64) -> Result<(), RayError> {
 /// `wait`/批量取会返回 `RayError::Runtime`，消息里带引用自己的代次与活着的
 /// 运行时的代次，不会把调用交给已经关闭的 C++ 运行时。关闭之后从 id 字节
 /// 重建的引用（`impl From<Vec<u8>>` 走 `from_id`）拿到代次 0，同样被拒。
+///
+/// 调用结果构造的引用同时持有 Ray 的一个本地引用：clone 时加一个，drop 时减一个。
+/// 集群模式（core worker 已初始化）下最后一个引用 drop 之后对象可能被释放，要按
+/// id 继续读取就得持有引用；本地模式与工人进程不参与引用计数，对象不会被释放。
+/// 从 id 字节重建的引用（`impl From<Vec<u8>>`）不持有引用，见 `from_id`。
 #[derive(Debug)]
 pub struct ObjectRef<T> {
     pub(crate) id: Vec<u8>,
     pub(crate) is_xlang: bool,
     /// 创建时的运行时代次，用于拒绝属于已经关闭的运行时的引用。
     pub(crate) epoch: u64,
+    /// 这个句柄是否持有 Ray 的本地引用：调用结果持有，从 id 字节重建的不持有。
+    /// 只有持有的引用在 `Clone` / `Drop` 上增减计数。
+    pub(crate) holds_reference: bool,
     _marker: PhantomData<T>,
 }
 
 /// 手写 Clone：派生版本会额外要求 `T: Clone`，而引用本身只需要复制 id。
+///
+/// 持有 Ray 本地引用的引用复制之后再加一个，不持有的复制也不加。
 impl<T> Clone for ObjectRef<T> {
     fn clone(&self) -> Self {
-        ObjectRef {
+        let cloned = ObjectRef {
             id: self.id.clone(),
             is_xlang: self.is_xlang,
             epoch: self.epoch,
+            holds_reference: self.holds_reference,
             _marker: PhantomData,
+        };
+        if cloned.counts_reference() {
+            add_local_reference(&cloned.id);
+        }
+        cloned
+    }
+}
+
+/// 减掉这个引用持有的那一个本地引用；最后一个引用 drop 之后对象可能被 Ray 释放。
+/// 从 id 字节重建的引用不持有引用，什么都不做。
+///
+/// 引用计数调用失败时就地崩溃。在 unwinding 过程中 drop 引用而 panic 会终止
+/// 进程，这条不变量被破坏时就是这样的结果。
+impl<T> Drop for ObjectRef<T> {
+    fn drop(&mut self) {
+        if self.counts_reference() {
+            remove_local_reference(&self.id);
         }
     }
 }
 
 impl<T> ObjectRef<T> {
+    /// 这个引用是否要在增减时调用 Ray 的引用计数接口。
+    fn counts_reference(&self) -> bool {
+        self.holds_reference && ref_counting_live(self.epoch, &self.id)
+    }
+
+    /// 从 id 字节重建引用（`impl From<Vec<u8>>` 走这条）。
+    ///
+    /// 不持有 Ray 的本地引用：构造时不加、`Clone` 时不加、`Drop` 时不减，与 Python
+    /// 前端的 `ray.ObjectRef(id_bytes)` 一致。对象能不能活到你读它的时候取决于别处
+    /// 是否还有引用。已释放的 id 在本地 core worker 的引用表里不存在，读取立即返回
+    /// `RayError::Ffi`；对可能已释放的对象用 `get_timeout`，没有期限的 `get` 只在
+    /// 对象迟迟不就绪时不返回。
+    ///
     /// 打戳取当前活着的运行时的代次；没有活着的运行时就是 0，此后恒被拒。
     pub(crate) fn from_id(id: Vec<u8>) -> Self {
         ObjectRef {
             id,
             is_xlang: false,
             epoch: live_epoch(),
+            holds_reference: false,
             _marker: PhantomData,
         }
     }
 
-    pub(crate) fn from_id_xlang(id: Vec<u8>) -> Self {
+    /// 调用结果（`put`、`task_call*`、`actor_call*`）的引用：沿用 core worker
+    /// 已经加好的初始引用，构造时既不加也不减，`Clone` 加一个、`Drop` 减一个。
+    ///
+    /// core worker 给每个返回 id 加一个初始引用（`task_manager.cc` 的
+    /// `AddOwnedObject(..., add_local_ref=true)`、`core_worker.cc` 的
+    /// `CoreWorker::Put`），C++ 前端在 `ObjectRef(id)` 构造时加一、随后用
+    /// `RemoveLocalReference` 去掉那个初始引用（`task_caller.h:105`、
+    /// `actor_task_caller.h:92`、`api.h:216`），净计数 1。这里保持那一个初始
+    /// 引用，`Drop` 时减掉它，净计数相同而省掉两次 FFI 调用。
+    pub(crate) fn from_call_id(id: Vec<u8>) -> Self {
+        ObjectRef {
+            id,
+            is_xlang: false,
+            epoch: live_epoch(),
+            holds_reference: true,
+            _marker: PhantomData,
+        }
+    }
+
+    pub(crate) fn from_call_xlang(id: Vec<u8>) -> Self {
         ObjectRef {
             id,
             is_xlang: true,
             epoch: live_epoch(),
+            holds_reference: true,
             _marker: PhantomData,
         }
     }
 
     /// Get the raw object ID as bytes.
+    ///
+    /// 字节本身不持有引用：引用 drop 之后对象可能被 Ray 释放，之后拿这些字节
+    /// 重建的引用（`impl From<Vec<u8>>`）同样不持有 Ray 的本地引用，对象能不能活到
+    /// 你读它的时候取决于别处是否还有引用。对可能已经释放的对象用 `get_timeout`；
+    /// 要在别处继续按 id 读取并保住对象，把 `ObjectRef` 一起交出去。
     pub fn id(&self) -> &[u8] {
         &self.id
     }
@@ -148,6 +293,9 @@ impl<T> ObjectRef<T> {
     }
 
     /// Retrieve the object value (blocks until ready).
+    ///
+    /// 没有期限：`get` 走 `get_raw`（`timeout = -1`），对象永远不会就绪时它不返回。
+    /// 需要期限用 `get_timeout` 或 `get_timeout_async`。
     pub fn get(&self) -> Result<T, RayError>
     where
         T: serde::de::DeserializeOwned,
@@ -166,6 +314,9 @@ impl<T> ObjectRef<T> {
     /// Useful when the exact type is unknown at compile time, e.g. when
     /// calling a Python function that returns a complex/nested structure.
     /// The `is_xlang` flag is respected automatically.
+    ///
+    /// 没有期限，与 `get` 共用 `get_raw`（`timeout = -1`）。需要期限用
+    /// `get_value_timeout_async`。
     pub fn get_value(&self) -> Result<rmpv::Value, RayError> {
         check_epoch(self.epoch)?;
         let bytes = crate::runtime::get_raw(&self.id)?;
@@ -264,30 +415,77 @@ impl<T> ObjectRef<T> {
     }
 
     /// Get raw bytes from the object store (for debugging).
+    ///
+    /// 没有期限，与 `get` 共用 `get_raw`（`timeout = -1`），对象永远不会就绪时它
+    /// 不返回。要原始字节同时要期限，用 `get_timeout` / `get_value_timeout_async`，
+    /// 或者先用 `wait(..., timeout_ms)` 确认就绪再读。
     pub fn get_raw_bytes(&self) -> Result<Vec<u8>, RayError> {
         check_epoch(self.epoch)?;
         crate::runtime::get_raw(&self.id)
     }
 
     /// Cast the phantom type parameter.
+    ///
+    /// 引用计数随引用一起转移：原引用不执行 `Drop`，计数不变；「是否持有引用」
+    /// 一并带到新的引用上。
     pub fn cast<U>(self) -> ObjectRef<U> {
+        let mut this = std::mem::ManuallyDrop::new(self);
         ObjectRef {
-            id: self.id,
-            is_xlang: self.is_xlang,
-            epoch: self.epoch,
+            id: std::mem::take(&mut this.id),
+            is_xlang: this.is_xlang,
+            epoch: this.epoch,
+            holds_reference: this.holds_reference,
             _marker: PhantomData,
         }
     }
 }
 
 impl<T> From<Vec<u8>> for ObjectRef<T> {
+    /// 从 id 字节重建引用。不持有 Ray 的本地引用，见 `ObjectRef::from_id`。
     fn from(id: Vec<u8>) -> Self {
         ObjectRef::from_id(id)
     }
 }
 
 impl<T> From<ObjectRef<T>> for Vec<u8> {
+    /// 字节交出去之后引用不再由 Rust 管理，计数保持不变、对象活到作业结束。
+    /// 这是有意的保留：调用方拿着 id 去提交任务时，靠这一个引用保证对象不会被
+    /// 提前释放；这个引用没有任何 API 可以交还。
     fn from(obj: ObjectRef<T>) -> Vec<u8> {
-        obj.id
+        let mut obj = std::mem::ManuallyDrop::new(obj);
+        std::mem::take(&mut obj.id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 四个不计数的情况与一个计数的情况。这个测试会发布再撤掉代次：先把五种取值
+    /// 算出来，再撤代次，最后统一断言，断言失败也不会把代次留给后面的测试。
+    #[test]
+    fn ref_counting_live_needs_the_live_epoch_and_a_28_byte_id() {
+        let id = [0u8; OBJECT_ID_LEN];
+        let epoch = publish_live_epoch();
+        let cases = [
+            // 没有活着的运行时，代次是 0
+            (!ref_counting_live(0, &id), "代次 0 不计数"),
+            // 代次与活着的运行时不同
+            (!ref_counting_live(epoch + 1, &id), "代次不同不计数"),
+            // id 长度不对
+            (
+                !ref_counting_live(epoch, &id[..OBJECT_ID_LEN - 1]),
+                "27 字节不计数",
+            ),
+            (!ref_counting_live(epoch, b""), "空 id 不计数"),
+            // 代次匹配且 id 长度正确
+            (ref_counting_live(epoch, &id), "代次匹配且 28 字节才计数"),
+        ];
+        retract_live_epoch();
+        let after_retract = !ref_counting_live(epoch, &id);
+        for (ok, what) in cases {
+            assert!(ok, "{}", what);
+        }
+        assert!(after_retract, "撤掉代次之后不计数");
     }
 }

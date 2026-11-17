@@ -203,6 +203,15 @@ let vals = ray.get_many(&[obj1, obj2, obj3])?;
 let (ready, unready) = ray.wait(&[obj1, obj2], 2, 5000)?;
 ```
 
+In cluster mode (the core worker is initialized) the `ObjectRef` returned by
+`put` and by a task or actor call holds one Ray local reference for its id:
+`Clone` adds one and `Drop` removes one, so the object lives while at least one
+such reference exists and may be freed once the last one is dropped. Local mode
+and Ray worker processes do not take part in reference counting, so dropping a
+reference there frees nothing. A reference rebuilt from id bytes
+(`ObjectRef::from(id_bytes)`) holds no reference at all: whether the object is
+still alive is up to whoever else holds it, so read it with `get_timeout`.
+
 ## Architecture
 
 ```

@@ -181,8 +181,12 @@ impl Drop for RayInner {
         // 锁必须活到 `shutdown()` 返回：否则新 `connect` 会在关闭过程中重新初始化。
         let mut live = LIVE.lock().expect("live runtime registry poisoned");
         *live = None;
-        // 关闭之前先撤掉活着的代次：从这一刻起这个运行时的引用全部过期，
-        // 等待中的线程不会拿着过期引用进入正在关闭的 C++ 运行时。
+        // 关闭之前先撤掉活着的代次：从这一刻起这个运行时的引用全部过期。
+        // 代次守卫只负责提前跳过；引用计数调用与 C++ 侧关闭之间的互斥在 C 包装层
+        // （`crates/rayrust-sys/wrapper/ray_c.cc` 的引用计数闸门）：关闭开始时闸门
+        // 拒绝新的引用计数调用，并等已经进入的那些退出（微秒级），所以关闭一定能
+        // 推进。闸门只覆盖引用计数两个函数，`get`/`put`/`wait` 这些阻塞调用不在
+        // 其中（阻塞调用不能让关闭等）。
         crate::object_ref::retract_live_epoch();
         shutdown();
         // 登记表已经清空、C++ 侧已经关掉，等着的 `connect` 可以初始化新运行时了。
@@ -446,7 +450,7 @@ impl Ray {
                     };
                     let guard = CBytesGuard::from(bytes)
                         .ok_or_else(|| ffi_error_detail("ray_task_call_with_resources", &func_name))?;
-                    Ok(ObjectRef::from_id(guard.as_slice().to_vec()))
+                    Ok(ObjectRef::from_call_id(guard.as_slice().to_vec()))
                 })
                 .await
                 .map_err(|e| RayError::Runtime(format!("task_call join error: {}", e)))?
@@ -465,7 +469,7 @@ impl Ray {
         is_ref: &[bool],
     ) -> Result<ObjectRef<()>, RayError> {
         let id = task_call_python_inner(module, function, args, is_ref)?;
-        Ok(ObjectRef::from_id_xlang(id))
+        Ok(ObjectRef::from_call_xlang(id))
     }
 
     // ── Actors ────────────────────────────────────────────────
@@ -532,7 +536,7 @@ impl Ray {
         is_ref: &[bool],
     ) -> Result<ObjectRef<()>, RayError> {
         let id = actor_call_python_inner(actor_id, method_name, args, is_ref)?;
-        Ok(ObjectRef::from_id_xlang(id))
+        Ok(ObjectRef::from_call_xlang(id))
     }
 
     /// Kill an actor by its handle.
@@ -744,7 +748,7 @@ pub(crate) fn shutdown() {
 pub(crate) fn put<T: serde::Serialize>(value: &T) -> Result<ObjectRef<T>, RayError> {
     let data = serialize(value)?;
     let id = put_raw(&data)?;
-    Ok(ObjectRef::from_id(id))
+    Ok(ObjectRef::from_call_id(id))
 }
 
 /// Put a value into the object store with XLANG header wrapping.
@@ -758,7 +762,7 @@ pub(crate) fn put<T: serde::Serialize>(value: &T) -> Result<ObjectRef<T>, RayErr
 pub(crate) fn put_xlang<T: serde::Serialize>(value: &T) -> Result<ObjectRef<T>, RayError> {
     let data = crate::serialize::serialize_xlang(value)?;
     let id = put_raw(&data)?;
-    Ok(ObjectRef::from_id_xlang(id))
+    Ok(ObjectRef::from_call_xlang(id))
 }
 
 /// Asynchronously put an object into the object store.
@@ -772,7 +776,7 @@ where
     let id = tokio::task::spawn_blocking(move || put_raw(&bytes))
         .await
         .map_err(|e| RayError::Runtime(format!("put_raw join error: {}", e)))??;
-    Ok(ObjectRef::from_id(id))
+    Ok(ObjectRef::from_call_id(id))
 }
 
 /// Ray 的 `Get` / `Wait` 只接受 `-1` 或非负的毫秒期限，其他负值会让内部的
@@ -923,7 +927,7 @@ pub(crate) fn task_call_inner(
 
     let guard = CBytesGuard::from(bytes)
         .ok_or_else(|| ffi_error_detail("ray_task_call", func_name))?;
-    Ok(ObjectRef::from_id(guard.as_slice().to_vec()))
+    Ok(ObjectRef::from_call_id(guard.as_slice().to_vec()))
 }
 
 /// Call a remote task with resource requirements via TaskOptions.
@@ -961,7 +965,7 @@ pub(crate) fn task_call_with_options_inner(
 
     let guard = CBytesGuard::from(bytes)
         .ok_or_else(|| ffi_error_detail("ray_task_call_with_resources", func_name))?;
-    Ok(ObjectRef::from_id(guard.as_slice().to_vec()))
+    Ok(ObjectRef::from_call_id(guard.as_slice().to_vec()))
 }
 
 /// Asynchronously call a remote task by function name.
@@ -1345,7 +1349,7 @@ pub(crate) fn actor_call_inner(
 
     let guard = CBytesGuard::from(bytes)
         .ok_or_else(|| ffi_error_detail("ray_actor_call", func_name))?;
-    Ok(ObjectRef::from_id(guard.as_slice().to_vec()))
+    Ok(ObjectRef::from_call_id(guard.as_slice().to_vec()))
 }
 
 /// Asynchronously call a method on an actor.

@@ -201,6 +201,13 @@ let vals = ray.get_many(&[obj1, obj2, obj3])?;
 let (ready, unready) = ray.wait(&[obj1, obj2], 2, 5000)?;
 ```
 
+集群模式（core worker 已初始化）下，`put` 与任务、actor 调用返回的 `ObjectRef` 为
+它的 id 持有一个 Ray 本地引用：`Clone` 加一个、`Drop` 减一个，只要还有这样的引用
+活着对象就活着，最后一个被 drop 之后对象可能被释放。本地模式与 Ray 工人进程不参与
+引用计数，在那里 drop 引用不会释放任何东西。从 id 字节重建的引用
+（`ObjectRef::from(id_bytes)`）不持有引用：对象能不能活到你读它的时候取决于别处
+是否还有引用，读取时用 `get_timeout`。
+
 ## 架构
 
 ```

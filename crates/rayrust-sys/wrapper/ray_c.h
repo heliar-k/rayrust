@@ -70,6 +70,22 @@ ray_bytes_t ray_put(const char *data, size_t len);
 /// On error, returns ray_bytes_t with data=NULL.
 ray_bytes_t ray_get(const char *id_data, size_t id_len, int timeout_ms);
 
+/// Add one local reference to an object ID.
+/// `id_len` must be exactly 28 bytes (the Ray 2.51.1 ObjectID length); any
+/// other length is rejected without touching Ray. `ObjectID::FromBinary`
+/// terminates the process on a non-empty length mismatch, and returns the nil
+/// ID for an empty string (src/ray/common/id.h:430-440).
+/// Returns 0 on success, -1 on error with the message in ray_last_error().
+/// Once `ray_shutdown` has started the call returns 0 without touching Ray:
+/// the core worker is going away, so there is no count left to change.
+int ray_add_local_reference(const char *id_data, size_t id_len);
+
+/// Remove one local reference from an object ID.
+/// Same length requirement and return value as ray_add_local_reference.
+/// Removing a reference the core worker does not know about only logs a
+/// warning; it does not fail.
+int ray_remove_local_reference(const char *id_data, size_t id_len);
+
 /// Wait for objects to be locally available.
 /// `ids` is an array of ray_bytes_t (binary object IDs).
 /// `count` is the number of IDs.
