@@ -68,6 +68,52 @@ pub fn sleep_for(seconds: f64) -> i64 {
     0
 }
 
+/// 任务里调用 `exit_actor()`：退出语义只在 actor 方法里成立，这次调用必须失败。
+#[remote]
+pub fn exit_from_task() -> i64 {
+    rayrust::exit_actor();
+    1
+}
+
+/// actor handle 交接：收下序列化 handle 与裸 actor id，把两段字节原样交回，并报告
+/// 在这个进程里分别尝试复原与调用的结果。
+///
+/// 工人进程的 `GetRayRuntime()` 是 per-DSO 副本且没有初始化（#38），所以两条路都会
+/// 返回 `Ffi("... Ray runtime is not initialized")`。驱动侧把这两个值打印出来，
+/// 不经受它们做断言。
+#[remote]
+pub fn handle_handoff(serialized: Vec<u8>, raw_id: Vec<u8>) -> (Vec<u8>, Vec<u8>, String, String) {
+    let restored = match rayrust::ActorHandle::from_serialized(&serialized) {
+        Ok(handle) => format!("Ok({} 字节 id)", handle.id().len()),
+        Err(error) => format!("Err({})", error),
+    };
+    let called = call_actor_by_raw_id(&raw_id);
+    (serialized, raw_id, restored, called)
+}
+
+/// 用裸 actor id 提交一次方法调用：走 `Ray::actor_call` 用的同一个 C 入口。工人进程
+/// 里没有 `Ray` 句柄可用，所以这里直接调 FFI。
+fn call_actor_by_raw_id(actor_id: &[u8]) -> String {
+    let method = rayrust::sys::to_cstring("__rayrust_actor_factory_counter::get");
+    let mut out = unsafe {
+        rayrust::sys::ray_actor_call(
+            actor_id.as_ptr() as *const std::os::raw::c_char,
+            actor_id.len(),
+            method.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if out.data.is_null() {
+        let message = rayrust::sys::last_error().unwrap_or_else(|| "没有留下错误".to_string());
+        return format!("Err({})", message);
+    }
+    let len = out.len;
+    unsafe { rayrust::sys::ray_free_bytes(&mut out) };
+    format!("Ok({} 字节 object id)", len)
+}
+
 // ─── Rust Actor: Counter (using #[rayrust::actor] macro) ───────
 
 /// A simple counter actor.
@@ -92,5 +138,61 @@ impl Counter {
 
     fn reset(&mut self) {
         self.value = 0;
+    }
+}
+
+// ─── 能结束自己的 actor ──────────────────────────────────────
+
+/// `exit()` 调用 `rayrust::exit_actor()` 结束自己；`get()` 是接管普通方法的对照组：
+/// actor 退出之后它必须失败，并借此证明没有按 `max_restarts` 重启。
+struct SelfExiting {
+    value: i64,
+}
+
+#[rayrust::actor]
+impl SelfExiting {
+    fn new(start: i64) -> Self {
+        SelfExiting { value: start }
+    }
+
+    fn get(&self) -> i64 {
+        self.value
+    }
+
+    fn increment(&mut self, n: i64) -> i64 {
+        self.value += n;
+        self.value
+    }
+
+    fn exit(&self) {
+        rayrust::exit_actor();
+    }
+
+    // 返回值的方法里调用 `exit_actor()`：本地模式用它验证「调用是空操作」这条，
+    // 因为方法自己的返回值会被解出来（哨兵路径上那里得到的是 `Serialization` 错误）。
+    fn increment_and_exit(&mut self, n: i64) -> i64 {
+        self.value += n;
+        rayrust::exit_actor();
+        self.value
+    }
+}
+
+// ─── 构造函数里退出 ─────────────────────────────────────────
+
+/// 在 `new()` 里调用 `rayrust::exit_actor()` 的 actor。集群模式下创建任务因此失败，
+/// 本地模式下那个调用是空操作、actor 正常创建。
+struct CtorExiting {
+    value: i64,
+}
+
+#[rayrust::actor]
+impl CtorExiting {
+    fn new(start: i64) -> Self {
+        rayrust::exit_actor();
+        CtorExiting { value: start }
+    }
+
+    fn get(&self) -> i64 {
+        self.value
     }
 }

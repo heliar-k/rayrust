@@ -606,6 +606,64 @@ impl Ray {
         placement_group_remove_inner(group_id);
     }
 
+    /// 等一个 placement group 就绪。
+    ///
+    /// `group_id` 是 [`Ray::placement_group_create`] 返回的二进制 id，必须正好 18
+    /// 字节；其他长度（包括空字节）返回 [`RayError::Ffi`]，进程存活。
+    ///
+    /// `timeout_seconds` 原样交给 GCS，换算成 RPC 的截止时间：正数等这么久，`0` 把截止
+    /// 时间设成现在，负数的截止时间已经过期。实测（已就绪的组上三跑一致）：`0` 仍然
+    /// 返回 `Ok(true)`（应答在毫秒级内到达），**负数即使组已就绪也返回 `Ok(false)`**
+    /// （不查现状）。未就绪的组在期限内返回 `Ok(false)`。
+    ///
+    /// 本地模式返回 [`RayError::Ffi`]：本地模式的等待实现没有覆盖接口默认值，上游
+    /// 会对任何 id 都答「ready」。
+    pub fn placement_group_wait_ready(
+        &self,
+        group_id: &[u8],
+        timeout_seconds: i32,
+    ) -> Result<bool, RayError> {
+        placement_group_wait_ready_inner(group_id, timeout_seconds)
+    }
+
+    /// 列出集群里的全部 placement group。
+    ///
+    /// 列表是 GCS 的表项，包含 `state == 3`（`REMOVED`）的历史条目：上游
+    /// `RemovePlacementGroup` 把行改成 `REMOVED` 之后继续写回去
+    /// （`src/ray/gcs/gcs_placement_group_manager.cc:458-469`），不删行。所以「全部组」
+    /// 不等于「全部存活的组」，判断存活要看 [`PlacementGroupInfo::state`]。
+    ///
+    /// 本地模式返回 [`RayError::Ffi`]：这三个查询直接解引用 GCS accessor，本地模式
+    /// 里它是空指针。
+    pub fn placement_groups(&self) -> Result<Vec<PlacementGroupInfo>, RayError> {
+        placement_groups_inner()
+    }
+
+    /// 按二进制 id 查一个 placement group。
+    ///
+    /// `group_id` 必须正好 18 字节。已移除的组**仍然返回**，`state` 是 3（`REMOVED`）
+    /// —— GCS 保留表项（同 [`Ray::placement_groups`] 的理由）；只有从未存在过的 id
+    /// 才返回 [`RayError::Ffi`]，消息里带查询用的 id。本地模式同
+    /// [`Ray::placement_groups`]。
+    pub fn placement_group_by_id(&self, group_id: &[u8]) -> Result<PlacementGroupInfo, RayError> {
+        placement_group_by_id_inner(group_id)
+    }
+
+    /// 按名字查一个 placement group。
+    ///
+    /// 只在**本 job 的 namespace 里**找：上游用
+    /// `GetPlacementGroupByName(name, GetJobConfig().ray_namespace())`
+    /// （`cpp/src/ray/runtime/abstract_ray_runtime.cc:363-372`），所以别的 namespace
+    /// 里建的同名组会得到「not found」。这是查询范围，不是错误条件。
+    ///
+    /// 移除一个组时名字映射立刻被删（`gcs_placement_group_manager.cc:414-427`），所以
+    /// 移除之后本方法马上报 [`RayError::Ffi`]，比按 id 的查询早（后者仍然成功、
+    /// `state` 是 `REMOVED`）。查不到时消息里带查询用的名字。本地模式同
+    /// [`Ray::placement_groups`]。
+    pub fn placement_group_by_name(&self, name: &str) -> Result<PlacementGroupInfo, RayError> {
+        placement_group_by_name_inner(name)
+    }
+
     // ── Misc ──────────────────────────────────────────────────
 
     /// Get the namespace of this job.
@@ -636,6 +694,11 @@ impl Ray {
     /// Check if Ray is initialized.
     pub fn is_initialized(&self) -> bool {
         is_initialized()
+    }
+
+    /// 这个进程是不是以本地模式初始化的（`RayConfig::local_mode`）。
+    pub fn is_local_mode(&self) -> bool {
+        is_local_mode()
     }
 }
 
@@ -1093,6 +1156,51 @@ impl ActorHandle {
     /// Get the actor's ID as raw bytes.
     pub fn id(&self) -> &[u8] {
         &self.id
+    }
+
+    /// 把 handle 序列化成可以跨进程传递的字节。
+    ///
+    /// 返回的是 core worker 的 `rpc::ActorHandle` protobuf：actor id、owner id 与 owner
+    /// 地址、创建 job id、actor 语言、创建任务的函数描述符、actor cursor、
+    /// `max_task_retries`、名字、namespace、`max_pending_calls` 等。带着 owner 地址
+    /// 与函数描述符，所以拿到字节的进程不必自己查 GCS 就能向这个 actor 提交方法调用。
+    /// [`ActorHandle::from_serialized`] 是它的逆操作。
+    ///
+    /// 只对「这个进程登记过的 handle」成立：[`Ray::actor_create`]、
+    /// [`Ray::get_actor`]、[`ActorHandle::from_serialized`] 都会在 core worker 的
+    /// actor manager 里登记。[`ActorHandle::id`] 背后是 crate 私有的字段，用户造
+    /// 不出没登记过的 handle，这条不变式就是本方法安全的前提——SDK 的
+    /// `ActorManager::GetActorHandle` 对查不到的 id 直接 RAY_CHECK 终止进程，没有
+    /// 错误可以返回。
+    ///
+    /// 本地模式返回 [`RayError::Ffi`]：`AbstractRayRuntime::SerializeActorHandle` 的第一句
+    /// 就是 `CoreWorkerProcess::GetCoreWorker()`，本地模式从不启动 core worker 进程，
+    /// 那里直接 `QuickExit()`（`_Exit(1)`，`src/ray/util/process.cc`）。
+    ///
+    /// 上一个运行时留下的 handle（同一个进程里 `drop` 掉 `Ray` 之后重新 `connect`）
+    /// 不在新运行时的 actor manager 里，`serialize()` 会命中 SDK 的 RAY_CHECK 终止
+    /// 进程（实测终止在 `ActorManager::GetActorHandle` 的 RAY_CHECK）。[`Ray::actor_call`]、
+    /// [`Ray::kill_actor`] 拿同一个陈旧 handle 时的处境相同。
+    pub fn serialize(&self) -> Result<Vec<u8>, RayError> {
+        actor_handle_serialize_inner(&self.id)
+    }
+
+    /// 从一个 handle 字节复原并登记 handle。
+    ///
+    /// 空字节返回 [`RayError::Ffi`]。除了空字节，**不是合法 actor handle 的字节也被
+    /// 拒掉**：上游 `ActorHandle(serialized)` 丢弃 `ParseFromString` 的结果
+    /// （`src/ray/core_worker/actor_handle.cc:66`、`:135`），畸形字节会登记成 nil actor，
+    /// 拿到的 handle 的 id 是 16 个 `0xff`。nil handle 在调用方手里没有任何明确的
+    /// 失败：调用提交成功但永远不就绪（`get` 要等到期限才报超时），`serialize()` 把
+    /// 登记的那份 protobuf 再交出来（长度与登记时相同，protobuf 重新序列化可能改写
+    /// 长度前缀；重新序列化结果为空时报错），所以 C 侧看到登记结果是 nil（16 个
+    /// `0xff` 或 16 个 `0x00`，合法 actor id 是散列，不会是这两种）就直接报
+    /// [`RayError::Ffi`]。
+    ///
+    /// 本地模式返回 [`RayError::Ffi`]：登记要读 `CoreWorkerProcess::GetCoreWorker()`，
+    /// 本地模式从不启动 core worker 进程，那里直接 `QuickExit()`（`_Exit(1)`）。
+    pub fn from_serialized(bytes: &[u8]) -> Result<ActorHandle, RayError> {
+        actor_handle_from_serialized_inner(bytes)
     }
 }
 
@@ -1634,7 +1742,151 @@ pub(crate) fn actor_kill_inner(actor_id: &[u8], no_restart: bool) {
     };
 }
 
+/// 序列化一个已登记的 actor handle。
+///
+/// 长度与「是否登记过」都在 C 侧检查：`ActorID::FromBinary` 与
+/// `ActorManager::GetActorHandle` 都是 RAY_CHECK，进 SDK 之前拦不住就会终止进程。
+pub(crate) fn actor_handle_serialize_inner(actor_id: &[u8]) -> Result<Vec<u8>, RayError> {
+    let bytes = unsafe {
+        rayrust_sys::ray_actor_handle_serialize(
+            actor_id.as_ptr() as *const std::os::raw::c_char,
+            actor_id.len(),
+        )
+    };
+    let guard = CBytesGuard::from(bytes)
+        .ok_or_else(|| ffi_error_detail("ray_actor_handle_serialize", hex_encode(actor_id)))?;
+    Ok(guard.as_slice().to_vec())
+}
+
+/// 从 handle 字节复原并登记 handle。
+pub(crate) fn actor_handle_from_serialized_inner(bytes: &[u8]) -> Result<ActorHandle, RayError> {
+    let out = unsafe {
+        rayrust_sys::ray_actor_handle_deserialize(
+            bytes.as_ptr() as *const std::os::raw::c_char,
+            bytes.len(),
+        )
+    };
+    let guard = CBytesGuard::from(out).ok_or_else(|| ffi_error("ray_actor_handle_deserialize"))?;
+    Ok(ActorHandle {
+        id: guard.as_slice().to_vec(),
+    })
+}
+
 // ─── Placement Group ──────────────────────────────────────────
+
+/// `PlacementGroupID` 的长度：14 个唯一字节 + 4 字节 JobID
+/// （`src/ray/common/id.h:300-306`）。`PlacementGroupID::FromBinary` 对非空且长度
+/// 不符的输入 RAY_CHECK 终止进程，所以带 id 的两个入口在进 FFI 之前就按它检查。
+const PLACEMENT_GROUP_ID_LEN: usize = 18;
+
+/// 一个 placement group 的查询结果。
+///
+/// `state` 与 `strategy` 保持上游的整数编码
+/// （`cpp/include/ray/api/task_options.h:44-58`）：
+/// - `state`：`PENDING` 0、`PREPARED` 1、`CREATED` 2、`REMOVED` 3、
+///   `RESCHEDULING` 4、`UNRECOGNIZED` -1；
+/// - `strategy`：`PACK` 0、`SPREAD` 1、`STRICT_PACK` 2、`STRICT_SPREAD` 3。
+///
+/// `state == 3`（`REMOVED`）的条目会一直留在 [`Ray::placement_groups`] 与
+/// [`Ray::placement_group_by_id`] 的结果里：GCS 把表行改成 `REMOVED` 之后保留
+/// （`src/ray/gcs/gcs_placement_group_manager.cc:458-469`）。只有按名字的查询会在
+/// 移除之后报错（名字映射在同一函数前面被删）。
+///
+/// 没有 `bundles` 字段：上游 `GeneratePlacementGroup` 迭代的是刚建的空 vector
+/// （`cpp/src/ray/runtime/abstract_ray_runtime.cc:326-340`），查询回来的组
+/// `GetBundles()` 永远是空的，读不到建组时传的 bundle。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementGroupInfo {
+    /// 二进制 id，18 字节。
+    pub id: Vec<u8>,
+    /// 建组时给的名字；没给就是空字符串。
+    pub name: String,
+    /// `PlacementGroupState` 的整数值。
+    pub state: i32,
+    /// `PlacementStrategy` 的整数值。
+    pub strategy: i32,
+}
+
+/// 带 group id 的两个入口的共同前置检查。
+fn check_placement_group_id(group_id: &[u8]) -> Result<(), RayError> {
+    if group_id.len() != PLACEMENT_GROUP_ID_LEN {
+        return Err(RayError::Ffi(format!(
+            "placement group id must be {} bytes, got {} bytes",
+            PLACEMENT_GROUP_ID_LEN,
+            group_id.len()
+        )));
+    }
+    Ok(())
+}
+
+/// 解一个组：4 元数组 [id(bin), name(str), state(int), strategy(int)]，与 C 侧的
+/// `pack_placement_group` 对应。
+fn decode_placement_group(value: &rmpv::Value) -> Result<PlacementGroupInfo, RayError> {
+    let fields = value.as_array().ok_or_else(|| {
+        RayError::Serialization(format!(
+            "a placement group must be a 4 element array, got {:?}",
+            value
+        ))
+    })?;
+    if fields.len() != 4 {
+        return Err(RayError::Serialization(format!(
+            "a placement group must have 4 fields, got {}",
+            fields.len()
+        )));
+    }
+    let id = match &fields[0] {
+        rmpv::Value::Binary(bytes) => bytes.clone(),
+        other => {
+            return Err(RayError::Serialization(format!(
+                "the placement group id must be msgpack bin, got {:?}",
+                other
+            )))
+        }
+    };
+    let name = fields[1]
+        .as_str()
+        .ok_or_else(|| {
+            RayError::Serialization(format!(
+                "the placement group name must be a UTF-8 msgpack str, got {:?}",
+                fields[1]
+            ))
+        })?
+        .to_string();
+    Ok(PlacementGroupInfo {
+        id,
+        name,
+        state: decode_placement_group_int(&fields[2], "state")?,
+        strategy: decode_placement_group_int(&fields[3], "strategy")?,
+    })
+}
+
+/// 解一个整数字段，超出 i32 不截断。
+fn decode_placement_group_int(value: &rmpv::Value, field: &str) -> Result<i32, RayError> {
+    let number = value.as_i64().ok_or_else(|| {
+        RayError::Serialization(format!(
+            "the placement group {} must be a msgpack integer, got {:?}",
+            field, value
+        ))
+    })?;
+    i32::try_from(number).map_err(|_| {
+        RayError::Serialization(format!(
+            "the placement group {} is {} and does not fit in i32",
+            field, number
+        ))
+    })
+}
+
+/// 解 C 侧返回的「组的数组」。
+fn decode_placement_groups(bytes: &[u8]) -> Result<Vec<PlacementGroupInfo>, RayError> {
+    let value = crate::serialize::deserialize_value(bytes)?;
+    let items = value.as_array().ok_or_else(|| {
+        RayError::Serialization(format!(
+            "expected a msgpack array of placement groups, got {:?}",
+            value
+        ))
+    })?;
+    items.iter().map(decode_placement_group).collect()
+}
 
 /// Create a placement group.
 /// `bundles_json` is a JSON array like `[{"CPU":1},{"CPU":1}]`.
@@ -1668,11 +1920,89 @@ pub(crate) fn placement_group_remove_inner(group_id: &[u8]) {
     };
 }
 
+/// 等一个 placement group 就绪。
+pub(crate) fn placement_group_wait_ready_inner(
+    group_id: &[u8],
+    timeout_seconds: i32,
+) -> Result<bool, RayError> {
+    check_placement_group_id(group_id)?;
+    let ret = unsafe {
+        rayrust_sys::ray_placement_group_wait_ready(
+            group_id.as_ptr() as *const std::os::raw::c_char,
+            group_id.len(),
+            timeout_seconds as c_int,
+        )
+    };
+    match ret {
+        1 => Ok(true),
+        0 => Ok(false),
+        _ => Err(ffi_error_detail(
+            "ray_placement_group_wait_ready",
+            hex_encode(group_id),
+        )),
+    }
+}
+
+/// 列出集群里的全部 placement group。
+pub(crate) fn placement_groups_inner() -> Result<Vec<PlacementGroupInfo>, RayError> {
+    let bytes = unsafe { rayrust_sys::ray_placement_group_get_all() };
+    let guard = CBytesGuard::from(bytes).ok_or_else(|| ffi_error("ray_placement_group_get_all"))?;
+    decode_placement_groups(guard.as_slice())
+}
+
+/// 按二进制 id 查一个 placement group。
+pub(crate) fn placement_group_by_id_inner(group_id: &[u8]) -> Result<PlacementGroupInfo, RayError> {
+    check_placement_group_id(group_id)?;
+    let bytes = unsafe {
+        rayrust_sys::ray_placement_group_get_by_id(
+            group_id.as_ptr() as *const std::os::raw::c_char,
+            group_id.len(),
+        )
+    };
+    let guard = CBytesGuard::from(bytes)
+        .ok_or_else(|| ffi_error_detail("ray_placement_group_get_by_id", hex_encode(group_id)))?;
+    unwrap_single_group(decode_placement_groups(guard.as_slice())?, || {
+        format!("placement group not found for id {}", hex_encode(group_id))
+    })
+}
+
+/// 按名字查一个 placement group。
+pub(crate) fn placement_group_by_name_inner(name: &str) -> Result<PlacementGroupInfo, RayError> {
+    let name_c = to_cstring(name);
+    let bytes = unsafe { rayrust_sys::ray_placement_group_get_by_name(name_c.as_ptr()) };
+    let guard = CBytesGuard::from(bytes)
+        .ok_or_else(|| ffi_error_detail("ray_placement_group_get_by_name", name))?;
+    unwrap_single_group(decode_placement_groups(guard.as_slice())?, || {
+        format!("placement group not found for name {:?}", name)
+    })
+}
+
+/// 按 id/按名字的查询返回 0 或 1 个组：0 个就是查不到（上游返回空组，这里必须报错，
+/// 静默成功就是丢信息）；多于 1 个是本仓库自己的打包出了错。
+fn unwrap_single_group(
+    mut groups: Vec<PlacementGroupInfo>,
+    not_found: impl FnOnce() -> String,
+) -> Result<PlacementGroupInfo, RayError> {
+    match groups.len() {
+        1 => Ok(groups.remove(0)),
+        0 => Err(RayError::Ffi(not_found())),
+        n => Err(RayError::Serialization(format!(
+            "a placement group lookup returned {} groups instead of at most 1",
+            n
+        ))),
+    }
+}
+
 // ─── Misc ─────────────────────────────────────────────────────
 
 /// Returns true if the current actor was restarted.
 pub(crate) fn was_current_actor_restarted() -> bool {
     unsafe { rayrust_sys::ray_was_current_actor_restarted() }
+}
+
+/// 这个进程是不是以本地模式初始化的。
+pub(crate) fn is_local_mode() -> bool {
+    unsafe { rayrust_sys::ray_is_local_mode() }
 }
 
 /// Get the namespace of this job.
@@ -2030,5 +2360,164 @@ mod tests {
     fn task_options_to_json_escapes_name() {
         let opts = TaskOptions::new().name("quote\"back\\slash\n");
         assert_eq!(opts.to_json(), "{\"name\":\"quote\\\"back\\\\slash\\n\"}");
+    }
+
+    // ── placement group 查询结果的解码 ───────────────────
+
+    /// 构造一个与 C 侧 `pack_placement_group` 同形的 msgpack 组：
+    /// [id(bin), name(str), state(int), strategy(int)]。
+    fn group_value(id: &[u8], name: &str, state: i64, strategy: i64) -> rmpv::Value {
+        rmpv::Value::Array(vec![
+            rmpv::Value::Binary(id.to_vec()),
+            rmpv::Value::String(name.into()),
+            rmpv::Value::Integer(state.into()),
+            rmpv::Value::Integer(strategy.into()),
+        ])
+    }
+
+    fn decode(groups: Vec<rmpv::Value>) -> Result<Vec<PlacementGroupInfo>, RayError> {
+        let bytes = crate::serialize::serialize(&rmpv::Value::Array(groups))?;
+        decode_placement_groups(&bytes)
+    }
+
+    #[test]
+    fn decode_placement_groups_reads_every_field() {
+        let first_id = vec![0x01u8; 18];
+        let second_id: Vec<u8> = (0..18u8).collect();
+        let groups = decode(vec![
+            group_value(&first_id, "named", 2, 3),
+            group_value(&second_id, "", 0, 0),
+        ])
+        .expect("两个组的数组");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0],
+            PlacementGroupInfo {
+                id: first_id,
+                name: "named".to_string(),
+                state: 2,
+                strategy: 3,
+            }
+        );
+        // 建组时没给名字就是空串，与 C 侧的 pack_str(0) 对应。
+        assert_eq!(
+            groups[1],
+            PlacementGroupInfo {
+                id: second_id,
+                name: String::new(),
+                state: 0,
+                strategy: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn decode_placement_groups_keeps_negative_state() {
+        // UNRECOGNIZED 是 -1，不能当成解码失败。
+        let groups = decode(vec![group_value(&[0x02u8; 18], "x", -1, -1)]).expect("一个组");
+        assert_eq!((groups[0].state, groups[0].strategy), (-1, -1));
+    }
+
+    #[test]
+    fn decode_placement_groups_rejects_a_short_array() {
+        let value = rmpv::Value::Array(vec![
+            rmpv::Value::Binary(vec![0u8; 18]),
+            rmpv::Value::String("x".into()),
+            rmpv::Value::Integer(2.into()),
+        ]);
+        match decode(vec![value]) {
+            Err(RayError::Serialization(message)) => assert!(
+                message.contains("4 fields"),
+                "错误文本没有指出字段数: {}",
+                message
+            ),
+            other => panic!("三字段的组返回了 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decode_placement_groups_rejects_a_textual_id() {
+        let mut value = group_value(&[0u8; 18], "x", 2, 0);
+        if let rmpv::Value::Array(fields) = &mut value {
+            fields[0] = rmpv::Value::String("not a bin".into());
+        }
+        match decode(vec![value]) {
+            Err(RayError::Serialization(message)) => assert!(
+                message.contains("bin"),
+                "错误文本没有指出 id 的 msgpack 类型: {}",
+                message
+            ),
+            other => panic!("文本 id 的组返回了 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decode_placement_groups_rejects_a_state_outside_i32() {
+        let value = group_value(&[0u8; 18], "x", i64::from(i32::MAX) + 1, 0);
+        match decode(vec![value]) {
+            Err(RayError::Serialization(message)) => assert!(
+                message.contains("does not fit in i32"),
+                "错误文本没有指出溢出: {}",
+                message
+            ),
+            other => panic!("state 溢出的组返回了 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decode_placement_groups_rejects_a_non_array_payload() {
+        let bytes = crate::serialize::serialize(&rmpv::Value::Nil).unwrap();
+        match decode_placement_groups(&bytes) {
+            Err(RayError::Serialization(message)) => assert!(
+                message.contains("msgpack array"),
+                "错误文本没有指出载荷形状: {}",
+                message
+            ),
+            other => panic!("非数组载荷返回了 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unwrap_single_group_reports_a_missing_group() {
+        let key = vec![0x0au8; 18];
+        match unwrap_single_group(Vec::new(), || {
+            format!("placement group not found for id {}", hex_encode(&key))
+        }) {
+            Err(RayError::Ffi(message)) => assert!(
+                message.contains(&hex_encode(&key)),
+                "错误文本没有带上查询键: {}",
+                message
+            ),
+            other => panic!("空数组返回了 {:?}", other),
+        }
+        let two = decode(vec![
+            group_value(&[0u8; 18], "a", 2, 0),
+            group_value(&[1u8; 18], "b", 2, 0),
+        ])
+        .expect("两个组");
+        match unwrap_single_group(two, || "not found".to_string()) {
+            Err(RayError::Serialization(message)) => assert!(
+                message.contains("2 groups"),
+                "错误文本没有指出组数: {}",
+                message
+            ),
+            other => panic!("两个组返回了 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn check_placement_group_id_only_accepts_18_bytes() {
+        assert!(check_placement_group_id(&[0u8; 18]).is_ok());
+        for len in [0usize, 1, 17, 19, 28] {
+            match check_placement_group_id(&vec![0u8; len]) {
+                Err(RayError::Ffi(message)) => assert!(
+                    message.contains("18 bytes") && message.contains(&len.to_string()),
+                    "{} 字节的长度错误文本不对: {}",
+                    len,
+                    message
+                ),
+                other => panic!("{} 字节的 id 返回了 {:?}", len, other),
+            }
+        }
     }
 }

@@ -188,10 +188,22 @@ pub fn remote(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 __rayrust_deserialized.push(__rayrust_raw.to_vec());
             }
 
+            // 上一次回调（同一个线程）留下的标志不能带进这一次。
+            ::rayrust::actor_exit::clear_exit_request();
+
             let __rayrust_result = {
                 #( #arg_deserialize )*
                 #call_expr
             };
+
+            // 任务里调用 exit_actor() 结束不了任何东西：退出语义只在 actor 方法里
+            // 成立。把标志变成哨兵，C 侧看到它就抛 RayException，这次调用因此失败。
+            if ::rayrust::actor_exit::take_exit_request() {
+                return ::rayrust::sys::RayBytes {
+                    data: ::std::ptr::null(),
+                    len: ::rayrust::sys::RAY_EXIT_OUTSIDE_ACTOR_SENTINEL,
+                };
+            }
 
             let __rayrust_result_bytes = ::rayrust::serialize(&__rayrust_result)
                 .expect(concat!("failed to serialize result of ", #fn_name_str));
@@ -463,10 +475,23 @@ pub fn actor(_attr: TokenStream, item: TokenStream) -> TokenStream {
                         __rayrust_deserialized.push(__rayrust_raw.to_vec());
                     }
 
+                    // 上一次回调（同一个线程）留下的标志不能带进这一次。
+                    ::rayrust::actor_exit::clear_exit_request();
+
                     let __rayrust_result = {
                         #( #m_arg_deserialize )*
                         #call_expr
                     };
+
+                    // actor 方法里调用了 exit_actor()：不序列化结果，把标志变成哨兵。
+                    // C 侧在 Rust 帧返回之后抛 RayIntentionalSystemExitException，
+                    // core worker 据此关闭 actor 且不按 max_restarts 重启。
+                    if ::rayrust::actor_exit::take_exit_request() {
+                        return ::rayrust::sys::RayBytes {
+                            data: ::std::ptr::null(),
+                            len: ::rayrust::sys::RAY_INTENTIONAL_EXIT_SENTINEL,
+                        };
+                    }
 
                     let __rayrust_result_bytes = ::rayrust::serialize(&__rayrust_result)
                         .expect("failed to serialize method result");
@@ -652,10 +677,21 @@ pub fn actor(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 __rayrust_deserialized.push(__rayrust_raw.to_vec());
             }
 
+            // 上一次回调（同一个线程）留下的标志不能带进这一次。
+            ::rayrust::actor_exit::clear_exit_request();
+
             let __rayrust_instance = {
                 #( #new_arg_deserialize )*
                 #type_ident::new(#(#new_arg_names),*)
             };
+
+            // 构造函数里调用 exit_actor() 只能让这次 actor 创建失败。
+            if ::rayrust::actor_exit::take_exit_request() {
+                return ::rayrust::sys::RayBytes {
+                    data: ::std::ptr::null(),
+                    len: ::rayrust::sys::RAY_EXIT_OUTSIDE_ACTOR_SENTINEL,
+                };
+            }
 
             let __rayrust_boxed = ::std::boxed::Box::new(__rayrust_instance);
             let __rayrust_ptr_val = ::std::boxed::Box::into_raw(__rayrust_boxed) as u64;
