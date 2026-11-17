@@ -61,6 +61,23 @@
 //! （`RayError::Serialization`）；它们既不会因为这个句柄而保持存活，也没有公开
 //! 途径读到那份列表（#19）。
 //!
+//! ## 作为参数
+//!
+//! 引用可以顶替一个值参数传给任务或 actor 方法（`ObjectRef<T>` 或
+//! `&ObjectRef<T>`，见 [`crate::TaskArg`]）：驱动不必先读出来，集群模式下 core
+//! worker 把对象的值投递给工人，本地模式下提交前取成值。调用器自己持有一份引用
+//! 直到提交的 FFI 调用返回，调用方不需要保证句柄活到某个时刻。传进来的句柄必须是
+//! 本进程当前持有的引用（[`crate::TaskArg`] 里有这条守卫）。
+//!
+//! Rust 任务不能把可用的引用交回来。`TaskExecutor` 给 `AllocateReturnObject` 传
+//! 的是空的嵌套引用表（`cpp/src/ray/runtime/task/task_executor.cc:251-258`），
+//! 所以 Rust 任务交回的 id 没有附带的嵌套引用；驱动侧的 core worker 只在它的引用
+//! 表里有这个 id 的 owner 时才能读（`core_worker.cc` 的 `GetObjects` 先查
+//! `HasOwner`，没有就 `ObjectUnknownOwner`，与对象是否还活着无关）。任务想把对象
+//! 交给驱动，就在驱动侧 put，或者让任务把值本身交回。Python 任务不受这条限制：
+//! 它返回的嵌套引用由 Ray 保活（`nested_inlined_refs`），只是 Rust 侧读不出那份
+//! 列表（见上一段）。
+//!
 //! For cross-language (Python) results, the data has a 9-byte XLANG header
 //! that is stripped before deserialization.
 
@@ -75,6 +92,10 @@ static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 /// 活着的运行时的代次，0 表示此刻没有活着的运行时。
 static LIVE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// 单元测试里发布/撤掉代次是进程级状态，测试线程并行跑会互相踩：拿这把锁串起来。
+#[cfg(test)]
+pub(crate) static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(crate) fn live_epoch() -> u64 {
     LIVE_EPOCH.load(Ordering::SeqCst)
@@ -179,6 +200,11 @@ pub(crate) fn check_epoch(epoch: u64) -> Result<(), RayError> {
 /// 集群模式（core worker 已初始化）下最后一个引用 drop 之后对象可能被释放，要按
 /// id 继续读取就得持有引用；本地模式与工人进程不参与引用计数，对象不会被释放。
 /// 从 id 字节重建的引用（`impl From<Vec<u8>>`）不持有引用，见 `from_id`。
+///
+/// 引用可以顶替一个值参数传给任务或 actor 方法（`ObjectRef<T>` 或
+/// `&ObjectRef<T>`，见 [`crate::TaskArg`]），任务拿到的是那个引用的值；传进来的
+/// 句柄必须是本进程当前持有的引用。Rust 任务不能把可用的引用交回来：交回的 id
+/// 没有嵌套引用，驱动侧也没有它的 owner 路径，详见模块文档的「作为参数」。
 #[derive(Debug)]
 pub struct ObjectRef<T> {
     pub(crate) id: Vec<u8>,
@@ -225,7 +251,10 @@ impl<T> Drop for ObjectRef<T> {
 
 impl<T> ObjectRef<T> {
     /// 这个引用是否要在增减时调用 Ray 的引用计数接口。
-    fn counts_reference(&self) -> bool {
+    ///
+    /// 同时看句柄自己的代次与 `holds_reference`：从 id 字节重建的句柄、
+    /// 属于已经关闭的运行时的句柄都为假。`TaskArg` 用它拒绝来路不明的 id。
+    pub(crate) fn counts_reference(&self) -> bool {
         self.holds_reference && ref_counting_live(self.epoch, &self.id)
     }
 
@@ -465,6 +494,9 @@ mod tests {
     /// 算出来，再撤代次，最后统一断言，断言失败也不会把代次留给后面的测试。
     #[test]
     fn ref_counting_live_needs_the_live_epoch_and_a_28_byte_id() {
+        let _guard = EPOCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let id = [0u8; OBJECT_ID_LEN];
         let epoch = publish_live_epoch();
         let cases = [

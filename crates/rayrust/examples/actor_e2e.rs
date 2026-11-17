@@ -11,7 +11,7 @@
 //! ```no_run
 //! // OLD (manual, error-prone)
 //! ray.actor_create("__rayrust_actor_factory_counter", &args, &ActorOptions::new())?;
-//! ray.actor_call_async(handle.id(), "__rayrust_actor_factory_counter::increment", vec![arg]).await?;
+//! ray.actor_call_async(handle.id(), "__rayrust_actor_factory_counter::increment", vec![arg], vec![]).await?;
 //!
 //! // NEW (macro-generated, type-safe)
 //! counter_actor_create(&ray, &ActorOptions::new(), 100)?;
@@ -101,7 +101,7 @@ async fn main() {
 
     // 3. Sync caller demonstration
     println!("-- 3. Sync caller --");
-    let r = counter_get_sync(&ray, &handle);
+    let r = counter_get_sync(&ray, &handle).expect("sync get failed");
     let v: i64 = r.get().expect("sync get failed");
     println!("   get_sync() = {} (expect 115)", v);
     assert_eq!(v, 115);

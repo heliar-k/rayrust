@@ -294,7 +294,7 @@ fn run_local(ray: &Ray) {
     assert_survives_drop("clone", id, 7);
 
     println!("\n--- 3. Rust 任务 add(10, 32) ---");
-    let task_ref = add_remote(ray, 10, 32);
+    let task_ref = add_remote(ray, 10, 32).expect("submit add(10, 32)");
     let id = task_ref.id().to_vec();
     read_before_drop(&task_ref, 42, "rust_task");
     drop(task_ref);

@@ -88,6 +88,7 @@ extern "C" {
         func_name: *const c_char,
         args: *const RayBytes,
         arg_count: usize,
+        is_ref: *const bool,
     ) -> RayBytes;
     pub fn ray_actor_call_python(
         actor_id_data: *const c_char,

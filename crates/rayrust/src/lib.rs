@@ -24,6 +24,7 @@ pub mod error;
 pub mod object_ref;
 pub mod runtime;
 pub mod serialize;
+pub mod task_args;
 
 /// Re-export of the raw FFI crate for macro-generated code.
 pub use rayrust_sys as sys;
@@ -34,6 +35,7 @@ pub use ctor;
 pub use error::RayError;
 pub use object_ref::ObjectRef;
 pub use runtime::{ActorHandle, ActorLifetime, ActorOptions, Ray, RayConfig, TaskOptions};
+pub use task_args::{TaskArg, TaskArgs};
 
 /// Re-export block_on_async for the `#[remote]` proc macro.
 pub use async_runtime::block_on_async;
@@ -71,6 +73,7 @@ pub mod prelude {
         deserialize, deserialize_value, deserialize_xlang, deserialize_xlang_value,
         serialize, serialize_xlang,
     };
+    pub use crate::task_args::{TaskArg, TaskArgs};
     pub use crate::{register_member_function, rmpv};
     pub use rayrust_macros::{actor, remote};
 }

@@ -29,7 +29,7 @@ rayrust wraps the Ray C++ SDK (`libray_api.so`) via a C ABI layer, providing idi
 | `get_actor` (named actor, cross-namespace) / `cancel` / `kill_actor` | ✅ | ✅ |
 | XLANG header auto-detection (Ray 2.51.1+ compatible) | ✅ | ✅ |
 | `rmpv::Value` dynamic deserialization | ✅ | ✅ |
-| `put_xlang` (for pass-by-reference to Python) | ✅ | ✅ |
+| `put_xlang` (writes the xlang header into the stored data; Python still rejects it for lack of metadata, see #21) | ✅ | ✅ |
 | `ray_last_error()` (thread-local error messages) | ✅ | ✅ |
 
 ## Quick Start
@@ -89,7 +89,7 @@ async fn main() -> Result<(), RayError> {
     let ray = Ray::connect(&RayConfig::new("127.0.0.1:6379"))?;
 
     // Async get: one bounded Get runs on the tokio blocking pool, so no tokio thread is held
-    let r = add_remote(&ray, 1, 2);
+    let r = add_remote(&ray, 1, 2)?;
     let v: i32 = r.get_async().await?;
     println!("add(1, 2) = {}", v);
 
@@ -101,6 +101,20 @@ async fn main() -> Result<(), RayError> {
     Ok(())
 }
 ```
+
+### Passing an `ObjectRef` as an argument
+
+A reference can stand in for a value parameter: pass `ObjectRef<T>` (the handle moves into the call) or `&ObjectRef<T>` (the handle stays with you; one reference is cloned for the duration of the submission), and the driver does not have to `get` the value first. In cluster mode the core worker delivers the object's value to the worker; in local mode the C wrapper reads it before submission. The generated caller holds its own reference until the submission call returns, so dropping your handle before an async future is polled is safe.
+
+```rust
+let a = ray.put(&40i32)?;
+let sum: ObjectRef<i32> = add_remote(&ray, 2, &a)?;  // same as add_remote(&ray, 2, 40)
+let v: i32 = sum.get_async().await?;                 // 42
+```
+
+Every macro-generated caller returns `Result`, so argument serialization and submission errors both reach the caller instead of panicking. Actor methods take references the same way (`counter_increment(&ray, &handle, &a)`).
+
+Two limits come with this feature. A reference the driver put can only be handed to Rust tasks and actors: Python rejects an object without metadata, and the C++ SDK's `put` writes none. And a Rust task cannot hand back a usable reference: the id it returns carries no nested references, and the driver has no owner path for it, so reading that id gives `ObjectUnknownOwner` even while the object is alive. Both limits are documented on `rayrust::TaskArg`.
 
 ### Actors (`#[actor]` macro)
 
@@ -143,6 +157,7 @@ async fn main() -> Result<(), RayError> {
         handle.id(),
         "__rayrust_actor_factory_counter::increment",
         vec![arg],
+        vec![],
     ).await?.cast::<i64>();
     let v = r.get_async().await?; // 105
 
@@ -221,6 +236,7 @@ Rust application code
 rayrust (safe Rust API)
     Ray (RAII context: connect / drop)
     ObjectRef<T>, ActorHandle, ActorOptions, TaskOptions
+    TaskArg / TaskArgs (value or &ObjectRef<T> per argument)
     #[remote]/#[actor] macros → &Ray callers
     get_async (bounded `Get` on the tokio blocking pool), persistent tokio runtime
     |
@@ -304,7 +320,7 @@ let futs = (0..10).map(|i| add_remote_async(&ray, i, 1));
 
 ### Error Handling — `Result` everywhere, no hidden panics
 
-`put`, `kill_actor`, `get_actor` all return `Result`. Serialization errors in macro-generated callers use `.expect()` (documented), while submission errors propagate via `Result`. The C ABI's thread-local `last_error()` is checked after FFI calls and `clear_error()` is called before to prevent stale errors.
+`put`, `kill_actor`, `get_actor`, and every macro-generated caller return `Result`: argument serialization and task/actor submission errors both reach the caller instead of panicking. The C ABI's thread-local `last_error()` is checked after FFI calls and `clear_error()` is called before to prevent stale errors.
 
 ## Benchmark
 

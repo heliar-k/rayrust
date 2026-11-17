@@ -105,7 +105,9 @@ fn check_clone_without_t_clone() {
 /// 一次批量取应当比 500 个并发单引用快出一倍。
 async fn check_batch_vs_single(ray: &Ray) {
     println!("\n--- 1. 批量取 vs 逐个引用取（{} 个任务）---", BATCH_TASKS);
-    let refs: Vec<ObjectRef<i64>> = (0..BATCH_TASKS).map(|i| multiply_remote(ray, i as i64, 1)).collect();
+    let refs: Vec<ObjectRef<i64>> = (0..BATCH_TASKS)
+        .map(|i| multiply_remote(ray, i as i64, 1).expect("submit multiply"))
+        .collect();
     println!("  已提交 {} 个 multiply(i, 1) 任务", refs.len());
 
     let start = Instant::now();
@@ -254,7 +256,7 @@ async fn check_batch_timeout(ray: &Ray) {
 /// `wait_async` 必须按引用本身区分就绪与未就绪，而不是按顺序。
 async fn check_wait_async(ray: &Ray) {
     println!("\n--- 3. wait_async 处理混合批次 ---");
-    let done = multiply_remote(ray, 6, 7);
+    let done = multiply_remote(ray, 6, 7).expect("submit multiply(6, 7)");
     let done_value: i64 = done
         .get_timeout_async(Duration::from_secs(30))
         .await
@@ -316,7 +318,9 @@ async fn check_leak(ray: &Ray) {
         LEAK_ROUNDS, LEAK_BATCH
     );
     let good: ObjectRef<Vec<i64>> = ray.put(&vec![42i64]).expect("put the good element");
-    let bad: ObjectRef<Vec<i64>> = multiply_remote(ray, 21, 2).cast();
+    let bad: ObjectRef<Vec<i64>> = multiply_remote(ray, 21, 2)
+        .expect("submit multiply(21, 2)")
+        .cast();
     let mut refs: Vec<ObjectRef<Vec<i64>>> = (0..LEAK_BATCH).map(|_| good.clone()).collect();
     refs[1] = bad;
     println!("  第 1 个元素可解码，第 2 个元素是 i64 结果被 .cast() 成 Vec<i64>");

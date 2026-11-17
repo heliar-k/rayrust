@@ -49,7 +49,7 @@ fn main() {
     println!("✓ Functions registered");
 
     // Call add(1, 2)
-    let obj_ref = add_remote(&ray, 1, 2);
+    let obj_ref = add_remote(&ray, 1, 2).expect("submit add(1, 2)");
     println!("Task 'add(1, 2)' submitted → ObjectRef(id_len={})", obj_ref.id().len());
     match obj_ref.get() {
         Ok(val) => println!("Task result: {} ✓", val),
@@ -57,7 +57,7 @@ fn main() {
     }
 
     // Call greet("Ray")
-    let obj_ref2 = greet_remote(&ray, "Ray".to_string());
+    let obj_ref2 = greet_remote(&ray, "Ray".to_string()).expect("submit greet(\"Ray\")");
     println!("Task 'greet(\"Ray\")' submitted");
     match obj_ref2.get() {
         Ok(val) => println!("Greet result: {} ✓", val),

@@ -102,7 +102,11 @@ bool *ray_wait(const ray_bytes_t *ids, size_t count, int num_objects, int timeou
 /// `args` is an array of msgpack-serialized arguments.
 /// `is_ref` is an array of booleans (same length as args). If is_ref[i] is true,
 ///   args[i] is treated as a binary ObjectRef ID (pass by reference).
-///   Pass NULL to treat all args as values.
+///   Pass NULL to treat all args as values. Any other length is rejected by the
+///   Rust side; this function itself does not know arg_count's relation to it.
+///   An id passed here must be a reference the process holds and whose owner
+///   Ray knows: a 28-byte id of unknown origin makes `TransformArgs` call
+///   `GetOwnerAddressOrDie`, which terminates the process.
 /// Returns a ray_bytes_t containing the binary object ID of the result.
 /// On error, returns ray_bytes_t with data=NULL.
 ray_bytes_t ray_task_call(const char *func_name,
@@ -122,6 +126,11 @@ ray_bytes_t ray_task_call_with_resources(const char *func_name,
 /// `module_name` and `function_name` are null-terminated C strings.
 /// `args` are msgpack-serialized arguments (will be wrapped with xlang header).
 /// `is_ref[i] = true` means args[i] is an ObjectRef ID (pass by reference).
+///   Such an id must be a reference the calling process holds and whose owner
+///   Ray knows: a 28-byte id of unknown origin makes `TransformArgs` call
+///   `GetOwnerAddressOrDie`, which terminates the process. It must also come
+///   from a Python worker; objects put through this SDK carry no metadata and
+///   Python rejects them as an argument.
 ray_bytes_t ray_task_call_python(const char *module_name,
                                   const char *function_name,
                                   const ray_bytes_t *args,
@@ -143,6 +152,7 @@ ray_bytes_t ray_task_call_python(const char *module_name,
 ///     "bundle_index": 0                // bundle index within the placement group
 ///   }
 /// Pass NULL or empty string for no options (all defaults).
+/// Constructor arguments are always values: there is no `is_ref` here.
 ray_bytes_t ray_actor_create_with_options(const char *func_name,
                                             const ray_bytes_t *args,
                                             size_t arg_count,
@@ -158,15 +168,25 @@ ray_bytes_t ray_actor_create_python_with_options(const char *module_name,
 
 /// Call a method on an actor.
 /// `actor_id_data`/`actor_id_len` is the binary actor ID.
+/// `is_ref` is an array of booleans (same length as args). If is_ref[i] is true,
+///   args[i] is treated as a binary ObjectRef ID (pass by reference).
+///   Pass NULL to treat all args as values. Any other length is rejected by the
+///   Rust side. The same owner requirement as ray_task_call applies.
 /// Returns a ray_bytes_t containing the binary object ID of the result.
 ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
                             const char *func_name,
                             const ray_bytes_t *args,
-                            size_t arg_count);
+                            size_t arg_count,
+                            const bool *is_ref);
 
 /// Call a method on a Python actor.
 /// `method_name` is the Python method name (without `self`).
 /// `is_ref[i] = true` means args[i] is an ObjectRef ID (pass by reference).
+///   Such an id must be a reference the calling process holds and whose owner
+///   Ray knows: a 28-byte id of unknown origin makes `TransformArgs` call
+///   `GetOwnerAddressOrDie`, which terminates the process. It must also come
+///   from a Python worker; objects put through this SDK carry no metadata and
+///   Python rejects them as an argument.
 ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len,
                                     const char *method_name,
                                     const ray_bytes_t *args,

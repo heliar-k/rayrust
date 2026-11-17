@@ -11,6 +11,7 @@ use rayrust_sys::{self, build_args_array, to_cstring, CBytesGuard, ErrorKind, Ra
 use crate::error::RayError;
 use crate::object_ref::{check_epoch, ObjectRef};
 use crate::serialize::serialize;
+use crate::task_args::TaskArgs;
 
 /// Result of `wait()`: (ready, unready) object references.
 pub type WaitResult<T> = Result<(Vec<ObjectRef<T>>, Vec<ObjectRef<T>>), RayError>;
@@ -260,7 +261,12 @@ impl Ray {
         put(value)
     }
 
-    /// Put a value with XLANG header wrapping (for Python pass-by-reference).
+    /// Put a value with a 9-byte XLANG header in front of the data (the msgpack
+    /// layout Python uses). The object itself carries no metadata: Put through
+    /// the C++ SDK stores `nullptr` metadata, so a Python task or actor rejects
+    /// this object when it arrives as a reference argument
+    /// (`_private/serialization.py` 的 `_deserialize_object` 拒收无 metadata 的
+    /// 非空对象，见 #21)。
     pub fn put_xlang<T: serde::Serialize>(&self, value: &T) -> Result<ObjectRef<T>, RayError> {
         put_xlang(value)
     }
@@ -383,8 +389,13 @@ impl Ray {
     // ── Tasks ─────────────────────────────────────────────────
 
     /// Call a remote task by function name.
-    /// `is_ref[i] = true` means args[i] is an ObjectRef ID (pass by reference).
-    /// Pass `&TaskOptions::new()` for no resource requirements.
+    ///
+    /// `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID (pass by
+    /// reference). The id must be a reference this process holds and whose owner
+    /// Ray knows (a handle returned by `put` or by a task/actor call); a 28-byte
+    /// id of unknown origin makes Ray's `GetOwnerAddressOrDie` terminate the
+    /// process. Use [`TaskArg`](crate::TaskArg) with the macro-generated callers
+    /// to get that check for free. Pass `&TaskOptions::new()` for no resources.
     pub fn task_call(
         &self,
         func_name: &str,
@@ -408,6 +419,13 @@ impl Ray {
     /// again right before the call to C++, so a future polled after the last
     /// `Ray` handle was dropped fails with `RayError::Runtime`.
     /// Pass `&TaskOptions::new()` for no resource requirements.
+    ///
+    /// `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID (pass by
+    /// reference). Such an id must be a reference this process currently holds
+    /// and whose owner Ray knows (a handle returned by `put` or by a task/actor
+    /// call). A 28-byte id of unknown origin makes Ray's `TransformArgs` →
+    /// `GetOwnerAddressOrDie` terminate the driver process, and local mode waits
+    /// for it forever.
     pub fn task_call_async(
         &self,
         func_name: &str,
@@ -415,52 +433,34 @@ impl Ray {
         is_ref: Vec<bool>,
         opts: &TaskOptions,
     ) -> impl std::future::Future<Output = Result<ObjectRef<()>, RayError>> + Send + 'static {
-        let func_name = func_name.to_string();
-        let epoch = crate::object_ref::live_epoch();
-        let has_resources = opts.has_resources();
-        let resources_json = if has_resources {
-            Some(opts.resources_json())
-        } else {
-            None
-        };
-        async move {
-            if has_resources {
-                // For async + resources, we use spawn_blocking on the sync FFI path
-                // (the C ABI for resources is sync-only).
-                tokio::task::spawn_blocking(move || {
-                    check_epoch(epoch)?;
-                    let args_ref: Vec<&[u8]> = args.iter().map(|v| v.as_slice()).collect();
-                    let is_ref_ref: &[bool] = if is_ref.is_empty() { &[] } else { &is_ref };
-                    let func_c = to_cstring(&func_name);
-                    let args_arr = build_args_array(&args_ref);
-                    let is_ref_ptr = if is_ref_ref.is_empty() {
-                        std::ptr::null()
-                    } else {
-                        is_ref_ref.as_ptr()
-                    };
-                    let resources_json_c = to_cstring(&resources_json.unwrap_or_default());
-                    let bytes = unsafe {
-                        rayrust_sys::ray_task_call_with_resources(
-                            func_c.as_ptr(),
-                            args_arr.as_ptr(),
-                            args_arr.len(),
-                            is_ref_ptr,
-                            resources_json_c.as_ptr(),
-                        )
-                    };
-                    let guard = CBytesGuard::from(bytes)
-                        .ok_or_else(|| ffi_error_detail("ray_task_call_with_resources", &func_name))?;
-                    Ok(ObjectRef::from_call_id(guard.as_slice().to_vec()))
-                })
-                .await
-                .map_err(|e| RayError::Runtime(format!("task_call join error: {}", e)))?
-            } else {
-                task_call_inner_async(func_name, args, is_ref, epoch).await
-            }
-        }
+        submit_task_async(func_name, TaskArgs::from_raw(args, is_ref), opts)
+    }
+
+    /// [`Ray::task_call_async`]，参数由 [`TaskArgs`] 收好。
+    ///
+    /// 参数准备过程中的错误（值参数序列化失败、引用参数的 id 长度不对）在这里
+    /// 直接返回，任务不会被提交。宏生成的异步调用用它。
+    #[doc(hidden)]
+    pub fn task_call_async_with_args(
+        &self,
+        func_name: &str,
+        args: TaskArgs,
+        opts: &TaskOptions,
+    ) -> impl std::future::Future<Output = Result<ObjectRef<()>, RayError>> + Send + 'static {
+        submit_task_async(func_name, args, opts)
     }
 
     /// Call a Python remote function.
+    ///
+    /// `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID (pass by
+    /// reference). Two requirements apply to such an id:
+    /// - it must be a reference this process currently holds and whose owner Ray
+    ///   knows. A 28-byte id of unknown origin makes Ray's `TransformArgs` →
+    ///   `GetOwnerAddressOrDie` terminate the driver process, and local mode
+    ///   waits for it forever.
+    /// - it must come from a Python worker: objects put through the C++ SDK carry
+    ///   no metadata and Python rejects them when they arrive as an argument (see
+    ///   [`Ray::put_xlang`], #21).
     pub fn task_call_python(
         &self,
         module: &str,
@@ -498,13 +498,18 @@ impl Ray {
     }
 
     /// Call a method on an actor (sync).
+    ///
+    /// `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID (pass by
+    /// reference). The id must be a reference this process holds and whose owner
+    /// Ray knows; see [`Ray::task_call`].
     pub fn actor_call(
         &self,
         actor_id: &[u8],
         func_name: &str,
         args: &[&[u8]],
+        is_ref: &[bool],
     ) -> Result<ObjectRef<()>, RayError> {
-        actor_call_inner(actor_id, func_name, args)
+        actor_call_inner(actor_id, func_name, args, is_ref)
     }
 
     /// Asynchronously call a method on an actor.
@@ -515,19 +520,47 @@ impl Ray {
     /// when the future is created, and the blocking-pool closure checks it
     /// again right before the call to C++, so a future polled after the last
     /// `Ray` handle was dropped fails with `RayError::Runtime`.
+    ///
+    /// `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID (pass by
+    /// reference). Such an id must be a reference this process currently holds
+    /// and whose owner Ray knows (a handle returned by `put` or by a task/actor
+    /// call). A 28-byte id of unknown origin makes Ray's `TransformArgs` →
+    /// `GetOwnerAddressOrDie` terminate the driver process, and local mode waits
+    /// for it forever.
     pub fn actor_call_async(
         &self,
         actor_id: &[u8],
         func_name: &str,
         args: Vec<Vec<u8>>,
+        is_ref: Vec<bool>,
     ) -> impl std::future::Future<Output = Result<ObjectRef<()>, RayError>> + Send + 'static {
-        let actor_id = actor_id.to_vec();
-        let func_name = func_name.to_string();
-        let epoch = crate::object_ref::live_epoch();
-        async move { actor_call_inner_async(actor_id, func_name, args, epoch).await }
+        submit_actor_call_async(actor_id, func_name, TaskArgs::from_raw(args, is_ref))
+    }
+
+    /// [`Ray::actor_call_async`]，参数由 [`TaskArgs`] 收好。
+    ///
+    /// 参数准备过程中的错误在这里直接返回，方法不会被调用。宏生成的异步调用用它。
+    #[doc(hidden)]
+    pub fn actor_call_async_with_args(
+        &self,
+        actor_id: &[u8],
+        func_name: &str,
+        args: TaskArgs,
+    ) -> impl std::future::Future<Output = Result<ObjectRef<()>, RayError>> + Send + 'static {
+        submit_actor_call_async(actor_id, func_name, args)
     }
 
     /// Call a method on a Python actor.
+    ///
+    /// `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID (pass by
+    /// reference). Two requirements apply to such an id:
+    /// - it must be a reference this process currently holds and whose owner Ray
+    ///   knows. A 28-byte id of unknown origin makes Ray's `TransformArgs` →
+    ///   `GetOwnerAddressOrDie` terminate the driver process, and local mode
+    ///   waits for it forever.
+    /// - it must come from a Python worker: objects put through the C++ SDK carry
+    ///   no metadata and Python rejects them when they arrive as an argument (see
+    ///   [`Ray::put_xlang`], #21).
     pub fn actor_call_python(
         &self,
         actor_id: &[u8],
@@ -753,12 +786,11 @@ pub(crate) fn put<T: serde::Serialize>(value: &T) -> Result<ObjectRef<T>, RayErr
 
 /// Put a value into the object store with XLANG header wrapping.
 ///
-/// Use this when the data will be consumed by Python via pass-by-reference
-/// (task_call_python with is_ref=true). Python's xlang deserialization
-/// expects the 9-byte XLANG header before the msgpack payload.
-///
-/// The returned ObjectRef ID can be passed to `task_call_python` as a
-/// reference arg, avoiding re-serialization of large data per task call.
+/// 数据前带 9 字节 xlang 头，与 Python 的 msgpack 段格式一致。驱动 put 出来的
+/// 对象没有 metadata（`NativeObjectStore::PutRaw` 给 `CoreWorker::Put` 传
+/// `nullptr`），所以把它当引用参数交给 Python 任务/actor 时，Python 侧会因为
+/// 缺 metadata 拒收（`_private/serialization.py` 的 `_deserialize_object`）；
+/// 这是既有行为，见 #21。
 pub(crate) fn put_xlang<T: serde::Serialize>(value: &T) -> Result<ObjectRef<T>, RayError> {
     let data = crate::serialize::serialize_xlang(value)?;
     let id = put_raw(&data)?;
@@ -900,6 +932,78 @@ pub(crate) fn get_raw_timeout(id: &[u8], timeout_ms: i32) -> Result<Vec<u8>, Ray
 
 // ─── Task ─────────────────────────────────────────────────────
 
+/// `task_call_async` 与 `task_call_async_with_args` 的共同主体。
+///
+/// 代次在创建 future 时取，参数准备失败时在这里返回、不提交任务。保活集合被移进
+/// `spawn_blocking` 的闭包，活到 FFI 调用返回为止：future 在排队期间被丢弃时，
+/// 参数引用仍然键在闭包里。
+fn submit_task_async(
+    func_name: &str,
+    args: TaskArgs,
+    opts: &TaskOptions,
+) -> impl std::future::Future<Output = Result<ObjectRef<()>, RayError>> + Send + 'static {
+    let func_name = func_name.to_string();
+    let epoch = crate::object_ref::live_epoch();
+    let has_resources = opts.has_resources();
+    let resources_json = if has_resources {
+        Some(opts.resources_json())
+    } else {
+        None
+    };
+    async move {
+        let (args, is_ref, held) = args.into_parts()?;
+        if has_resources {
+            // For async + resources, we use spawn_blocking on the sync FFI path
+            // (the C ABI for resources is sync-only).
+            tokio::task::spawn_blocking(move || {
+                let _held = held;
+                check_epoch(epoch)?;
+                let args_ref: Vec<&[u8]> = args.iter().map(|v| v.as_slice()).collect();
+                let is_ref_ref: &[bool] = if is_ref.is_empty() { &[] } else { &is_ref };
+                let func_c = to_cstring(&func_name);
+                let args_arr = build_args_array(&args_ref);
+                let is_ref_ptr = if is_ref_ref.is_empty() {
+                    std::ptr::null()
+                } else {
+                    is_ref_ref.as_ptr()
+                };
+                let resources_json_c = to_cstring(&resources_json.unwrap_or_default());
+                let bytes = unsafe {
+                    rayrust_sys::ray_task_call_with_resources(
+                        func_c.as_ptr(),
+                        args_arr.as_ptr(),
+                        args_arr.len(),
+                        is_ref_ptr,
+                        resources_json_c.as_ptr(),
+                    )
+                };
+                let guard = CBytesGuard::from(bytes)
+                    .ok_or_else(|| ffi_error_detail("ray_task_call_with_resources", &func_name))?;
+                Ok(ObjectRef::from_call_id(guard.as_slice().to_vec()))
+            })
+            .await
+            .map_err(|e| RayError::Runtime(format!("task_call join error: {}", e)))?
+        } else {
+            task_call_inner_async(func_name, args, is_ref, held, epoch).await
+        }
+    }
+}
+
+/// `is_ref` 要么为空（所有参数都是值），要么与 `args` 一一对应。
+///
+/// 长度对不上时 C 侧会按 `arg_count` 越界读：读到的那一字节会让参数被静默地按错误
+/// 形状解释，或者让一个短 buffer 被当成对象 id 而终止进程。
+fn check_is_ref_len(args_len: usize, is_ref: &[bool]) -> Result<(), RayError> {
+    if is_ref.is_empty() || is_ref.len() == args_len {
+        return Ok(());
+    }
+    Err(RayError::Ffi(format!(
+        "is_ref has {} entries but there are {} arguments; pass an empty slice to treat every argument as a value",
+        is_ref.len(),
+        args_len
+    )))
+}
+
 /// Call a remote task by function name.
 /// `is_ref[i] = true` means args[i] is a binary ObjectRef ID (pass by reference).
 /// `is_ref` can be empty slice to treat all args as values.
@@ -908,6 +1012,7 @@ pub(crate) fn task_call_inner(
     args: &[&[u8]],
     is_ref: &[bool],
 ) -> Result<ObjectRef<()>, RayError> {
+    check_is_ref_len(args.len(), is_ref)?;
     let func_c = to_cstring(func_name);
     let args_arr = build_args_array(args);
     let is_ref_ptr = if is_ref.is_empty() {
@@ -937,6 +1042,7 @@ pub(crate) fn task_call_with_options_inner(
     is_ref: &[bool],
     opts: &TaskOptions,
 ) -> Result<ObjectRef<()>, RayError> {
+    check_is_ref_len(args.len(), is_ref)?;
     let func_c = to_cstring(func_name);
     let args_arr = build_args_array(args);
     let is_ref_ptr = if is_ref.is_empty() {
@@ -969,13 +1075,18 @@ pub(crate) fn task_call_with_options_inner(
 }
 
 /// Asynchronously call a remote task by function name.
+///
+/// `held` 是参数引用的保活集合：它被移进 `spawn_blocking` 的闭包，活到 FFI 调用
+/// 返回为止，所以提交期间对象不会被释放。
 pub(crate) async fn task_call_inner_async(
     func_name: String,
     args: Vec<Vec<u8>>,
     is_ref: Vec<bool>,
+    held: Vec<ObjectRef<()>>,
     epoch: u64,
 ) -> Result<ObjectRef<()>, RayError> {
     tokio::task::spawn_blocking(move || {
+        let _held = held;
         check_epoch(epoch)?;
         let args_ref: Vec<&[u8]> = args.iter().map(|v| v.as_slice()).collect();
         task_call_inner(&func_name, &args_ref, &is_ref)
@@ -994,6 +1105,7 @@ pub(crate) fn task_call_python_inner(
     args: &[&[u8]],
     is_ref: &[bool],
 ) -> Result<Vec<u8>, RayError> {
+    check_is_ref_len(args.len(), is_ref)?;
     let module_c = to_cstring(module);
     let func_c = to_cstring(function);
     let args_arr = build_args_array(args);
@@ -1329,13 +1441,21 @@ pub(crate) fn actor_create_python_with_options_inner(
 }
 
 /// Call a method on an actor by binary actor ID and function name.
+/// `is_ref[i] = true` means args[i] is a binary ObjectRef ID (pass by reference).
 pub(crate) fn actor_call_inner(
     actor_id: &[u8],
     func_name: &str,
     args: &[&[u8]],
+    is_ref: &[bool],
 ) -> Result<ObjectRef<()>, RayError> {
+    check_is_ref_len(args.len(), is_ref)?;
     let func_c = to_cstring(func_name);
     let args_arr = build_args_array(args);
+    let is_ref_ptr = if is_ref.is_empty() {
+        std::ptr::null()
+    } else {
+        is_ref.as_ptr()
+    };
 
     let bytes = unsafe {
         rayrust_sys::ray_actor_call(
@@ -1344,6 +1464,7 @@ pub(crate) fn actor_call_inner(
             func_c.as_ptr(),
             args_arr.as_ptr(),
             args_arr.len(),
+            is_ref_ptr,
         )
     };
 
@@ -1352,17 +1473,41 @@ pub(crate) fn actor_call_inner(
     Ok(ObjectRef::from_call_id(guard.as_slice().to_vec()))
 }
 
+/// `actor_call_async` 与 `actor_call_async_with_args` 的共同主体。
+///
+/// 代次在创建 future 时取，参数准备失败时在这里返回，方法不会被调用。保活集合被
+/// 移进 `spawn_blocking` 的闭包，活到 FFI 调用返回为止。
+fn submit_actor_call_async(
+    actor_id: &[u8],
+    func_name: &str,
+    args: TaskArgs,
+) -> impl std::future::Future<Output = Result<ObjectRef<()>, RayError>> + Send + 'static {
+    let actor_id = actor_id.to_vec();
+    let func_name = func_name.to_string();
+    let epoch = crate::object_ref::live_epoch();
+    async move {
+        let (args, is_ref, held) = args.into_parts()?;
+        actor_call_inner_async(actor_id, func_name, args, is_ref, held, epoch).await
+    }
+}
+
 /// Asynchronously call a method on an actor.
+///
+/// `held` 是参数引用的保活集合：它被移进 `spawn_blocking` 的闭包，活到 FFI 调用
+/// 返回为止。
 pub(crate) async fn actor_call_inner_async(
     actor_id: Vec<u8>,
     func_name: String,
     args: Vec<Vec<u8>>,
+    is_ref: Vec<bool>,
+    held: Vec<ObjectRef<()>>,
     epoch: u64,
 ) -> Result<ObjectRef<()>, RayError> {
     tokio::task::spawn_blocking(move || {
+        let _held = held;
         check_epoch(epoch)?;
         let args_ref: Vec<&[u8]> = args.iter().map(|v| v.as_slice()).collect();
-        actor_call_inner(&actor_id, &func_name, &args_ref)
+        actor_call_inner(&actor_id, &func_name, &args_ref, &is_ref)
     })
     .await
     .map_err(|e| RayError::Runtime(format!("actor_call join error: {}", e)))?
@@ -1376,6 +1521,7 @@ pub(crate) fn actor_call_python_inner(
     args: &[&[u8]],
     is_ref: &[bool],
 ) -> Result<Vec<u8>, RayError> {
+    check_is_ref_len(args.len(), is_ref)?;
     let method_c = to_cstring(method_name);
     let args_arr = build_args_array(args);
     let is_ref_ptr = if is_ref.is_empty() {
@@ -1589,4 +1735,49 @@ pub(crate) fn get_many_with_timeout<T: serde::de::DeserializeOwned>(
 /// Blocks until all objects are available.
 pub(crate) fn get_many<T: serde::de::DeserializeOwned>(refs: &[ObjectRef<T>]) -> Result<Vec<T>, RayError> {
     get_many_with_timeout(refs, -1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `is_ref` 长度与参数个数对不上时必须拒绝，不进入 FFI。
+    fn assert_len_rejected<T>(label: &str, result: Result<T, RayError>) {
+        match result {
+            Err(RayError::Ffi(msg)) => assert!(
+                msg.contains("is_ref has 1 entries but there are 2 arguments"),
+                "{} 的消息看不出长度对不上: {}",
+                label,
+                msg
+            ),
+            Err(other) => panic!("{} 返回了别的错误变体: {}", label, other),
+            Ok(_) => panic!("{}：长度对不上却提交了", label),
+        }
+    }
+
+    #[test]
+    fn every_entry_point_rejects_a_mismatched_is_ref() {
+        let arg = [0u8; 4];
+        let args: [&[u8]; 2] = [&arg, &arg];
+        let flags = [true];
+        let actor_id = [0u8; 16];
+
+        assert_len_rejected("task_call_inner", task_call_inner("add", &args, &flags));
+        assert_len_rejected(
+            "task_call_with_options_inner",
+            task_call_with_options_inner("add", &args, &flags, &TaskOptions::new()),
+        );
+        assert_len_rejected(
+            "actor_call_inner",
+            actor_call_inner(&actor_id, "counter::increment", &args, &flags),
+        );
+        assert_len_rejected(
+            "task_call_python_inner",
+            task_call_python_inner("m", "f", &args, &flags),
+        );
+        assert_len_rejected(
+            "actor_call_python_inner",
+            actor_call_python_inner(&actor_id, "increment", &args, &flags),
+        );
+    }
 }

@@ -27,7 +27,7 @@ Ray 的 Rust SDK —— 通过 FFI 封装 Ray C++ SDK，提供地道的 Rust API
 | `get_actor`（命名 actor，跨 namespace） / `cancel` / `kill_actor` | ✅ | ✅ |
 | XLANG header 自动检测（兼容 Ray 2.51.1+） | ✅ | ✅ |
 | `rmpv::Value` 动态反序列化 | ✅ | ✅ |
-| `put_xlang`（xlang 数据存入 object store） | ✅ | ✅ |
+| `put_xlang`（把 xlang 头写进存入的数据；Python 侧仍因缺 metadata 拒收，见 #21） | ✅ | ✅ |
 | `ray_last_error()`（线程局部错误消息） | ✅ | ✅ |
 
 ## 快速开始
@@ -87,7 +87,7 @@ async fn main() -> Result<(), RayError> {
     let ray = Ray::connect(&RayConfig::new("127.0.0.1:6379"))?;
 
     // 异步获取：一次带期限的 Get 跑在 tokio blocking pool 上，tokio 线程不被占用
-    let r = add_remote(&ray, 1, 2);
+    let r = add_remote(&ray, 1, 2)?;
     let v: i32 = r.get_async().await?;
     println!("add(1, 2) = {}", v);
 
@@ -99,6 +99,20 @@ async fn main() -> Result<(), RayError> {
     Ok(())
 }
 ```
+
+### 引用参数
+
+引用可以顶替一个值参数：传 `ObjectRef<T>`（句柄转移进调用）或 `&ObjectRef<T>`（调用方保留句柄，调用器克隆一份），驱动不必先 `get`。集群模式下 core worker 把对象的值投递给工人，本地模式下 C 包装层在提交前取成值。生成的调用器自己持有一份引用直到提交的 FFI 调用返回，所以异步 future 轮询之前 drop 掉自己的句柄是安全的。
+
+```rust
+let a = ray.put(&40i32)?;
+let sum: ObjectRef<i32> = add_remote(&ray, 2, &a)?;  // 等价于 add_remote(&ray, 2, 40)
+let v: i32 = sum.get_async().await?;                 // 42
+```
+
+宏生成的调用器都返回 `Result`：参数序列化错误与提交错误都回到调用方，不变成 panic。actor 方法的引用参数写法相同（`counter_increment(&ray, &handle, &a)`）。
+
+这条能力有两条限制。驱动自己 put 出来的引用只能交给 Rust 任务与 actor：Python 拒绝没有 metadata 的对象，而 C++ SDK 的 `put` 不写 metadata。Rust 任务也不能把可用的引用交回来：它交回的 id 不附带嵌套引用，驱动侧也没有这个 id 的 owner 路径，所以读这个 id 得到 `ObjectUnknownOwner`，对象活着也一样。两条限制都写在 `rayrust::TaskArg` 的文档里。
 
 ### Actor（`#[actor]` 宏）
 
@@ -141,6 +155,7 @@ async fn main() -> Result<(), RayError> {
         handle.id(),
         "__rayrust_actor_factory_counter::increment",
         vec![arg],
+        vec![],
     ).await?.cast::<i64>();
     let v = r.get_async().await?; // 105
 
@@ -217,6 +232,7 @@ Rust 应用代码
 rayrust（安全 Rust API）
     Ray (RAII context: connect / drop)
     ObjectRef<T>, ActorHandle, ActorOptions, TaskOptions
+    TaskArg / TaskArgs（每个参数是值或 &ObjectRef<T>）
     #[remote]/#[actor] 宏 → &Ray 调用器
     get_async (带期限的 `Get` 跑在 tokio blocking pool 上), 持久化 tokio runtime
     |
@@ -300,7 +316,7 @@ let futs = (0..10).map(|i| add_remote_async(&ray, i, 1));
 
 ### 错误处理 —— 全部 `Result`，无隐藏 panic
 
-`put`、`kill_actor`、`get_actor` 全部返回 `Result`。宏生成的调用器中序列化错误使用 `.expect()`（已文档化），提交错误通过 `Result` 传播。C ABI 的线程局部 `last_error()` 在 FFI 调用后检查，调用前 `clear_error()` 防止残留错误。
+`put`、`kill_actor`、`get_actor` 与全部宏生成的调用器都返回 `Result`：参数序列化错误与任务、actor 提交错误都回到调用方，不变成 panic。C ABI 的线程局部 `last_error()` 在 FFI 调用后检查，调用前 `clear_error()` 防止残留错误。
 
 Rust vs Python 在 Ray 集群上（500 个任务）：
 
