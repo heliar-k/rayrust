@@ -720,7 +720,7 @@ async fn handle_handoff_check(ray: &Ray) {
     }
 }
 
-/// 7. 本地模式：这四条查询/等待与两个 handle 接口都必须报错，进程存活。
+/// 7. 本地模式：这四条查询/等待、两个 handle 接口、kill_actor 与 cancel 都必须报错，进程存活。
 async fn local_mode_rejections(ray: &Ray) {
     println!("\n--- 7. 本地模式的拒绝 ---");
     let group_id = [0xa1u8; 18];
@@ -831,6 +831,28 @@ async fn local_mode_rejections(ray: &Ray) {
             handle.id().len()
         ),
     }
+    let put_ref = ray.put(&7i64).expect("本地 put");
+    match ray.cancel(put_ref.id(), false, false) {
+        Err(RayError::Ffi(message)) => {
+            assert!(
+                message.contains("local mode"),
+                "cancel 的错误没有说明本地模式: {}",
+                message
+            );
+            println!("  cancel → Ffi({})", message);
+        }
+        Err(other) => panic!("本地模式 cancel 返回了别的错误变体: {}", other),
+        Ok(()) => panic!("本地模式 cancel 返回了 Ok"),
+    }
+    let after_cancel = counter_increment_sync(ray, &handle, 2)
+        .expect("本地 cancel 被拒之后 increment")
+        .get_timeout(GET_TIMEOUT_MS)
+        .expect("本地 cancel 被拒之后读 increment");
+    assert_eq!(after_cancel, 4, "本地 cancel 被拒之后的计数不对");
+    println!(
+        "  cancel 被拒之后进程仍可用：increment(2) → {}",
+        after_cancel
+    );
     println!("  进程存活：以上被拒的调用都是提交侧的报错，没有 abort");
 }
 

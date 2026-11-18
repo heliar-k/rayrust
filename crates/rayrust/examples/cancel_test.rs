@@ -7,6 +7,9 @@
 //!   ray start --head --port=6399 --num-cpus=1 --include-dashboard=false
 //!
 //! Environment: RAY_ADDRESS, RAY_NODE_IP, RAY_WORKER_SO.
+//!
+//! Cluster only: local mode has no cancellation path, so every `cancel` there
+//! returns an error instead of withdrawing a task.
 
 use std::time::{Duration, Instant};
 

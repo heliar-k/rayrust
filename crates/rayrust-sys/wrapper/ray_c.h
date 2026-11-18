@@ -407,6 +407,13 @@ ray_bytes_t ray_get_actor(const char *name, const char *ray_namespace);
 /// other length is rejected without touching Ray.
 /// `force_kill` kills the worker if true. `recursive` cancels dependent tasks.
 /// Returns 0 on success, -1 on error.
+/// Local mode returns -1 without reaching the core worker: `CancelTask` exists
+/// only on the core worker, so the cluster path goes through
+/// `CoreWorkerProcess::GetCoreWorker()`, whose `EnsureInitialized` calls
+/// `QuickExit()` (`_Exit(1)`, `src/ray/util/process.cc:845-848`) because local
+/// mode never starts a core worker process. Local mode has no cancellation path
+/// either: `LocalModeTaskSubmitter` keeps no handle to withdraw a task once it
+/// is submitted.
 int ray_cancel(const char *id_data, size_t id_len, bool force_kill, bool recursive);
 
 /// Get multiple objects from the object store.

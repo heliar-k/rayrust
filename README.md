@@ -27,7 +27,7 @@ rayrust wraps the Ray C++ SDK (`libray_api.so`) via a C ABI layer, providing idi
 | `RayConfig.namespace` (job-level namespace) | ✅ | ✅ |
 | PlacementGroup | ✅ | ✅ |
 | `get_actor` (named actor, cross-namespace) | ✅ | ✅ |
-| `cancel` (task cancellation; local mode has no cancellation path, see #58) | ❌ | ✅ |
+| `cancel` (task cancellation; local mode has no cancellation path and returns an error, see #58) | ❌ | ✅ |
 | `kill_actor` (local mode returns an error and the actor ends with the process, see #53) | ❌ | ✅ |
 | XLANG header auto-detection (Ray 2.51.1+ compatible) | ✅ | ✅ |
 | `rmpv::Value` dynamic deserialization | ✅ | ✅ |
