@@ -407,6 +407,42 @@ static int check_placement_group_id(const char *group_id_data, size_t group_id_l
     return 0;
 }
 
+/// object id 的共同前置检查：非空且正好 28 字节。
+/// `ObjectID::FromBinary` 对非空且长度不符的输入 RAY_CHECK 终止进程，对空串返回
+/// nil（src/ray/common/id.h:430-440），长度必须先在这里拒掉：空串变成 nil 之后
+/// `get` 报 TimedOut、`wait` 把它当成永不就绪的对象。
+static int check_object_id(const char *id_data, size_t id_len) {
+    if (!id_data) {
+        set_last_error("object id is null");
+        return -1;
+    }
+    if (id_len != ray::ObjectID::kLength) {
+        std::string msg = "object id must be "
+            + std::to_string(ray::ObjectID::kLength) + " bytes, got "
+            + std::to_string(id_len) + " bytes";
+        set_last_error(msg.c_str());
+        return -1;
+    }
+    return 0;
+}
+
+/// actor id 的共同前置检查：非空且正好 16 字节。理由与 object id 相同：
+/// `ActorID::FromBinary` 对长度不符的输入 RAY_CHECK 终止进程
+/// （src/ray/common/id.h:430-441）。
+static int check_actor_id(const char *id_data, size_t id_len) {
+    if (!id_data) {
+        set_last_error("actor id is null");
+        return -1;
+    }
+    if (id_len != kActorIdLength) {
+        std::string msg = "actor id must be " + std::to_string(kActorIdLength) +
+                          " bytes, got " + std::to_string(id_len) + " bytes";
+        set_last_error(msg.c_str());
+        return -1;
+    }
+    return 0;
+}
+
 /// `bundle_index` 的 JSON 解码与范围检查：-1，或 0 .. INT_MAX。
 ///
 /// wheel 里的 nlohmann 是 3.9.1，`get<int>()` 走 `get_arithmetic_value`
@@ -840,6 +876,7 @@ ray_bytes_t ray_put(const char *data, size_t len) {
 ray_bytes_t ray_get(const char *id_data, size_t id_len, int timeout_ms) {
     ray_clear_error();
     try {
+        if (check_object_id(id_data, id_len) != 0) return ray_bytes_t{nullptr, 0};
         auto runtime = ray::internal::GetRayRuntime();
         if (!runtime) {
             set_last_error("Ray runtime is not initialized");
@@ -867,24 +904,6 @@ ray_bytes_t ray_get(const char *id_data, size_t id_len, int timeout_ms) {
 }
 
 // ─── Reference Counting ──────────────────────────────────────
-
-/// 引用计数入口的共同前置检查：id 非空且正好 28 字节。
-/// `ObjectID::FromBinary` 对非空且长度不符的输入 RAY_CHECK 终止进程，对空串返回
-/// nil（src/ray/common/id.h:430-440），长度必须先在这里拒掉。
-static int check_object_id(const char *id_data, size_t id_len) {
-    if (!id_data) {
-        set_last_error("object id is null");
-        return -1;
-    }
-    if (id_len != ray::ObjectID::kLength) {
-        std::string msg = "object id must be "
-            + std::to_string(ray::ObjectID::kLength) + " bytes, got "
-            + std::to_string(id_len) + " bytes";
-        set_last_error(msg.c_str());
-        return -1;
-    }
-    return 0;
-}
 
 int ray_add_local_reference(const char *id_data, size_t id_len) {
     ray_clear_error();
@@ -921,9 +940,20 @@ int ray_remove_local_reference(const char *id_data, size_t id_len) {
 }
 
 bool *ray_wait(const ray_bytes_t *ids, size_t count, int num_objects, int timeout_ms) {
+    ray_clear_error();
     try {
+        if (count > 0 && !ids) {
+            set_last_error("object id array is null");
+            return nullptr;
+        }
+        for (size_t i = 0; i < count; i++) {
+            if (check_object_id(ids[i].data, ids[i].len) != 0) return nullptr;
+        }
         auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) return nullptr;
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return nullptr;
+        }
 
         std::vector<std::string> id_vec;
         id_vec.reserve(count);
@@ -947,6 +977,34 @@ bool *ray_wait(const ray_bytes_t *ids, size_t count, int num_objects, int timeou
 
 // ─── Task ─────────────────────────────────────────────────────
 
+/// 引用参数的宽度检查：`is_ref[i]` 为真时 `args[i]` 必须是 28 字节的 ObjectID。
+/// 宽度不符的 id 交给 Ray 会在 `ObjectID::FromBinary` 的 RAY_CHECK 终止进程
+/// （src/ray/common/id.h:430-441）；本地模式更早一步用无期限的 `runtime->Get(id)`
+/// 读值，0 字节在那里永久等待。所以每个引用参数都要在构造 TaskArg 之前拒掉，
+/// 抛出的消息由入口的 RAY_CATCH 存进 ray_last_error()。
+static void check_reference_arg_ids(const ray_bytes_t *args, size_t arg_count,
+                                    const bool *is_ref) {
+    if (!is_ref) return;
+    if (arg_count > 0 && !args) {
+        throw std::invalid_argument("argument array is null");
+    }
+    for (size_t i = 0; i < arg_count; i++) {
+        if (!is_ref[i]) continue;
+        if (!args[i].data) {
+            throw std::invalid_argument(
+                "argument " + std::to_string(i) +
+                " is passed by reference, but its id is null");
+        }
+        if (args[i].len != ray::ObjectID::kLength) {
+            throw std::invalid_argument(
+                "argument " + std::to_string(i) +
+                " is passed by reference, so its id must be " +
+                std::to_string(ray::ObjectID::kLength) + " bytes, got " +
+                std::to_string(args[i].len) + " bytes");
+        }
+    }
+}
+
 /// Helper: build TaskArg vector for CPP tasks.
 /// `is_ref` array marks which args are ObjectRef references (pass by ID)
 /// vs value args (pass by serialized msgpack). It must be NULL or have one
@@ -965,6 +1023,7 @@ static std::vector<ray::internal::TaskArg>
 build_task_args_cpp(ray::internal::RayRuntime *runtime,
                     const ray_bytes_t *args, size_t arg_count,
                     const bool *is_ref = nullptr) {
+    check_reference_arg_ids(args, arg_count, is_ref);
     std::vector<ray::internal::TaskArg> task_args;
     task_args.reserve(arg_count);
     for (size_t i = 0; i < arg_count; i++) {
@@ -1004,6 +1063,7 @@ build_task_args_cpp(ray::internal::RayRuntime *runtime,
 static std::vector<ray::internal::TaskArg>
 build_task_args_python(const ray_bytes_t *args, size_t arg_count,
                        const bool *is_ref = nullptr) {
+    check_reference_arg_ids(args, arg_count, is_ref);
     std::vector<ray::internal::TaskArg> task_args;
     task_args.reserve(arg_count * 2);
     for (size_t i = 0; i < arg_count; i++) {
@@ -1193,6 +1253,8 @@ ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
                             const bool *is_ref = nullptr) {
     ray_clear_error();
     try {
+        if (check_actor_id(actor_id_data, actor_id_len) != 0)
+            return ray_bytes_t{nullptr, 0};
         auto runtime = ray::internal::GetRayRuntime();
         if (!runtime) {
             set_last_error("Ray runtime is not initialized");
@@ -1228,6 +1290,8 @@ ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len
                                     const bool *is_ref) {
     ray_clear_error();
     try {
+        if (check_actor_id(actor_id_data, actor_id_len) != 0)
+            return ray_bytes_t{nullptr, 0};
         auto runtime = ray::internal::GetRayRuntime();
         if (!runtime) {
             set_last_error("Ray runtime is not initialized");
@@ -1272,6 +1336,9 @@ ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len
 void ray_actor_kill(const char *actor_id_data, size_t actor_id_len, bool no_restart) {
     ray_clear_error();
     try {
+        // 宽度检查排在本地模式分支之前，与 ray_cancel 的次序一致：本地模式 + 3 字节
+        // actor id 报的是宽度错误。
+        if (check_actor_id(actor_id_data, actor_id_len) != 0) return;
         auto runtime = ray::internal::GetRayRuntime();
         if (runtime) {
             if (runtime->IsLocalMode()) {
@@ -1301,12 +1368,7 @@ void ray_actor_kill(const char *actor_id_data, size_t actor_id_len, bool no_rest
 
 ray_bytes_t ray_actor_handle_serialize(const char *actor_id_data, size_t actor_id_len) {
     ray_clear_error();
-    if (!actor_id_data || actor_id_len != kActorIdLength) {
-        std::string msg = "actor id must be " + std::to_string(kActorIdLength) +
-                          " bytes, got " + std::to_string(actor_id_len) + " bytes";
-        set_last_error(msg.c_str());
-        return ray_bytes_t{nullptr, 0};
-    }
+    if (check_actor_id(actor_id_data, actor_id_len) != 0) return ray_bytes_t{nullptr, 0};
     try {
         auto runtime = ray::internal::GetRayRuntime();
         if (!runtime) {
@@ -1688,7 +1750,15 @@ int ray_cancel(const char *id_data, size_t id_len, bool force_kill, bool recursi
 }
 
 ray_bytes_t *ray_get_many(const ray_bytes_t *ids, size_t count, int timeout_ms) {
+    ray_clear_error();
     try {
+        if (count > 0 && !ids) {
+            set_last_error("object id array is null");
+            return nullptr;
+        }
+        for (size_t i = 0; i < count; i++) {
+            if (check_object_id(ids[i].data, ids[i].len) != 0) return nullptr;
+        }
         auto runtime = ray::internal::GetRayRuntime();
         if (!runtime) {
             set_last_error("Ray runtime is not initialized");

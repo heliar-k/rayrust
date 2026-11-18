@@ -20,6 +20,11 @@
 //!    那一项也是 REMOVED。
 //! 3. 非法与未知（集群）：17 / 19 / 空字节 id → `Ffi` 错误，随后合法调用照常完成；
 //!    未知 18 字节 id → 错误且消息里带 id；未知名字 → 错误且消息里带名字。
+//!    另加一条 C ABI 直接调用：`rayrust::sys::ray_actor_kill` 传 3 字节 actor id →
+//!    `last_error()` 说明 16 字节，进程存活（`Ray::kill_actor` 只收 `&ActorHandle`，
+//!    id 恒为 16 字节，短 id 只能从 C ABI 传进来；这个集群里它在修复前会命中
+//!    `ActorID::FromBinary` 的 RAY_CHECK 终止进程）；随后第 4 项合法 actor 的
+//!    `kill_actor` 照旧工作。
 //! 4. `exit_actor`：`max_restarts=2` 的 actor，方法里调用 `exit_actor()`。
 //!    集群模式：`exit()` 的对象用 `get_timeout` 取（退出路径不写结果，无界 `get` 会永远等），
 //!    随后同一 handle 的普通方法必须失败；再用一个独立 actor 做正向对照——
@@ -434,6 +439,39 @@ fn placement_group_rejections(ray: &Ray) {
         Err(other) => panic!("未知名字返回了别的错误变体: {}", other),
         Ok(group) => panic!("未知名字成功返回了 {:?}", group),
     }
+}
+
+/// 3b. actor id 宽度：短 id 只能从 C ABI 传进 `ray_actor_kill`。
+///
+/// `Ray::kill_actor` 只收 `&ActorHandle`，而 `ActorHandle` 的 id 恒为 16 字节，所以
+/// 「16 字节以下」这个形状只能从 C ABI 传进来。集群模式下这条路径在修复前会命中
+/// `ActorID::FromBinary` 的 RAY_CHECK 终止进程
+/// （`cpp/src/ray/runtime/abstract_ray_runtime.cc:265-267`），RAY_CATCH 抓不到，
+/// 所以这条断言在集群里是承重的。合法的 `kill_actor` 由第 4 项的重启对照证实仍按
+/// 原样工作。
+fn actor_kill_id_width_c_abi() {
+    println!("\n--- 3b. actor id 宽度（C ABI 直接调用 ray_actor_kill）---");
+    rayrust::sys::clear_error();
+    let short_actor_id = [1u8, 2, 3];
+    // 指针与长度描述的是这个函数内的数组本身，数组在调用返回之前一直活着。
+    unsafe {
+        rayrust::sys::ray_actor_kill(short_actor_id.as_ptr() as *const _, 3, false);
+    }
+    match rayrust::sys::last_error() {
+        Some(message) => {
+            assert!(
+                message.contains("actor id must be 16 bytes"),
+                "ray_actor_kill 的错误里没有长度要求: {}",
+                message
+            );
+            println!(
+                "  ray_actor_kill(3 字节 actor id) → last_error({})",
+                message
+            );
+        }
+        None => panic!("ray_actor_kill 接受了 3 字节 actor id"),
+    }
+    println!("  进程存活：错误在进 Ray 之前返回");
 }
 
 /// 4. exit_actor：集群模式下 actor 自己结束且不被 max_restarts 重启；本地模式下这个调用
@@ -904,10 +942,13 @@ async fn main() {
     if cluster {
         placement_group_flow(&ray).await;
         placement_group_rejections(&ray);
+        actor_kill_id_width_c_abi();
     } else {
         println!("\n--- 2、3. placement group 流程与非法输入 ---");
         println!("  本地模式跳过：三个查询在本地模式没有 GCS accessor，C 侧直接报错；");
         println!("  第 7 项会实际跑这四条报错。");
+        println!("  第 3b 项（C ABI 传 3 字节 actor id）也跳过：它的承重性来自集群模式下");
+        println!("  修复前会终止进程；本地模式那条报错由第 7 项的 kill_actor 覆盖。");
     }
     exit_actor_check(&ray, cluster).await;
     exit_from_task_check(&ray, cluster).await;

@@ -26,6 +26,15 @@
 //! `get`/`get_async`/`wait`/批量取在进入 FFI 之前就返回 `RayError::Runtime`，
 //! 消息里带引用自己的代次与活着的运行时的代次。
 //!
+//! ## id 宽度
+//!
+//! 引用里存的就是 28 字节的 ObjectID。`ObjectRef::from`（走 `from_id`）接受任意长度
+//! 的字节，因为 `From` 不能失败；宽度在每个使用点检查：所有读取入口（`get`、
+//! `get_timeout`、`get_value*`、`get_raw_bytes`、`get_*_async`、`get_many*`、`wait`、
+//! `wait_async`）与作为引用参数提交时，不是 28 字节的 id 一律返回 `RayError::Ffi`，
+//! 进程不终止。上游的 `ObjectID::FromBinary` 对长度不符的输入直接 RAY_CHECK 终止进程
+//! （`src/ray/common/id.h:430-441`），0 字节则变成永不就绪的 nil id。
+//!
 //! ## 引用计数
 //!
 //! 调用结果（`put`、`put_xlang`、`put_async`、`task_call*`、`actor_call*`）持有
@@ -266,6 +275,10 @@ impl<T> ObjectRef<T> {
     /// `RayError::Ffi`；对可能已释放的对象用 `get_timeout`，没有期限的 `get` 只在
     /// 对象迟迟不就绪时不返回。
     ///
+    /// 任意长度的字节都接受（`From` 不能失败），宽度在使用时检查：所有读取入口与
+    /// 作为引用参数提交时，不是 28 字节的 id 返回 `RayError::Ffi`，进程不终止。
+    /// 见模块文档的「id 宽度」。
+    ///
     /// 打戳取当前活着的运行时的代次；没有活着的运行时就是 0，此后恒被拒。
     pub(crate) fn from_id(id: Vec<u8>) -> Self {
         ObjectRef {
@@ -324,7 +337,8 @@ impl<T> ObjectRef<T> {
     /// Retrieve the object value (blocks until ready).
     ///
     /// 没有期限：`get` 走 `get_raw`（`timeout = -1`），对象永远不会就绪时它不返回。
-    /// 需要期限用 `get_timeout` 或 `get_timeout_async`。
+    /// 需要期限用 `get_timeout` 或 `get_timeout_async`。id 不是 28 字节时返回
+    /// `RayError::Ffi`，见模块文档的「id 宽度」。
     pub fn get(&self) -> Result<T, RayError>
     where
         T: serde::de::DeserializeOwned,
@@ -358,7 +372,9 @@ impl<T> ObjectRef<T> {
 
     /// Retrieve the object value with a timeout (in milliseconds).
     ///
-    /// `-1` waits forever; other negative values return `RayError::Ffi`.
+    /// `-1` waits forever; other negative values return `RayError::Ffi`. An id
+    /// that is not 28 bytes returns `RayError::Ffi` too, before the id reaches
+    /// Ray.
     pub fn get_timeout(&self, timeout_ms: i32) -> Result<T, RayError>
     where
         T: serde::de::DeserializeOwned,
@@ -471,6 +487,8 @@ impl<T> ObjectRef<T> {
 
 impl<T> From<Vec<u8>> for ObjectRef<T> {
     /// 从 id 字节重建引用。不持有 Ray 的本地引用，见 `ObjectRef::from_id`。
+    /// 任意长度的字节都接受，宽度在用到时检查：所有读取入口与作为引用参数提交时，
+    /// 不是 28 字节的 id 返回 `RayError::Ffi`，进程不终止（模块文档的「id 宽度」）。
     fn from(id: Vec<u8>) -> Self {
         ObjectRef::from_id(id)
     }

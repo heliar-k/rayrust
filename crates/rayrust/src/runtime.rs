@@ -299,7 +299,9 @@ impl Ray {
     /// Wait for objects to be locally available.
     ///
     /// `timeout_ms` 是 `-1`（永久等待）或非负的毫秒数，其他值返回
-    /// `RayError::Ffi`。
+    /// `RayError::Ffi`。每个 id 必须正好 28 字节，其他长度（包括 0 字节）同样返回
+    /// `RayError::Ffi`，进程存活：这种 id 进入 `ObjectID::FromBinary` 会触发
+    /// RAY_CHECK 终止进程，而 0 字节会变成永不就绪的 nil id。
     pub fn wait<T>(
         &self,
         object_refs: &[ObjectRef<T>],
@@ -312,7 +314,8 @@ impl Ray {
     /// 异步等待一组引用在本地就绪。
     ///
     /// 一次 `ray_wait` 跑在 tokio blocking pool 上，等待的 tokio 工作线程不被占用。
-    /// `timeout` 限制整次等待。
+    /// `timeout` 限制整次等待。每个 id 必须正好 28 字节，其他长度（包括 0 字节）
+    /// 返回 `RayError::Ffi`。
     pub async fn wait_async<T>(
         &self,
         object_refs: &[ObjectRef<T>],
@@ -331,6 +334,9 @@ impl Ray {
 
     /// Get multiple objects from the object store (blocks until all ready).
     ///
+    /// 每个引用必须正好 28 字节，其他长度（包括 0 字节）返回 `RayError::Ffi`，
+    /// 进程存活。
+    ///
     /// If any element's cross-language payload carries a pickle5 section, the
     /// whole batch returns `RayError::Serialization`: the plain values already
     /// read from the same batch are dropped too, because
@@ -345,7 +351,8 @@ impl Ray {
     /// 批量取，超过 `timeout_ms` 毫秒就返回。
     ///
     /// `timeout_ms` 是 `-1`（永久等待）或非负的毫秒数，其他值返回
-    /// `RayError::Ffi`。批里任一元素的载荷带 pickle5 段时整批返回
+    /// `RayError::Ffi`。每个引用必须正好 28 字节，其他长度（包括 0 字节）同样返回
+    /// `RayError::Ffi`，进程存活。批里任一元素的载荷带 pickle5 段时整批返回
     /// `RayError::Serialization`，同一批里已经取到的普通值也拿不到
     /// （`get_many_with_timeout` 用 `?` 直接返回）。
     pub fn get_many_timeout<T: serde::de::DeserializeOwned>(
@@ -373,6 +380,7 @@ impl Ray {
     ///
     /// Ray 在一次 `Get` 内部限制整批的等待，期限覆盖每一个元素。与
     /// `get_timeout_async` 一样，期限从 blocking pool 的线程接到这次调用时开始计时。
+    /// 每个引用必须正好 28 字节，其他长度（包括 0 字节）返回 `RayError::Ffi`。
     /// 批里任一元素的载荷带 pickle5 段时整批返回 `RayError::Serialization`，
     /// 同一批里已经取到的普通值也拿不到。
     pub async fn get_many_timeout_async<T>(
@@ -398,8 +406,12 @@ impl Ray {
     /// reference). The id must be a reference this process holds and whose owner
     /// Ray knows (a handle returned by `put` or by a task/actor call); a 28-byte
     /// id of unknown origin makes Ray's `GetOwnerAddressOrDie` terminate the
-    /// process. Use [`TaskArg`](crate::TaskArg) with the macro-generated callers
-    /// to get that check for free. Pass `&TaskOptions::new()` for no options;
+    /// process, and local mode waits for it forever in `build_task_args_cpp`'s
+    /// undeadlined read. Use
+    /// [`TaskArg`](crate::TaskArg) with the macro-generated callers
+    /// to get that check for free. A reference argument's id must also be exactly
+    /// 28 bytes: any other length returns [`RayError::Ffi`] before submission,
+    /// with the process still alive. Pass `&TaskOptions::new()` for no options;
     /// [`TaskOptions`] carries the task name, resource requirements, placement
     /// group binding and runtime env. No options means one CPU, Ray's default
     /// for a task, so in cluster mode `--num-cpus` limits how many tasks run at
@@ -431,7 +443,8 @@ impl Ray {
     /// and whose owner Ray knows (a handle returned by `put` or by a task/actor
     /// call). A 28-byte id of unknown origin makes Ray's `TransformArgs` →
     /// `GetOwnerAddressOrDie` terminate the driver process, and local mode waits
-    /// for it forever.
+    /// for it forever. Its length must be exactly 28 bytes; any other length
+    /// returns [`RayError::Ffi`] before submission, with the process still alive.
     pub fn task_call_async(
         &self,
         func_name: &str,
@@ -465,7 +478,9 @@ impl Ray {
     /// is no way to opt out of it. Local mode drops the requirement.
     ///
     /// `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID (pass by
-    /// reference). Two requirements apply to such an id:
+    /// reference). Three requirements apply to such an id:
+    /// - it must be exactly 28 bytes; any other length returns [`RayError::Ffi`]
+    ///   before submission, with the process still alive.
     /// - it must be a reference this process currently holds and whose owner Ray
     ///   knows. In cluster mode a 28-byte id of unknown origin makes Ray's
     ///   `TransformArgs` → `GetOwnerAddressOrDie` terminate the driver process;
@@ -513,9 +528,12 @@ impl Ray {
 
     /// Call a method on an actor (sync).
     ///
-    /// `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID (pass by
-    /// reference). The id must be a reference this process holds and whose owner
-    /// Ray knows; see [`Ray::task_call`].
+    /// `actor_id` must be exactly 16 bytes (the Ray 2.51.1 ActorID length); any
+    /// other length returns [`RayError::Ffi`] before submission, with the process
+    /// still alive. `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID
+    /// (pass by reference); such an id must be exactly 28 bytes, and it must be a
+    /// reference this process holds and whose owner Ray knows; see
+    /// [`Ray::task_call`].
     pub fn actor_call(
         &self,
         actor_id: &[u8],
@@ -536,11 +554,14 @@ impl Ray {
     /// `Ray` handle was dropped fails with `RayError::Runtime`.
     ///
     /// `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID (pass by
-    /// reference). Such an id must be a reference this process currently holds
-    /// and whose owner Ray knows (a handle returned by `put` or by a task/actor
-    /// call). A 28-byte id of unknown origin makes Ray's `TransformArgs` →
-    /// `GetOwnerAddressOrDie` terminate the driver process, and local mode waits
-    /// for it forever.
+    /// reference). Such an id must be exactly 28 bytes, and it must be a
+    /// reference this process currently holds and whose owner Ray knows (a handle
+    /// returned by `put` or by a task/actor call). A 28-byte id of unknown origin
+    /// makes Ray's `TransformArgs` → `GetOwnerAddressOrDie` terminate the driver
+    /// process, and local mode waits for it forever.
+    ///
+    /// `actor_id` must be exactly 16 bytes; any other length returns
+    /// [`RayError::Ffi`] before submission, with the process still alive.
     pub fn actor_call_async(
         &self,
         actor_id: &[u8],
@@ -566,8 +587,15 @@ impl Ray {
 
     /// Call a method on a Python actor.
     ///
+    /// `actor_id` must be exactly 16 bytes; any other length returns
+    /// [`RayError::Ffi`] before the call reaches the SDK, with the process still
+    /// alive. That width check runs before the local mode rejection below, so
+    /// local mode with a short actor id reports the width error.
+    ///
     /// `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID (pass by
-    /// reference). Two requirements apply to such an id:
+    /// reference). Three requirements apply to such an id:
+    /// - it must be exactly 28 bytes; any other length returns [`RayError::Ffi`]
+    ///   before submission, with the process still alive.
     /// - it must be a reference this process currently holds and whose owner Ray
     ///   knows. A 28-byte id of unknown origin makes Ray's `TransformArgs` →
     ///   `GetOwnerAddressOrDie` terminate the driver process.
@@ -575,7 +603,8 @@ impl Ray {
     ///   no metadata and Python rejects them when they arrive as an argument (see
     ///   [`Ray::put_xlang`], #21).
     ///
-    /// Local mode returns [`RayError::Ffi`] before either requirement is looked at:
+    /// Local mode returns [`RayError::Ffi`] before any of the reference
+    /// requirements are looked at:
     /// the SDK reads the actor's module and class from the core worker's actor
     /// handle before it builds the call
     /// (`cpp/src/ray/runtime/abstract_ray_runtime.cc:202-211`), and local mode
@@ -595,6 +624,10 @@ impl Ray {
     /// Kill an actor by its handle.
     ///
     /// Returns `Ok(())` on success, `Err` if the C++ side reports an error.
+    ///
+    /// The actor id width needs no check here: `&ActorHandle` always carries a
+    /// 16-byte id. The width check sits at the C entry, which a C caller can reach
+    /// with a shorter id.
     ///
     /// Local mode returns [`RayError::Ffi`]: `AbstractRayRuntime::KillActor`
     /// starts with `CoreWorkerProcess::GetCoreWorker()`, whose
