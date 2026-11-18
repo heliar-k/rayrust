@@ -370,6 +370,14 @@ ray_bytes_t ray_placement_group_get_by_name(const char *name);
 // ─── Misc ─────────────────────────────────────────────────────
 
 /// Returns true if the current actor was restarted.
+///
+/// The return type has no error channel, so a failure reads as `false`; the
+/// reason is only visible to C callers through `ray_last_error()`. Failures are
+/// a missing runtime (`"Ray runtime is not initialized"`), an SDK exception
+/// (its `what()`), and a non-`std::exception` throw (`"unknown exception"`).
+/// In local mode this returns `false` without touching the core worker
+/// (`AbstractRayRuntime::WasCurrentActorRestarted` takes its SINGLE_PROCESS
+/// branch, `cpp/src/ray/runtime/abstract_ray_runtime.cc:288-291`).
 bool ray_was_current_actor_restarted(void);
 
 /// Returns true if this process is in local mode.
@@ -378,6 +386,15 @@ bool ray_is_local_mode(void);
 
 /// Get the namespace of this job.
 /// Returns a ray_bytes_t containing the namespace string.
+///
+/// Cluster mode asks the runtime, so the answer is the job config's namespace
+/// (Ray generates a random one when the job configured none). Local mode never
+/// starts a core worker and the runtime's `GetNamespace` calls
+/// `CoreWorkerProcess::GetCoreWorker()`, which ends the process there
+/// (`src/ray/core_worker/core_worker_process.cc:842-850`); local mode therefore
+/// returns the namespace passed to `ray_init`, which is the empty string when
+/// none was passed. An empty string comes back as a non-null buffer of length 0,
+/// not as an error.
 ray_bytes_t ray_get_namespace(void);
 
 /// Get a named actor by name.
