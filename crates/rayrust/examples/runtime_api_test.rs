@@ -33,8 +33,8 @@
 //!    调方法、断言数值。另加一条：畸形 handle 字节让 `from_serialized` 报错，而不是
 //!    交出一个永远不就绪的 nil handle。
 //! 7. 本地模式：第 2、3 项与第 6 项的集群部分跳过并打印原因；第 1 项、第 4、5、8 项的
-//!    本地模式断言、本地模式下 `wait_ready` 与三个查询的报错、两个 handle 接口的报错
-//!    实际跑。
+//!    本地模式断言、本地模式下 `wait_ready` 与三个查询的报错、`kill_actor` 的报错（之后
+//!    同一个 actor 仍然可用）、两个 handle 接口的报错实际跑。
 //! 8. 构造函数里调 `exit_actor()`：集群模式 `actor_create` 照常返回 handle、第一次调用
 //!    报 `RayError::Actor`；本地模式那个调用是空操作，actor 正常创建、方法拿到值 11。
 //!
@@ -762,6 +762,27 @@ async fn local_mode_rejections(ray: &Ray) {
         "  本地模式的 actor 本身可用：increment(0) → {}",
         incremented
     );
+    match ray.kill_actor(&handle, true) {
+        Err(RayError::Ffi(message)) => {
+            assert!(
+                message.contains("local mode"),
+                "kill_actor 的错误没有说明本地模式: {}",
+                message
+            );
+            println!("  kill_actor → Ffi({})", message);
+        }
+        Err(other) => panic!("本地模式 kill_actor 返回了别的错误变体: {}", other),
+        Ok(()) => panic!("本地模式 kill_actor 返回了 Ok"),
+    }
+    let after_kill = counter_increment_sync(ray, &handle, 1)
+        .expect("本地 kill 被拒之后 increment")
+        .get_timeout(GET_TIMEOUT_MS)
+        .expect("本地 kill 被拒之后读 increment");
+    assert_eq!(after_kill, 2, "本地 kill 被拒之后的计数不对");
+    println!(
+        "  kill 被拒之后 actor 仍可用：increment(1) → {}",
+        after_kill
+    );
     match handle.serialize() {
         Err(RayError::Ffi(message)) => {
             assert!(
@@ -789,7 +810,7 @@ async fn local_mode_rejections(ray: &Ray) {
             handle.id().len()
         ),
     }
-    println!("  进程存活：六个调用都是提交侧的错误，没有 abort");
+    println!("  进程存活：以上被拒的调用都是提交侧的报错，没有 abort");
 }
 
 #[tokio::main]

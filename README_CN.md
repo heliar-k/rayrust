@@ -24,7 +24,9 @@ Ray 的 Rust SDK —— 通过 FFI 封装 Ray C++ SDK，提供地道的 Rust API
 | `ActorLifetime::Detached`（detached actor） | ✅ | ✅ |
 | `RayConfig.namespace`（job 级命名空间） | ✅ | ✅ |
 | PlacementGroup | ✅ | ✅ |
-| `get_actor`（命名 actor，跨 namespace） / `cancel` / `kill_actor` | ✅ | ✅ |
+| `get_actor`（命名 actor，跨 namespace） | ✅ | ✅ |
+| `cancel`（任务取消；本地模式没有取消路径，见 #58） | ❌ | ✅ |
+| `kill_actor`（本地模式返回错误，actor 随进程结束，见 #53） | ❌ | ✅ |
 | XLANG header 自动检测（兼容 Ray 2.51.1+） | ✅ | ✅ |
 | `rmpv::Value` 动态反序列化 | ✅ | ✅ |
 | `put_xlang`（把 xlang 头写进存入的数据；Python 侧仍因缺 metadata 拒收，见 #21） | ✅ | ✅ |

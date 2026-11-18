@@ -185,7 +185,11 @@ async fn main() {
     let _ = ray.kill_actor(&handle, true);
     let _ = ray.kill_actor(&handle2, true);
     let _ = ray.kill_actor(&handle3, true);
-    println!("-- All actors killed --");
+    if ray.is_local_mode() {
+        println!("-- Local mode: kill requests are rejected, actors end with this process --");
+    } else {
+        println!("-- All actors killed --");
+    }
     println!("\n=== All Rust actor e2e tests passed ===");
     drop(ray);
 }
