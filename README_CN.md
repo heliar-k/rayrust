@@ -18,7 +18,7 @@ Ray 的 Rust SDK —— 通过 FFI 封装 Ray C++ SDK，提供地道的 Rust API
 | `actor_call_async`（非阻塞） | ✅ | ✅ |
 | `get_async`（带期限的 `Get` 跑在 tokio blocking pool 上） | ✅ | ✅ |
 | Python 任务（跨语言，复杂类型） | ✅ | ✅ |
-| Python Actor（跨语言） | ✅ | ✅ |
+| Python Actor（跨语言；本地模式返回错误，见 #59） | ❌ | ✅ |
 | 资源调度（`TaskOptions` / `ActorOptions` builder） | ✅ | ✅ |
 | `ActorOptions`：name、namespace、max_restarts、max_concurrency、runtime_env、placement_group | ✅ | ✅ |
 | `ActorLifetime::Detached`（detached actor） | ✅ | ✅ |

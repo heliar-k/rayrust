@@ -1233,6 +1233,25 @@ ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len
             set_last_error("Ray runtime is not initialized");
             return ray_bytes_t{nullptr, 0};
         }
+        if (runtime->IsLocalMode()) {
+            // AbstractRayRuntime::CallActor 的 PYTHON 分支在构造调用之前读取 actor handle
+            // 上的 PythonFunctionDescriptor，把其中记录的 module 与 class 写入
+            // ACTOR_TASK 的 RemoteFunctionHolder
+            // （cpp/src/ray/runtime/abstract_ray_runtime.cc:202-211）。这份登记表只存在
+            // 于 core worker 内，而读取它会调用 CoreWorkerProcess::GetCoreWorker()；本地模式
+            // 从不启动 core worker 进程，那里的 EnsureInitialized 会执行 QuickExit()，最终
+            // 调用 _Exit(1)（src/ray/core_worker/core_worker_process.cc:842-850、
+            // src/ray/util/process.cc:845-848），RAY_CATCH 无法捕获 _Exit。即便外部传入
+            // module 与 class 也走不通：LocalModeTaskSubmitter::Submit 固定用
+            // CppFunctionDescriptor 构造每个任务（local_mode_task_submitter.cc:39-55），
+            // 本地模式没有任何能执行 Python actor 方法的执行器，因此这个入口在本地模式
+            // 直接返回错误，不进入 CallActor。
+            set_last_error(
+                "Python actors cannot be called in local mode: the SDK reads the actor's "
+                "module and class from the core worker's actor handle, and local mode "
+                "never starts a core worker process");
+            return ray_bytes_t{nullptr, 0};
+        }
 
         ray::internal::RemoteFunctionHolder holder(
             "", std::string(method_name), "",

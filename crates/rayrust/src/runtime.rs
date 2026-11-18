@@ -467,9 +467,11 @@ impl Ray {
     /// `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID (pass by
     /// reference). Two requirements apply to such an id:
     /// - it must be a reference this process currently holds and whose owner Ray
-    ///   knows. A 28-byte id of unknown origin makes Ray's `TransformArgs` →
-    ///   `GetOwnerAddressOrDie` terminate the driver process, and local mode
-    ///   waits for it forever.
+    ///   knows. In cluster mode a 28-byte id of unknown origin makes Ray's
+    ///   `TransformArgs` → `GetOwnerAddressOrDie` terminate the driver process;
+    ///   local mode sends it without an owner lookup
+    ///   (`cpp/src/ray/runtime/abstract_ray_runtime.cc:152-155` only asks a core
+    ///   worker in cluster mode).
     /// - it must come from a Python worker: objects put through the C++ SDK carry
     ///   no metadata and Python rejects them when they arrive as an argument (see
     ///   [`Ray::put_xlang`], #21).
@@ -568,11 +570,17 @@ impl Ray {
     /// reference). Two requirements apply to such an id:
     /// - it must be a reference this process currently holds and whose owner Ray
     ///   knows. A 28-byte id of unknown origin makes Ray's `TransformArgs` →
-    ///   `GetOwnerAddressOrDie` terminate the driver process, and local mode
-    ///   waits for it forever.
+    ///   `GetOwnerAddressOrDie` terminate the driver process.
     /// - it must come from a Python worker: objects put through the C++ SDK carry
     ///   no metadata and Python rejects them when they arrive as an argument (see
     ///   [`Ray::put_xlang`], #21).
+    ///
+    /// Local mode returns [`RayError::Ffi`] before either requirement is looked at:
+    /// the SDK reads the actor's module and class from the core worker's actor
+    /// handle before it builds the call
+    /// (`cpp/src/ray/runtime/abstract_ray_runtime.cc:202-211`), and local mode
+    /// never starts a core worker process. This entry receives only the actor id
+    /// and the method name, so there is nothing to build that descriptor from.
     pub fn actor_call_python(
         &self,
         actor_id: &[u8],
