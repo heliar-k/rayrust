@@ -1614,6 +1614,7 @@ ray_bytes_t ray_get_actor(const char *name, const char *ray_namespace) {
 }
 
 int ray_cancel(const char *id_data, size_t id_len, bool force_kill, bool recursive) {
+    ray_clear_error();
     try {
         if (!id_data) {
             set_last_error("object id is null");
@@ -1624,6 +1625,29 @@ int ray_cancel(const char *id_data, size_t id_len, bool force_kill, bool recursi
                 + std::to_string(ray::ObjectID::kLength) + " bytes, got "
                 + std::to_string(id_len) + " bytes";
             set_last_error(msg.c_str());
+            return -1;
+        }
+
+        auto runtime = ray::internal::GetRayRuntime();
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return -1;
+        }
+        if (runtime->IsLocalMode()) {
+            // 这个入口不经过 task_submitter_：C++ SDK 没有 AbstractRayRuntime::CancelTask，
+            // CancelTask 只存在于 core worker 上，所以下面直接向 CoreWorkerProcess 要。本地模式
+            // 从不启动 core worker 进程，那里的 EnsureInitialized 走 QuickExit()，最终 _Exit(1)
+            // （src/ray/core_worker/core_worker_process.cc:842-850、
+            // src/ray/util/process.cc:845-848），RAY_CATCH 抓不到 _Exit。本地也没有取消路径：
+            // LocalModeTaskSubmitter 提交任务后不保留任何句柄：普通任务直接 post 给
+            // boost::asio::thread_pool，actor 创建与 actor 方法任务在调用线程里同步跑完
+            // （cpp/src/ray/runtime/task/local_mode_task_submitter.cc:115-135），
+            // LocalModeRayRuntime 也没有覆盖任何取消接口
+            // （cpp/src/ray/runtime/local_mode_ray_runtime.h:24-36）。
+            set_last_error(
+                "tasks cannot be cancelled in local mode: local mode never starts a core "
+                "worker process, and the local submitter keeps no handle to withdraw a "
+                "task once it is submitted");
             return -1;
         }
 

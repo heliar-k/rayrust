@@ -719,6 +719,10 @@ impl Ray {
 
     /// Cancel a remote task by object ID.
     /// `obj_id` must be exactly 28 bytes (the Ray 2.51.1 ObjectID length).
+    ///
+    /// Local mode returns [`RayError::Ffi`]: `CancelTask` exists only on the core
+    /// worker, which local mode never starts. Its submitter keeps no handle to
+    /// withdraw a task once it is submitted, so there is nothing to cancel.
     pub fn cancel(&self, obj_id: &[u8], force_kill: bool, recursive: bool) -> Result<(), RayError> {
         cancel(obj_id, force_kill, recursive)
     }
@@ -2184,6 +2188,8 @@ pub(crate) fn get_actor(name: &str, namespace: &str) -> Result<Option<ActorHandl
 /// `obj_id` must be exactly 28 bytes; the C side rejects any other length.
 /// `force_kill` kills the worker process if true.
 /// `recursive` cancels dependent tasks.
+/// Local mode rejects with [`RayError::Ffi`]: there is no core worker to take the
+/// `CancelTask` call, and no handle to withdraw a task once it is submitted.
 pub(crate) fn cancel(obj_id: &[u8], force_kill: bool, recursive: bool) -> Result<(), RayError> {
     let ret = unsafe {
         rayrust_sys::ray_cancel(
