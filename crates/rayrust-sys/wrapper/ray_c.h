@@ -245,6 +245,16 @@ ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
 ///   `GetOwnerAddressOrDie`, which terminates the process. It must also come
 ///   from a Python worker; objects put through this SDK carry no metadata and
 ///   Python rejects them as an argument.
+/// Local mode returns an error without reaching the core worker:
+/// `AbstractRayRuntime::CallActor` reads the actor's module and class from the
+/// core worker's actor handle (`cpp/src/ray/runtime/abstract_ray_runtime.cc:202-211`),
+/// and that lookup takes `CoreWorkerProcess::GetCoreWorker()`, whose
+/// `EnsureInitialized` calls `QuickExit()` (`_Exit(1)`,
+/// `src/ray/util/process.cc:845-848`) when no core worker exists
+/// (`src/ray/core_worker/core_worker_process.cc:842-850`). The C ABI receives only
+/// the actor id and the method name, and `LocalModeTaskSubmitter::Submit` builds
+/// every task as a C++ descriptor (`local_mode_task_submitter.cc:39-55`), so local
+/// mode has nothing to run a Python actor method with either.
 ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len,
                                     const char *method_name,
                                     const ray_bytes_t *args,
