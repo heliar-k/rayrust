@@ -23,6 +23,11 @@
 //! 9. 来路不明的 id 当引用参数：保存字节重建的、自己拼的 28 字节、27 字节都返回
 //!    `Err`，进程不崩也不阻塞；裸通道的 `is_ref` 长度对不上时拒绝
 //! 10. 异步入口的错误路径：27 字节 id 的 future 返回 `Err(RayError::Ffi)`
+//! 11. id 宽度：3 字节与 0 字节的 id 在进 Ray 之前被拒，进程不终止。单个读取、
+//!    `get_many_timeout`、`wait`、任务的引用参数（含 0 字节那个修复前永久挂起的
+//!    情形）、Python 任务的引用参数、`actor_call` 的短 actor id 各一条；本地模式
+//!    再加一条 `actor_call_python` 的短 id，断言报告的是宽度错误，顺序与 `cancel`
+//!    的守卫一致。最后 `put` + `get` 照常读到值，证明这一串拒绝没有打坏运行时。
 //!
 //! 本地模式补充说明（不是一项检查）：第 1、2 项在本地模式下由
 //! `build_task_args_cpp` 在提交前用 `Runtime()->Get(id)` 取成值。
@@ -538,6 +543,172 @@ async fn async_error_path(ray: &Ray) {
     }
 }
 
+/// 11. id 宽度：读侧与提交侧都在进 Ray 之前拒掉，进程不终止。
+///
+/// 3 字节与 27 字节的 id 进入 `BaseID<ObjectID>::FromBinary` 会命中
+/// `RAY_CHECK(binary.size() == T::Size())`（`src/ray/common/id.h:430-441`）终止进程；
+/// 0 字节的 id 变成 nil：`get` 报 TimedOut、`wait` 把它当成永不就绪的对象。
+/// 引用参数的 0 字节更糟：本地模式在 `build_task_args_cpp` 里用无期限的
+/// `runtime->Get(id)` 读值，永久等待。所以每条入口都在进 Ray 之前拒绝。
+async fn id_width_rejections(ray: &Ray, cluster: bool) {
+    println!("\n--- 11. id 宽度不对的 id 在进 Ray 之前被拒 ---");
+
+    // 11a. 单个读取：3 字节与 0 字节都报出实际长度。
+    let short: ObjectRef<i64> = ObjectRef::from(vec![1u8, 2, 3]);
+    match short.get_timeout(1000) {
+        Err(RayError::Ffi(msg)) => {
+            assert!(
+                msg.contains("28 bytes"),
+                "3 字节 id 的错误里没有长度要求: {}",
+                msg
+            );
+            assert!(
+                msg.contains("3 bytes"),
+                "3 字节 id 的错误里没有实际长度: {}",
+                msg
+            );
+            println!("  get_timeout(3 字节 id) → Ffi({})", msg);
+        }
+        Err(other) => panic!("3 字节 id 返回了别的错误变体: {}", other),
+        Ok(value) => panic!("3 字节 id 读到了 {}", value),
+    }
+    let empty: ObjectRef<i64> = ObjectRef::from(Vec::new());
+    match empty.get_timeout(1000) {
+        Err(RayError::Ffi(msg)) => {
+            assert!(
+                msg.contains("28 bytes"),
+                "0 字节 id 的错误里没有长度要求: {}",
+                msg
+            );
+            assert!(
+                msg.contains("0 bytes"),
+                "0 字节 id 的错误里没有实际长度: {}",
+                msg
+            );
+            println!("  get_timeout(0 字节 id) → Ffi({})", msg);
+        }
+        Err(other) => panic!("0 字节 id 返回了别的错误变体: {}", other),
+        Ok(value) => panic!("0 字节 id 读到了 {}", value),
+    }
+
+    // 11b. 批量读取：正常 id 与 3 字节 id 混在一批。
+    let good = ray.put(&11i64).expect("put(11)");
+    let short: ObjectRef<i64> = ObjectRef::from(vec![1u8, 2, 3]);
+    match ray.get_many_timeout(&[good.clone(), short], 1000) {
+        Err(RayError::Ffi(msg)) => {
+            println!("  get_many_timeout([好 id, 3 字节 id]) → Ffi({})", msg)
+        }
+        Err(other) => panic!("批量读取返回了别的错误变体: {}", other),
+        Ok(values) => panic!("批量读取读到了 {:?}", values),
+    }
+
+    // 11c. wait：3 字节 id。
+    let short: ObjectRef<i64> = ObjectRef::from(vec![1u8, 2, 3]);
+    match ray.wait(&[short], 1, 1000) {
+        Err(RayError::Ffi(msg)) => println!("  wait([3 字节 id], 1, 1000) → Ffi({})", msg),
+        Err(other) => panic!("wait 返回了别的错误变体: {}", other),
+        Ok((ready, unready)) => panic!(
+            "wait 接受了 3 字节 id: ready={} unready={}",
+            ready.len(),
+            unready.len()
+        ),
+    }
+
+    // 11d. 引用参数：3 字节与 0 字节。错误文本带参数下标。
+    let three = [1u8, 2, 3];
+    let args: [&[u8]; 1] = [&three];
+    match ray.task_call("add", &args, &[true], &TaskOptions::new()) {
+        Err(RayError::Ffi(msg)) => {
+            assert!(
+                msg.contains("argument 0"),
+                "引用参数的错误里没有参数下标: {}",
+                msg
+            );
+            assert!(
+                msg.contains("28 bytes"),
+                "引用参数的错误里没有长度要求: {}",
+                msg
+            );
+            println!("  task_call(引用参数 3 字节) → Ffi({})", msg);
+        }
+        Err(other) => panic!("3 字节引用参数返回了别的错误变体: {}", other),
+        Ok(_) => panic!("3 字节的引用参数被提交了"),
+    }
+    let empty: [u8; 0] = [];
+    let args: [&[u8]; 1] = [&empty];
+    match ray.task_call("add", &args, &[true], &TaskOptions::new()) {
+        Err(RayError::Ffi(msg)) => {
+            assert!(
+                msg.contains("0 bytes"),
+                "0 字节引用参数的错误里没有实际长度: {}",
+                msg
+            );
+            println!("  task_call(引用参数 0 字节) → Ffi({})", msg);
+        }
+        Err(other) => panic!("0 字节引用参数返回了别的错误变体: {}", other),
+        Ok(_) => panic!("0 字节的引用参数被提交了（修复前这里在本地模式永久挂起）"),
+    }
+
+    // 11e. Python 任务的引用参数：同一个宽度检查。
+    let three = [1u8, 2, 3];
+    let args: [&[u8]; 1] = [&three];
+    match ray.task_call_python(PYTHON_MODULE, "add", &args, &[true]) {
+        Err(RayError::Ffi(msg)) => println!("  task_call_python(引用参数 3 字节) → Ffi({})", msg),
+        Err(other) => panic!("Python 任务的 3 字节引用参数返回了别的错误变体: {}", other),
+        Ok(_) => panic!("Python 任务的 3 字节引用参数被提交了"),
+    }
+
+    // 11f. actor id 宽度：3 字节与 0 字节。
+    for (label, actor_id) in [("3 字节", vec![1u8, 2, 3]), ("0 字节", Vec::new())] {
+        match ray.actor_call(&actor_id, "Counter::increment", &[], &[]) {
+            Err(RayError::Ffi(msg)) => {
+                assert!(
+                    msg.contains("actor id must be 16 bytes"),
+                    "{} actor id 的错误里没有长度要求: {}",
+                    label,
+                    msg
+                );
+                println!("  actor_call({} actor id) → Ffi({})", label, msg);
+            }
+            Err(other) => panic!("{} actor id 返回了别的错误变体: {}", label, other),
+            Ok(_) => panic!("{}的 actor id 被接受了", label),
+        }
+    }
+
+    // 11g. 本地模式：`actor_call_python` 的宽度检查排在本地模式拒绝之前，与
+    // `ray_cancel` 的次序一致。集群模式没有这条本地模式分支，跳过。
+    if cluster {
+        println!("  actor_call_python 的守卫次序在集群模式没有本地模式分支可区分：跳过");
+    } else {
+        match ray.actor_call_python(&[1u8, 2, 3], "increment", &[], &[]) {
+            Err(RayError::Ffi(msg)) => {
+                assert!(
+                    msg.contains("actor id must be 16 bytes"),
+                    "本地模式 actor_call_python 的短 id 没有报宽度: {}",
+                    msg
+                );
+                assert!(
+                    !msg.contains("local mode"),
+                    "宽度检查排在了本地模式拒绝之后: {}",
+                    msg
+                );
+                println!("  actor_call_python(3 字节 actor id) → Ffi({})", msg);
+            }
+            Err(other) => panic!("本地模式 actor_call_python 返回了别的错误变体: {}", other),
+            Ok(_) => panic!("本地模式 actor_call_python 接受了 3 字节 actor id"),
+        }
+    }
+
+    // 11h. 以上拒绝之后运行时状态没有被打坏。
+    let value = ray
+        .put(&42i64)
+        .expect("拒绝之后 put")
+        .get_timeout(PROBE_TIMEOUT_MS)
+        .expect("拒绝之后 get");
+    assert_eq!(value, 42, "拒绝之后 put + get 读到 {}", value);
+    println!("  以上全部被拒之后 put + get 照常读到 {}", value);
+}
+
 #[tokio::main]
 async fn main() {
     let mode = std::env::args()
@@ -576,6 +747,7 @@ async fn main() {
 
     unknown_ids_are_rejected(&ray).await;
     async_error_path(&ray).await;
+    id_width_rejections(&ray, cluster).await;
 
     if !cluster {
         println!(

@@ -87,7 +87,12 @@ void ray_shutdown(void);
 ray_bytes_t ray_put(const char *data, size_t len);
 
 /// Get a single object from the object store.
-/// `id_data`/`id_len` is the binary object ID.
+/// `id_data`/`id_len` is the binary object ID and must be exactly 28 bytes (the
+/// Ray 2.51.1 ObjectID length). Any other length, including 0, is rejected
+/// without touching Ray: `ObjectID::FromBinary` RAY_CHECKs a non-empty length
+/// mismatch and terminates the process (`src/ray/common/id.h:430-441`), while an
+/// empty id becomes the nil id, which is never ready (`get` then reports
+/// TimedOut).
 /// `timeout_ms` is -1 for infinite wait.
 /// Returns a ray_bytes_t containing the serialized object data.
 /// On error, returns ray_bytes_t with data=NULL.
@@ -110,7 +115,10 @@ int ray_add_local_reference(const char *id_data, size_t id_len);
 int ray_remove_local_reference(const char *id_data, size_t id_len);
 
 /// Wait for objects to be locally available.
-/// `ids` is an array of ray_bytes_t (binary object IDs).
+/// `ids` is an array of ray_bytes_t (binary object IDs), each exactly 28 bytes
+/// (the Ray 2.51.1 ObjectID length). Any other length, including 0, is rejected
+/// without touching Ray for the same reasons as ray_get; an empty id would
+/// become the nil id and wait as an object that never becomes ready.
 /// `count` is the number of IDs.
 /// `num_objects` is the minimum number to wait for.
 /// `timeout_ms` is -1 for infinite wait.
@@ -127,6 +135,12 @@ bool *ray_wait(const ray_bytes_t *ids, size_t count, int num_objects, int timeou
 ///   args[i] is treated as a binary ObjectRef ID (pass by reference).
 ///   Pass NULL to treat all args as values. Any other length is rejected by the
 ///   Rust side; this function itself does not know arg_count's relation to it.
+///   A reference argument must be exactly 28 bytes (the Ray 2.51.1 ObjectID
+///   length); any other length is rejected before the TaskArg is built, with the
+///   argument index in ray_last_error(). A length mismatch would hit a RAY_CHECK
+///   in `ObjectID::FromBinary` (`src/ray/common/id.h:430-441`), and in local mode
+///   an empty id waits forever in the undeadlined `runtime->Get(id)` that
+///   `build_task_args_cpp` performs.
 ///   An id passed here must be a reference the process holds and whose owner
 ///   Ray knows: a 28-byte id of unknown origin makes `TransformArgs` call
 ///   `GetOwnerAddressOrDie`, which terminates the process.
@@ -176,6 +190,8 @@ ray_bytes_t ray_task_call_with_options(const char *func_name,
 /// `module_name` and `function_name` are null-terminated C strings.
 /// `args` are msgpack-serialized arguments (will be wrapped with xlang header).
 /// `is_ref[i] = true` means args[i] is an ObjectRef ID (pass by reference).
+///   Such an id must be exactly 28 bytes, the same requirement and the same
+///   rejection as ray_task_call_with_options.
 ///   Such an id must be a reference the calling process holds and whose owner
 ///   Ray knows: a 28-byte id of unknown origin makes `TransformArgs` call
 ///   `GetOwnerAddressOrDie`, which terminates the process. It must also come
@@ -225,11 +241,16 @@ ray_bytes_t ray_actor_create_python_with_options(const char *module_name,
                                                    const char *options_json);
 
 /// Call a method on an actor.
-/// `actor_id_data`/`actor_id_len` is the binary actor ID.
+/// `actor_id_data`/`actor_id_len` is the binary actor ID and must be exactly 16
+/// bytes (the Ray 2.51.1 ActorID length, `src/ray/common/id.h:124-142`); any
+/// other length is rejected without touching Ray, because `ActorID::FromBinary`
+/// RAY_CHECKs the length (`src/ray/common/id.h:430-441`).
 /// `is_ref` is an array of booleans (same length as args). If is_ref[i] is true,
 ///   args[i] is treated as a binary ObjectRef ID (pass by reference).
 ///   Pass NULL to treat all args as values. Any other length is rejected by the
-///   Rust side. The same owner requirement as ray_task_call_with_options applies.
+///   Rust side. A reference argument must be exactly 28 bytes, the same
+///   requirement and the same rejection as ray_task_call_with_options. The same
+///   owner requirement applies as well.
 /// Returns a ray_bytes_t containing the binary object ID of the result.
 ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
                             const char *func_name,
@@ -238,9 +259,15 @@ ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
                             const bool *is_ref);
 
 /// Call a method on a Python actor.
+/// `actor_id_data`/`actor_id_len` must be exactly 16 bytes, the same requirement
+/// and the same rejection as ray_actor_call. The width check runs before the
+/// local mode rejection below, so local mode with a short actor id reports the
+/// width error, in the same order as ray_cancel.
 /// `method_name` is the Python method name (without `self`).
 /// `is_ref[i] = true` means args[i] is an ObjectRef ID (pass by reference).
-///   Such an id must be a reference the calling process holds and whose owner
+///   Such an id must be exactly 28 bytes, the same requirement and the same
+///   rejection as ray_task_call_with_options.
+///   It must also be a reference the calling process holds and whose owner
 ///   Ray knows: a 28-byte id of unknown origin makes `TransformArgs` call
 ///   `GetOwnerAddressOrDie`, which terminates the process. It must also come
 ///   from a Python worker; objects put through this SDK carry no metadata and
@@ -262,7 +289,10 @@ ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len
                                     const bool *is_ref);
 
 /// Kill an actor.
-/// `actor_id_data`/`actor_id_len` is the binary actor ID.
+/// `actor_id_data`/`actor_id_len` is the binary actor ID and must be exactly 16
+/// bytes, the same requirement and the same rejection as ray_actor_call. The
+/// width check runs before the local mode rejection below, so local mode with a
+/// short actor id reports the width error, in the same order as ray_cancel.
 /// Returns nothing: an error is reported through ray_last_error().
 /// Local mode returns an error: `AbstractRayRuntime::KillActor` starts with
 /// `CoreWorkerProcess::GetCoreWorker()`, whose `EnsureInitialized` calls
@@ -427,7 +457,9 @@ ray_bytes_t ray_get_actor(const char *name, const char *ray_namespace);
 int ray_cancel(const char *id_data, size_t id_len, bool force_kill, bool recursive);
 
 /// Get multiple objects from the object store.
-/// `ids` is an array of ray_bytes_t. `count` is the number of IDs.
+/// `ids` is an array of ray_bytes_t, each exactly 28 bytes (the Ray 2.51.1
+/// ObjectID length). Any other length, including 0, is rejected without touching
+/// Ray for the same reasons as ray_get. `count` is the number of IDs.
 /// `timeout_ms` is -1 for infinite wait.
 /// Returns a heap-allocated array of ray_bytes_t (one per input ID).
 /// On error for a specific ID, that element will have data=NULL.
