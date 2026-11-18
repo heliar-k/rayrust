@@ -1,7 +1,9 @@
 //! Example: cancel tasks by object id.
 //!
-//! The long task is a Python `time.sleep` call that holds no CPU but never
-//! finishes by itself; the task queued behind it waits on its result.
+//! The long task is a Python `time.sleep` call that never finishes by itself and
+//! now requests the default one CPU, so on a `--num-cpus=1` node it holds the only
+//! CPU while it runs; the task queued behind it waits for the CPU and for its
+//! result.
 //!   ray start --head --port=6399 --num-cpus=1 --include-dashboard=false
 //!
 //! Environment: RAY_ADDRESS, RAY_NODE_IP, RAY_WORKER_SO.

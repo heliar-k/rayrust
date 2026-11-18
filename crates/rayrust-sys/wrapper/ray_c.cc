@@ -584,6 +584,20 @@ static void parse_call_options(const char *options_json,
     }
 }
 
+/// 补上任务的默认 CPU：Python 的 `@ray.remote` 给每个任务要 1 个 CPU
+/// （`ray/_common/ray_option_utils.py:179` 的 `num_cpus` 默认 1，由
+/// `ray/remote_function.py:125-126` 填进 `_num_cpus`），调用方写了别的资源而没写
+/// CPU 时也照样合并 1.0（`ray/_common/utils.py:130,147-154` 先复制 `resources` 再按
+/// `num_cpus` 写 `CPU`）。C++ SDK 的 `CallOptions` 没有这个默认
+/// （`include/ray/api/task_options.h:96-102`），少了这一步任务不占 CPU，
+/// `--num-cpus` 限不住并发。
+///
+/// `emplace` 不覆盖已有的键：显式写 `"CPU":0` 的调用方保留 0。本地模式的
+/// `LocalModeTaskSubmitter` 丢弃整个 options，这一步在本地模式没有效果。
+static void apply_default_task_cpu(ray::internal::CallOptions &options) {
+    options.resources.emplace("CPU", 1.0);
+}
+
 // ─── Lifecycle ────────────────────────────────────────────────
 
 static void reopen_ref_count_gate(void);
@@ -1025,6 +1039,7 @@ ray_bytes_t ray_task_call_with_options(const char *func_name,
         ray::internal::CallOptions options;
         options.bundle_index = -1;
         parse_call_options(options_json, options);
+        apply_default_task_cpu(options);
         std::string id = runtime->Call(holder, task_args, options);
         return dup_bytes(id);
     } RAY_CATCH
@@ -1054,6 +1069,7 @@ ray_bytes_t ray_task_call_python(const char *module_name,
         auto task_args = build_task_args_python(args, arg_count, is_ref);
 
         ray::internal::CallOptions options;
+        apply_default_task_cpu(options);
         std::string id = runtime->Call(holder, task_args, options);
         return dup_bytes(id);
     } catch (const std::exception &e) {

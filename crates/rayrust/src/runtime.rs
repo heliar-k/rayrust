@@ -397,7 +397,9 @@ impl Ray {
     /// process. Use [`TaskArg`](crate::TaskArg) with the macro-generated callers
     /// to get that check for free. Pass `&TaskOptions::new()` for no options;
     /// [`TaskOptions`] carries the task name, resource requirements, placement
-    /// group binding and runtime env.
+    /// group binding and runtime env. No options means one CPU, Ray's default
+    /// for a task, so in cluster mode `--num-cpus` limits how many tasks run at
+    /// once (local mode drops resource requirements).
     pub fn task_call(
         &self,
         func_name: &str,
@@ -416,7 +418,9 @@ impl Ray {
     /// when the future is created, and the blocking-pool closure checks it
     /// again right before the call to C++, so a future polled after the last
     /// `Ray` handle was dropped fails with `RayError::Runtime`.
-    /// Pass `&TaskOptions::new()` for no options (see [`TaskOptions`]).
+    /// Pass `&TaskOptions::new()` for no options (see [`TaskOptions`]). No
+    /// options means one CPU, Ray's default for a task (cluster mode; local mode
+    /// drops resource requirements).
     ///
     /// `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID (pass by
     /// reference). Such an id must be a reference this process currently holds
@@ -453,6 +457,8 @@ impl Ray {
     /// This entry point takes no [`TaskOptions`]: a Python task submitted here
     /// cannot be named, cannot request resources, cannot be bound to a placement
     /// group bundle and cannot be given a runtime env.
+    /// The task requests one CPU, Ray's default for a task; with no options there
+    /// is no way to opt out of it. Local mode drops the requirement.
     ///
     /// `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID (pass by
     /// reference). Two requirements apply to such an id:
@@ -1255,8 +1261,10 @@ fn resources_to_json(resources: &[(String, f64)]) -> String {
 /// - `name` — 任务名，空字符串表示不设，默认由函数名生成。名字进入任务规格；
 ///   任务失败或被取消时，驱动进程的 core worker 日志里会以 `task_name=<名字>`
 ///   打出这一行（`task_manager.cc`）。
-/// - `resources` — 资源需求，例如 `[("CPU", 2.0), ("GPU", 0.5)]`，空表示不
-///   申请额外资源。
+/// - `resources` — 资源需求，例如 `[("CPU", 2.0), ("GPU", 0.5)]`。空表表示用
+///   Ray 的默认值：任务要 1 个 CPU（与 Python `@ray.remote` 一致），所以
+///   `--num-cpus` 限制同时运行的任务数。零需求必须显式写 `("CPU", 0.0)`；给了
+///   别的资源而没给 `CPU` 时 1.0 会合并进资源表。
 /// - `placement_group_id` — 绑定到 placement group 的二进制 id
 ///   （[`Ray::placement_group_create`] 返回的字节），空表示不绑。非空时必须
 ///   正好 18 字节（`PlacementGroupID` 的长度）；查不到的 group 报
@@ -1293,6 +1301,9 @@ pub struct TaskOptions {
     /// Task name. Empty = the default name derived from the function name.
     pub name: String,
     /// Resource requirements, e.g. `[("CPU", 2.0), ("GPU", 0.5)]`.
+    /// Empty = Ray's default for a task, one CPU. A zero-CPU task must give
+    /// `("CPU", 0.0)` explicitly; a list with other resources and no `CPU` gets
+    /// CPU 1.0 merged in.
     pub resources: Vec<(String, f64)>,
     /// Binary placement group ID, exactly 18 bytes when non-empty.
     /// Empty = do not bind to a placement group.
@@ -1322,6 +1333,9 @@ impl Default for TaskOptions {
 
 impl TaskOptions {
     /// Create a new builder with no options (all defaults).
+    ///
+    /// The empty resource list means one CPU, the default Python's
+    /// `@ray.remote` applies to every task.
     pub fn new() -> Self {
         Self::default()
     }
@@ -1333,12 +1347,17 @@ impl TaskOptions {
     }
 
     /// Add a resource requirement, e.g. `("CPU", 2.0)`.
+    ///
+    /// Adding another resource leaves the task at one CPU: the default is merged
+    /// in at submission, so zero CPU needs an explicit `("CPU", 0.0)`.
     pub fn resource(mut self, name: impl Into<String>, value: f64) -> Self {
         self.resources.push((name.into(), value));
         self
     }
 
     /// Set resource requirements as a slice of `(name, value)` pairs.
+    ///
+    /// The same default as [`TaskOptions::resource`]: no `CPU` key means one CPU.
     pub fn resources(mut self, resources: Vec<(String, f64)>) -> Self {
         self.resources = resources;
         self
@@ -1365,6 +1384,10 @@ impl TaskOptions {
     }
 
     /// Whether any resources are set.
+    ///
+    /// This reports the list that was written. The requirement that reaches the
+    /// scheduler can differ: an empty list still means one CPU, and a list without
+    /// `CPU` gets 1.0 merged in.
     pub fn has_resources(&self) -> bool {
         !self.resources.is_empty()
     }
@@ -1433,6 +1456,23 @@ fn check_task_options(opts: &TaskOptions) -> Result<(), RayError> {
 /// - `max_concurrency` — max concurrent method calls (default 1)
 /// - `serialized_runtime_env_info` — runtime environment info string
 /// - `placement_group` — bind actor to a placement group bundle
+///
+/// `resources` carries no task-like default here: an actor reserves exactly what
+/// this list names, so an actor without resources reserves no CPU.
+///
+/// Ray's Python driver chooses between two actor presets (`ray/actor.py:1660-1674`,
+/// `ray/_private/ray_constants.py:174-179`): with no resource options the actor
+/// reserves 0 CPU for its lifetime and its method requirement is set to 1 CPU
+/// (`DEFAULT_ACTOR_METHOD_CPU_SIMPLE`) instead of reserving anything; with any
+/// other resource named, the actor reserves its resources plus 1 CPU for its
+/// lifetime (`DEFAULT_ACTOR_CREATION_CPU_SPECIFIED`). Measured in 2.51.1, a
+/// default Python actor's method still ran in 0.01 s while a task held the only
+/// CPU for 20 s, so the per-method figure does not make methods wait. The C++
+/// SDK's `ActorCreationOptions` has no method-CPU field
+/// (`include/ray/api/task_options.h:104-112`), so the first preset can only be
+/// approximated by reserving nothing; the second is expressible here but is not
+/// applied, which means an actor that names e.g. a GPU reserves no CPU where
+/// Python reserves one (#55).
 ///
 /// # Example
 /// ```no_run

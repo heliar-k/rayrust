@@ -201,6 +201,20 @@ let handle = ray.actor_create(
 )?;
 ```
 
+In cluster mode every task requests one CPU by default, the same default
+Python's `@ray.remote` applies, so `--num-cpus` limits how many tasks run at
+once. To ask for zero CPU (a task that only waits or only does I/O and should not
+hold a CPU slot), say `.resource("CPU", 0.0)` explicitly. Giving another
+resource without a `CPU` key still leaves the task at one CPU: the default 1.0 is
+merged in. This covers both `Ray::task_call` and `Ray::task_call_python`; the
+latter takes no options and so always requests one CPU. Local mode drops
+resource requirements entirely, so none of this applies there.
+
+An actor is different: `ActorOptions` has no default, so an actor without
+`resources` reserves no CPU for its lifetime. That matches Python's no-options
+actor; an actor that names some other resource reserves no CPU here, while
+Python additionally reserves one (#55).
+
 ### Object Store
 
 ```rust
