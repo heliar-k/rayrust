@@ -150,6 +150,10 @@ bool *ray_wait(const ray_bytes_t *ids, size_t count, int num_objects, int timeou
 ///   requires `placement_group_id`.
 /// - `runtime_env` must be a JSON string holding a single JSON object; a
 ///   non-string, malformed JSON or a non-object is an error.
+/// `resources` carries Ray's task default: when the map has no `CPU` key, 1.0 is
+/// added (the Python `@ray.remote` default), so `--num-cpus` limits how many
+/// tasks run at once. An explicit `"CPU":0` is the only way to ask for zero CPU;
+/// a map with other resources and no `CPU` still gets 1.0 merged in.
 /// Local mode rejects `placement_group_id` outright (the SDK has no placement
 /// group lookup there) and drops the other three fields: LocalModeTaskSubmitter
 /// calls `Submit(invocation, {})`, so name, resources and runtime_env have no
@@ -167,6 +171,8 @@ ray_bytes_t ray_task_call_with_options(const char *func_name,
 /// This entry point takes no options JSON: a Python task submitted here cannot be
 /// named, cannot request resources, cannot be bound to a placement group bundle
 /// and cannot be given a runtime env.
+/// The task requests one CPU: with no options there is no way to opt out of the
+/// default 1.0 that `ray_task_call_with_options` applies.
 /// `module_name` and `function_name` are null-terminated C strings.
 /// `args` are msgpack-serialized arguments (will be wrapped with xlang header).
 /// `is_ref[i] = true` means args[i] is an ObjectRef ID (pass by reference).

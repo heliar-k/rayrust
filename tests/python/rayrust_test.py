@@ -27,6 +27,14 @@ def compute(n):
     return sum(range(n))
 
 
+@ray.remote
+def sleep_for(seconds):
+    import time
+
+    time.sleep(seconds)
+    return 0
+
+
 # ── Complex type return functions ────────────────────────────────
 
 @ray.remote

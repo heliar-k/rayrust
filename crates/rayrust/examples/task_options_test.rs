@@ -1,5 +1,5 @@
 //! Example: `TaskOptions` 的五个字段（name、resources、placement group、
-//! runtime_env、默认值）。
+//! runtime_env、默认资源）。
 //!
 //! 一次运行只跑一种模式：
 //! ```text
@@ -10,10 +10,13 @@
 //!
 //! # 环境前提
 //!
-//! - 集群必须是 **1 个 CPU**：第 2 项靠单 bundle 的组占住唯一 CPU 才有区分力，
-//!   第 4 项靠 `CPU 2.0` 的请求在这台机器上永远无法满足才有区分力。
-//! - 同一集群上别的 job 正在占着 CPU 时会干扰第 2、4 项（两处都依赖「空集群只剩
-//!   待测任务能跑」）。非 detached 的 placement group 随创建它的 job 结束而销毁，
+//! - 集群必须是 **1 个 CPU + 1 个 `Custom` 资源**：启动命令是
+//!   `--num-cpus=1 --resources='{"Custom":1}'`。第 2、5 项靠单 bundle 的组占住
+//!   唯一 CPU 才有区分力，第 4 项靠 `CPU 2.0` 的请求在这台机器上永远无法满足才有
+//!   区分力，第 5 项的两个对照靠节点上确实有 1 个 `Custom` 才有区分力。
+//! - 同一集群上别的 job 正在占着 CPU 或 `Custom` 时会干扰第 1、2、4、5 项（四处都
+//!   依赖「空集群只剩待测任务能跑」：第 1 项的 `env_check` 是默认任务，按默认值
+//!   要 1 个 CPU）。非 detached 的 placement group 随创建它的 job 结束而销毁，
 //!   所以本示例自己上一轮留下的组不需要手动清理。
 //! - 示例启动时清掉自己的日志目录 `task_options_test_logs/`，结束时再清一次，不在
 //!   工作树里留痕迹。
@@ -36,14 +39,17 @@
 //!    在提交前就被拒，不会因为 `to_json` 不输出它而静默丢掉字段。
 //! 4. resources：`resource("CPU", 2.0)` 的任务在 1 CPU 集群上 `wait` 期限内不就绪
 //!    （随后 cancel），`resource("CPU", 1.0)` 的任务正常完成。
-//! 5. 默认值：`TaskOptions::new()` 的任务照旧完成；`to_json()` 为空串由单元测试
-//!    覆盖。
+//! 5. 默认资源：建单 bundle `{"CPU":1}` 的组占住唯一 CPU 后，`TaskOptions::new()`
+//!    的任务 `wait` 期限内不就绪（默认要 1 个 CPU）；显式 `resource("CPU", 0.0)`
+//!    的任务立刻完成；只写 `Custom 1.0` 的任务同样不就绪（CPU 1.0 被合并进来），
+//!    补上 `CPU 0.0` 的对照完成；`task_call_python` 的任务同样不就绪；移除组之后
+//!    前面两个不就绪的任务都完成。`to_json()` 为空串由单元测试覆盖。
 //!
 //! 本地模式（`local`）跑能跑的子集并说明其余跳过的原因：
 //! `LocalModeTaskSubmitter::SubmitTask` 把 `CallOptions` 整个丢弃
 //! （`Submit(invocation, {})`），所以 runtime_env（第 1 项的对照读到 `None`）、
-//! resources（第 4 项）都没有效果；placement group 在本地模式直接报错
-//! （第 3 项可以观察到）；name（第 2 项）没有 core worker 日志可查。
+//! resources（第 4 项）与默认资源（第 5 项）都没有效果；placement group 在本地
+//! 模式直接报错（第 3 项可以观察到）；name（第 2 项）没有 core worker 日志可查。
 //!
 //! # 名字的观察点
 //!
@@ -65,7 +71,7 @@ fn env_check(name: String) -> Option<String> {
     std::env::var(&name).ok()
 }
 
-/// 与 worker .so 的 sleep_for 同名同签名，第 2、4 项用它占资源。
+/// 与 worker .so 的 sleep_for 同名同签名，第 2、4、5 项用它占资源。
 #[rayrust::remote]
 fn sleep_for(seconds: f64) -> i64 {
     std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
@@ -83,6 +89,15 @@ const PG_BOUND_TIMEOUT_MS: i32 = 8000;
 
 /// 任务时长：短于期限，长于调度余量。
 const TASK_SLEEP_S: f64 = 1.0;
+
+/// 第 5 项的等待期限（毫秒）：默认要 1 个 CPU 的任务在期限内不该就绪。
+const DEFAULT_CPU_WAIT_MS: i32 = 1000;
+
+/// 第 5 项的短任务时长：远短于期限，有条件时立刻就能跑。
+const SHORT_TASK_SLEEP_S: f64 = 0.2;
+
+/// 第 5 项调的 Python 任务模块。
+const PYTHON_MODULE: &str = "rayrust_test";
 
 /// 本示例自己的驱动日志目录（集群模式第 2 项扫描这里）。
 const DRIVER_LOG_DIR: &str = "task_options_test_logs";
@@ -389,18 +404,116 @@ async fn resources_check(ray: &Ray, cluster: bool) {
     );
 }
 
-/// 5. 默认值：TaskOptions::new() 的任务照旧完成。
-async fn defaults_check(ray: &Ray) {
-    println!("\n--- 5. 默认值 ---");
-    let value = env_check_remote(ray, ENV_VAR.to_string())
-        .expect("submit env_check with default options")
-        .get_timeout(GET_TIMEOUT_MS)
-        .expect("read env_check with default options");
-    assert_eq!(value, None, "默认 options 的任务读到 {:?}", value);
+/// 5. 默认资源：不给 resources 的任务要 1 个 CPU。
+async fn default_cpu_check(ray: &Ray, cluster: bool) {
+    println!("\n--- 5. 默认资源 = 1 个 CPU ---");
+    if !cluster {
+        println!("  本地模式跳过：LocalModeTaskSubmitter 丢弃 CallOptions，资源需求");
+        println!("  不生效，「占住 CPU 后默认任务排队」无从观察。");
+        println!("  to_json() 为空串由单元测试覆盖（cargo test -p rayrust --lib）");
+        return;
+    }
+
+    // 单 bundle 的组占走集群唯一的 CPU，先确认 raylet 已经把它扣掉。
+    let pg_id = ray
+        .placement_group_create("rayrust_task_options_default_cpu", r#"[{"CPU":1}]"#, 0)
+        .expect("create the placement group");
+    let bound_opts = TaskOptions::new()
+        .placement_group(pg_id.clone(), 0)
+        .resource("CPU", 1.0);
+    let value = sleep_for_remote_with_options(ray, &bound_opts, SHORT_TASK_SLEEP_S)
+        .expect("submit the bound sleep_for")
+        .get_timeout(PG_BOUND_TIMEOUT_MS)
+        .expect("the bound task must finish within its deadline");
+    assert_eq!(value, 0, "sleep_for 返回了 {}", value);
+    println!("  绑组任务完成（组已占住唯一 CPU）");
+
+    // a) 空资源表 = Ray 的默认值 1 个 CPU：此刻没有空闲 CPU。
+    let default_task: ObjectRef<i64> =
+        sleep_for_remote_with_options(ray, &TaskOptions::new(), SHORT_TASK_SLEEP_S)
+            .expect("submit the default-options sleep_for");
+    let (ready, unready) = ray
+        .wait(&[default_task.clone()], 1, DEFAULT_CPU_WAIT_MS)
+        .expect("wait on the default-options task");
+    assert_eq!(ready.len(), 0, "默认任务在 CPU 被占住时就绪了");
+    assert_eq!(unready.len(), 1);
     println!(
-        "  env_check + TaskOptions::new() → 完成（读到 {:?}）",
-        value
+        "  TaskOptions::new() → wait({}ms) 后仍不就绪（默认要 1 个 CPU）",
+        DEFAULT_CPU_WAIT_MS
     );
+
+    // b) 显式 CPU 0.0 的任务现在就能跑，所以 a) 的不就绪来自 CPU。
+    let zero_cpu_opts = TaskOptions::new().resource("CPU", 0.0);
+    let value = sleep_for_remote_with_options(ray, &zero_cpu_opts, SHORT_TASK_SLEEP_S)
+        .expect("submit the CPU 0.0 sleep_for")
+        .get_timeout(PG_BOUND_TIMEOUT_MS)
+        .expect("the CPU 0.0 task must finish while the CPU is taken");
+    assert_eq!(value, 0, "sleep_for 返回了 {}", value);
+    println!("  resource(\"CPU\", 0.0) → 完成（零 CPU 的任务不受占住的 CPU 影响）");
+
+    // c) 只给别的资源、不给 CPU 时，Ray 会合并 1.0 个 CPU。
+    let custom_only: ObjectRef<i64> = sleep_for_remote_with_options(
+        ray,
+        &TaskOptions::new().resource("Custom", 1.0),
+        SHORT_TASK_SLEEP_S,
+    )
+    .expect("submit the Custom-only sleep_for");
+    let (ready, unready) = ray
+        .wait(&[custom_only.clone()], 1, DEFAULT_CPU_WAIT_MS)
+        .expect("wait on the Custom-only task");
+    assert_eq!(ready.len(), 0, "只写 Custom 的任务在 CPU 被占住时就绪了");
+    assert_eq!(unready.len(), 1);
+    println!(
+        "  resource(\"Custom\", 1.0)（没有 CPU 键）→ wait({}ms) 后仍不就绪（合并了 CPU）",
+        DEFAULT_CPU_WAIT_MS
+    );
+    ray.cancel(custom_only.id(), false, true)
+        .expect("cancel the Custom-only task with its handle alive");
+    println!("  句柄存活时 cancel → Ok");
+
+    // 对照：同样要 Custom，显式写 CPU 0.0 就能跑，所以节点上确实有 1 个 Custom，
+    // c) 的不就绪来自合并进来的 CPU。
+    let custom_zero_cpu_opts = TaskOptions::new()
+        .resource("Custom", 1.0)
+        .resource("CPU", 0.0);
+    let value = sleep_for_remote_with_options(ray, &custom_zero_cpu_opts, SHORT_TASK_SLEEP_S)
+        .expect("submit the Custom + CPU 0.0 sleep_for")
+        .get_timeout(PG_BOUND_TIMEOUT_MS)
+        .expect("the Custom + CPU 0.0 task must finish");
+    assert_eq!(value, 0, "sleep_for 返回了 {}", value);
+    println!("  resource(\"Custom\", 1.0) + resource(\"CPU\", 0.0) → 完成");
+
+    // d) Python 任务入口没有 options，所以它总是要 1 个 CPU。
+    let arg = serialize(&SHORT_TASK_SLEEP_S).expect("serialize the Python sleep_for argument");
+    let python_task = ray
+        .task_call_python(PYTHON_MODULE, "sleep_for", &[&arg], &[])
+        .expect("submit the Python sleep_for");
+    let (ready, unready) = ray
+        .wait(&[python_task.clone()], 1, DEFAULT_CPU_WAIT_MS)
+        .expect("wait on the Python sleep_for");
+    assert_eq!(ready.len(), 0, "Python 任务在 CPU 被占住时就绪了");
+    assert_eq!(unready.len(), 1);
+    println!(
+        "  task_call_python(sleep_for) → wait({}ms) 后仍不就绪（总是要 1 个 CPU）",
+        DEFAULT_CPU_WAIT_MS
+    );
+
+    // e) 移除组：a) 与 d) 里不就绪的任务都该跑完，不就绪确实来自被占住的 CPU。
+    ray.placement_group_remove(&pg_id);
+    println!("  placement group 已 remove，资源归还");
+
+    let value = python_task
+        .cast::<i64>()
+        .get_timeout(PG_BOUND_TIMEOUT_MS)
+        .expect("the Python task must finish once the group is gone");
+    assert_eq!(value, 0, "Python sleep_for 返回了 {}", value);
+    println!("  移除组后同一个 Python 任务 → 完成");
+
+    let value = default_task
+        .get_timeout(PG_BOUND_TIMEOUT_MS)
+        .expect("the default-options task must finish once the group is gone");
+    assert_eq!(value, 0, "sleep_for 返回了 {}", value);
+    println!("  移除组后 TaskOptions::new() 的任务 → 完成");
     println!("  to_json() 为空串由单元测试覆盖（cargo test -p rayrust --lib）");
 }
 
@@ -423,7 +536,7 @@ async fn main() {
     name_and_placement_group_check(&ray, cluster).await;
     unknown_pg_check(&ray).await;
     resources_check(&ray, cluster).await;
-    defaults_check(&ray).await;
+    default_cpu_check(&ray, cluster).await;
 
     // 让 tokio 的 blocking pool 里的 FFI 调用有机会收尾，避免退出竞态。
     tokio::time::sleep(Duration::from_millis(200)).await;
