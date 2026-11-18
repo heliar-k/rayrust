@@ -581,12 +581,20 @@ impl Ray {
     }
 
     /// Kill an actor by its handle.
+    ///
     /// Returns `Ok(())` on success, `Err` if the C++ side reports an error.
+    ///
+    /// Local mode returns [`RayError::Ffi`]: `AbstractRayRuntime::KillActor`
+    /// starts with `CoreWorkerProcess::GetCoreWorker()`, whose
+    /// `EnsureInitialized` calls `QuickExit()` (`_Exit(1)`,
+    /// `src/ray/util/process.cc:845-848`) because local mode never starts a core
+    /// worker process. A local actor lives in the calling process and ends with
+    /// it, so there is nothing to kill.
     pub fn kill_actor(&self, handle: &ActorHandle, no_restart: bool) -> Result<(), RayError> {
         rayrust_sys::clear_error();
         actor_kill_inner(handle.id(), no_restart);
-        // C ABI returns void, but sets last_error on exception.
-        // Best-effort: check if an error was set.
+        // The C ABI returns void and reports both the local mode rejection and
+        // exceptions through last_error, so this check is the designed path.
         if rayrust_sys::last_error().is_some() {
             return Err(ffi_error("ray_actor_kill"));
         }
@@ -1185,8 +1193,9 @@ impl ActorHandle {
     ///
     /// 上一个运行时留下的 handle（同一个进程里 `drop` 掉 `Ray` 之后重新 `connect`）
     /// 不在新运行时的 actor manager 里，`serialize()` 会命中 SDK 的 RAY_CHECK 终止
-    /// 进程（实测终止在 `ActorManager::GetActorHandle` 的 RAY_CHECK）。[`Ray::actor_call`]、
-    /// [`Ray::kill_actor`] 拿同一个陈旧 handle 时的处境相同。
+    /// 进程（实测终止在 `ActorManager::GetActorHandle` 的 RAY_CHECK）。[`Ray::actor_call`]
+    /// 拿同一个陈旧 handle 时的处境相同；[`Ray::kill_actor`] 只在集群模式相同，本地
+    /// 模式先被本地模式守卫拒绝，陈旧与否无关。
     pub fn serialize(&self) -> Result<Vec<u8>, RayError> {
         actor_handle_serialize_inner(&self.id)
     }

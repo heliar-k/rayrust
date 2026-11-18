@@ -26,7 +26,9 @@ rayrust wraps the Ray C++ SDK (`libray_api.so`) via a C ABI layer, providing idi
 | `ActorLifetime::Detached` (detached actors) | ✅ | ✅ |
 | `RayConfig.namespace` (job-level namespace) | ✅ | ✅ |
 | PlacementGroup | ✅ | ✅ |
-| `get_actor` (named actor, cross-namespace) / `cancel` / `kill_actor` | ✅ | ✅ |
+| `get_actor` (named actor, cross-namespace) | ✅ | ✅ |
+| `cancel` (task cancellation; local mode has no cancellation path, see #58) | ❌ | ✅ |
+| `kill_actor` (local mode returns an error and the actor ends with the process, see #53) | ❌ | ✅ |
 | XLANG header auto-detection (Ray 2.51.1+ compatible) | ✅ | ✅ |
 | `rmpv::Value` dynamic deserialization | ✅ | ✅ |
 | `put_xlang` (writes the xlang header into the stored data; Python still rejects it for lack of metadata, see #21) | ✅ | ✅ |

@@ -253,6 +253,13 @@ ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len
 
 /// Kill an actor.
 /// `actor_id_data`/`actor_id_len` is the binary actor ID.
+/// Returns nothing: an error is reported through ray_last_error().
+/// Local mode returns an error: `AbstractRayRuntime::KillActor` starts with
+/// `CoreWorkerProcess::GetCoreWorker()`, whose `EnsureInitialized` calls
+/// `QuickExit()` (`_Exit(1)`, `src/ray/util/process.cc:845-848`) because local
+/// mode never starts a core worker process. `LocalModeRayRuntime` does not
+/// override `KillActor`, and a local actor lives in the calling process
+/// (`LocalModeTaskSubmitter::actor_contexts_`), so there is nothing to kill.
 void ray_actor_kill(const char *actor_id_data, size_t actor_id_len, bool no_restart);
 
 /// Serialize a registered actor handle.

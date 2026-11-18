@@ -1214,6 +1214,23 @@ void ray_actor_kill(const char *actor_id_data, size_t actor_id_len, bool no_rest
     try {
         auto runtime = ray::internal::GetRayRuntime();
         if (runtime) {
+            if (runtime->IsLocalMode()) {
+                // AbstractRayRuntime::KillActor 的第一句是
+                // CoreWorkerProcess::GetCoreWorker()
+                // （cpp/src/ray/runtime/abstract_ray_runtime.cc:265-266），本地模式从不
+                // 启动 core worker 进程，那里的 EnsureInitialized 走 QuickExit()，最终
+                // _Exit(1)（src/ray/core_worker/core_worker_process.cc:842-850、
+                // src/ray/util/process.cc:845-848），RAY_CATCH 抓不到 _Exit。
+                // LocalModeRayRuntime 没有覆盖 KillActor
+                // （cpp/src/ray/runtime/local_mode_ray_runtime.h:24-36），本地 actor 活在
+                // 本进程的 LocalModeTaskSubmitter::actor_contexts_ 里
+                // （cpp/src/ray/runtime/task/local_mode_task_submitter.h:53），随进程结束。
+                set_last_error(
+                    "actors cannot be killed in local mode: local mode never starts a "
+                    "core worker process, and a local actor lives in the calling process "
+                    "and ends with it");
+                return;
+            }
             std::string actor_id(actor_id_data, actor_id_len);
             runtime->KillActor(actor_id, no_restart);
         }
