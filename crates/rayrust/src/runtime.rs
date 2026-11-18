@@ -135,6 +135,10 @@ impl RayConfig {
     /// Set the job-level namespace for named actors.
     /// Named actors are registered in this namespace by default.
     /// Use `ActorOptions::ray_namespace()` to override per-actor.
+    ///
+    /// Local mode accepts the value and reports it back ([`Ray::namespace`]), but
+    /// its actor registration and lookup ignore it: the local runtime keeps one
+    /// flat name table.
     pub fn namespace(mut self, ns: impl Into<String>) -> Self {
         self.namespace = ns.into();
         self
@@ -681,11 +685,30 @@ impl Ray {
     // ── Misc ──────────────────────────────────────────────────
 
     /// Get the namespace of this job.
+    ///
+    /// Cluster mode returns the job config's namespace, which for a job that
+    /// configured none is the random value Ray generates. The namespace scopes
+    /// named actors — registration ([`RayConfig::namespace`]'s default and
+    /// [`ActorOptions::ray_namespace`]) and lookup ([`Ray::get_actor`]) — and
+    /// named placement groups ([`Ray::placement_group_by_name`]).
+    ///
+    /// Local mode returns whatever `RayConfig::namespace` gave `ray_init`, and the
+    /// empty string when that was none: local mode never starts a core worker, so
+    /// there is no job config to ask. Ray does record a namespace for a driver job
+    /// regardless of the run mode (`ConfigInternal::ray_namespace`, generated when
+    /// the caller configured none), but nothing in local mode reads it, so the
+    /// anonymous namespace a cluster would report is not observable here. Local
+    /// mode also keeps one flat name table: `CreateActor` registers by name only
+    /// (`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:143-152`) and
+    /// `GetActor` ignores its `ray_namespace` argument (same file, `:159-167`),
+    /// and its placement group queries are rejected outright.
     pub fn namespace(&self) -> Result<String, RayError> {
         get_namespace()
     }
 
     /// Get a named actor by name and namespace.
+    ///
+    /// Local mode ignores `namespace` and looks the name up in its flat table.
     pub fn get_actor(
         &self,
         name: &str,
@@ -701,6 +724,10 @@ impl Ray {
     }
 
     /// Returns true if the current actor was restarted.
+    ///
+    /// A `bool` has no error channel, so a failure reads as `false`. Local mode
+    /// always reports `false`; it takes the SINGLE_PROCESS branch, which does not
+    /// touch the core worker.
     pub fn was_current_actor_restarted(&self) -> bool {
         was_current_actor_restarted()
     }
@@ -1497,6 +1524,8 @@ pub struct ActorOptions {
     /// Named actor name. Empty = anonymous actor.
     pub name: String,
     /// Namespace for named actor lookup. Empty = current namespace.
+    /// Ignored in local mode, where actors are registered and looked up by name
+    /// only.
     pub ray_namespace: String,
     /// Resource requirements, e.g. `[("CPU", 1.0), ("GPU", 0.5)]`.
     pub resources: Vec<(String, f64)>,

@@ -10,7 +10,8 @@
 //!
 //! # 检查项
 //!
-//! 1. `is_local_mode`：集群 `false`、本地 `true`。
+//! 1. `is_local_mode`：集群 `false`、本地 `true`。同一项还断言 `namespace()`：集群返回
+//!    job config 的 namespace，本地返回 init 时配置的那一个（两边都配了固定名字）。
 //! 2. placement group 全流程（集群）：建带名字的单 bundle 组（`CPU 0.5`、
 //!    `STRICT_PACK`）→ `wait_ready(10)` 为 `true` → `by_id` 的 id 与建组返回一致、
 //!    name 一致、`state == 2`（CREATED）、`strategy` 与建组时传的一致 → `by_name`
@@ -189,6 +190,12 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// 本地模式 init 时配的 namespace，第 1 项的断言要拿它对比。
+const LOCAL_NAMESPACE: &str = "rayrust_local_ns";
+
+/// 集群模式 init 时配的 namespace。
+const CLUSTER_NAMESPACE: &str = "rayrust_cluster_ns";
+
 fn cluster_config() -> RayConfig {
     let address = std::env::var("RAY_ADDRESS").expect("RAY_ADDRESS");
     let node_ip = std::env::var("RAY_NODE_IP").expect("RAY_NODE_IP");
@@ -196,9 +203,10 @@ fn cluster_config() -> RayConfig {
     RayConfig::new(&address)
         .node_ip(&node_ip)
         .code_search_path(vec![worker_so])
+        .namespace(CLUSTER_NAMESPACE)
 }
 
-/// 1. is_local_mode：集群 false、本地 true。
+/// 1. is_local_mode：集群 false、本地 true；namespace：两边都与配置的相同。
 fn is_local_mode_check(ray: &Ray, cluster: bool) {
     println!("\n--- 1. is_local_mode ---");
     let reported = ray.is_local_mode();
@@ -207,6 +215,19 @@ fn is_local_mode_check(ray: &Ray, cluster: bool) {
         reported, !cluster,
         "is_local_mode() 报 {}，与本次运行的模式（cluster = {}）不符",
         reported, cluster
+    );
+
+    let expected = if cluster {
+        CLUSTER_NAMESPACE
+    } else {
+        LOCAL_NAMESPACE
+    };
+    let namespace = ray.namespace().expect("namespace query");
+    println!("  namespace() → {:?}", namespace);
+    assert_eq!(
+        namespace, expected,
+        "namespace() 报 {:?}，配置的是 {:?}（cluster = {}）",
+        namespace, expected, cluster
     );
 }
 
@@ -823,7 +844,7 @@ async fn main() {
     let config = if cluster {
         cluster_config()
     } else {
-        RayConfig::local()
+        RayConfig::local().namespace(LOCAL_NAMESPACE)
     };
     let ray = Ray::connect(&config).expect("Ray::connect");
 

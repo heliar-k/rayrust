@@ -348,8 +348,12 @@ void ray_register_member_function(const char *func_name, ray_member_callback_t c
 // ─── Helpers ──────────────────────────────────────────────────
 
 /// Copy a std::string (may contain null bytes) into a heap-allocated ray_bytes_t.
+///
+/// 空串也要拿到非空指针：`malloc(0)` 允许返回 null，而 Rust 侧的 `CBytesGuard`
+/// 把 null 当成错误（crates/rayrust-sys/src/lib.rs:218-225），本地模式未配置
+/// namespace 时就会把 `""` 读成失败。
 static ray_bytes_t dup_bytes(const std::string &s) {
-    char *data = static_cast<char *>(std::malloc(s.size()));
+    char *data = static_cast<char *>(std::malloc(s.size() ? s.size() : 1));
     if (!data) return ray_bytes_t{nullptr, 0};
     std::memcpy(data, s.data(), s.size());
     return ray_bytes_t{data, s.size()};
@@ -600,6 +604,37 @@ static void apply_default_task_cpu(ray::internal::CallOptions &options) {
 
 // ─── Lifecycle ────────────────────────────────────────────────
 
+/// `ray_init` 收到的 job namespace。
+///
+/// 本地模式不启动 core worker，`AbstractRayRuntime::GetNamespace`
+/// （cpp/src/ray/runtime/abstract_ray_runtime.cc:374-377）第一句
+/// `CoreWorkerProcess::GetCoreWorker()` 在 core worker 不存在时走
+/// `EnsureInitialized` 的 `QuickExit()` 终止进程
+/// （src/ray/core_worker/core_worker_process.cc:842-850）。本地模式也没有 job config，
+/// 而 `ConfigInternal` 的类定义（`config_internal.h`）不在 wheel 的 `ray/cpp/include`
+/// 里：`ConfigInternal::Instance()` 虽然是 `libray_api.so` 导出的弱符号，但没有成员
+/// 布局就定位不到 `ray_namespace`，所以这里留一份 init 时传入的值给
+/// `ray_get_namespace` 在本地模式返回。
+namespace {
+
+std::mutex &init_namespace_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::string &init_namespace() {
+    static std::string value;
+    return value;
+}
+
+}  // namespace
+
+/// 读回 `ray_init` 记下的 namespace（空串表示没有配置过）。
+static std::string saved_init_namespace() {
+    std::lock_guard<std::mutex> lock(init_namespace_mutex());
+    return init_namespace();
+}
+
 static void reopen_ref_count_gate(void);
 
 int ray_init(const char *address, int local_mode, const char *node_ip,
@@ -622,6 +657,12 @@ int ray_init(const char *address, int local_mode, const char *node_ip,
     // Set job-level namespace for named actors.
     if (ns && ns[0] != '\0') {
         config.ray_namespace = ns;
+    }
+
+    // 同一处留一份给本地模式的 `ray_get_namespace`；没传就是空串。
+    {
+        std::lock_guard<std::mutex> lock(init_namespace_mutex());
+        init_namespace() = config.ray_namespace;
     }
 
     // Set code search path for worker to find .so with remote functions.
@@ -1514,10 +1555,19 @@ ray_bytes_t ray_placement_group_get_by_name(const char *name) {
 // ─── Misc ─────────────────────────────────────────────────────
 
 bool ray_was_current_actor_restarted(void) {
+    ray_clear_error();
     try {
         auto runtime = ray::internal::GetRayRuntime();
-        if (runtime) return runtime->WasCurrentActorRestarted();
-    } catch (...) {}
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return false;
+        }
+        return runtime->WasCurrentActorRestarted();
+    } catch (const std::exception &e) {
+        set_last_error_exception(e);
+    } catch (...) {
+        set_last_error("unknown exception");
+    }
     return false;
 }
 
@@ -1530,8 +1580,12 @@ ray_bytes_t ray_get_namespace(void) {
     ray_clear_error();
     try {
         auto runtime = ray::internal::GetRayRuntime();
-        if (runtime) return dup_bytes(runtime->GetNamespace());
-        set_last_error("Ray runtime is not initialized");
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return ray_bytes_t{nullptr, 0};
+        }
+        if (runtime->IsLocalMode()) return dup_bytes(saved_init_namespace());
+        return dup_bytes(runtime->GetNamespace());
     } catch (const std::exception &e) {
         set_last_error_exception(e);
     } catch (...) {

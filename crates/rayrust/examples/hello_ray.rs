@@ -4,7 +4,9 @@
 //! - #[remote] macro: callback generation + registration + caller
 //! - put/get (i32, String)
 //! - remote task: add(1, 2) → 3
-//! - namespace query
+//! - namespace query: local mode reports the namespace given to init, which is
+//!   the empty string here (local mode starts no core worker, so there is no job
+//!   config to ask)
 
 use rayrust::prelude::*;
 
@@ -66,10 +68,13 @@ fn main() {
 
     // ── Namespace ─────────────────────────────────────────
     println!("\n--- Namespace ---");
-    match ray.namespace() {
-        Ok(ns) => println!("Namespace: {}", ns),
-        Err(e) => println!("Get namespace failed: {}", e),
-    }
+    let namespace = ray.namespace().expect("namespace query");
+    println!("Namespace: {:?}", namespace);
+    assert_eq!(
+        namespace, "",
+        "本地模式没配置 namespace，读回来的是 {:?}",
+        namespace
+    );
 
     // ── Shutdown (automatic on drop) ──────────────────────
     println!("\n--- Shutdown ---");
