@@ -16,7 +16,8 @@
 //! 4. 异步调用带引用参数；再补一条「future 先建、引用先 drop、等一会儿再轮询」
 //! 5. actor 方法带引用参数，同步与异步各一次；异步同样补「先建 future、先 drop」
 //! 6. （集群）Python 任务与 Python actor 的引用参数：驱动 put 的对象会被 Python 拒绝
-//!    （原因只能从 worker 的 `.err` 读到），Python 自己产生的对象可以按引用传
+//!    （原因只能从 worker 的 `.err` 读到），Python 自己产生的对象可以按引用传；
+//!    Python actor 的 handle 也要能 `serialize` → `from_serialized` → 调用
 //! 7. 提交之后立刻 drop 参数引用，任务仍读到值
 //! 8. （集群）任务返回的 id 不可读：驱动自己持有引用时交回的 id 能读；actor 里
 //!    put 并保活的对象，驱动按同一个 id 读也读不到（对象活着也一样）
@@ -352,6 +353,33 @@ async fn python_with_ref(ray: &Ray) {
     println!(
         "  Python 产生的对象当 actor 参数：Counter.increment(&ref(5)) → {}",
         value
+    );
+
+    // 6e. Python actor 的 handle 往返。它的
+    // `actor_creation_task_function_descriptor` 里是 `python_function_descriptor`，
+    // 字段 6 的嵌套比 C++ actor 深一层，载荷校验必须照旧收下；复原出来的 handle
+    // 登记在本进程，接着调用要能读到当前值。
+    let serialized = handle
+        .serialize()
+        .expect("serialize the Python actor handle");
+    let restored =
+        ActorHandle::from_serialized(&serialized).expect("from_serialized the Python handle");
+    assert_eq!(
+        restored.id(),
+        handle.id(),
+        "复原的 Python actor id 与原 handle 不同"
+    );
+    let current: i64 = ray
+        .actor_call_python(restored.id(), "get", &[], &[])
+        .expect("用复原的 Python handle 提交 get")
+        .cast::<i64>()
+        .get_timeout(PROBE_TIMEOUT_MS)
+        .expect("读复原 Python handle 的 get");
+    assert_eq!(current, value, "复原的 Python handle 读到的值不对");
+    println!(
+        "  Python handle 往返：serialize {} 字节 → from_serialized → get() → {}",
+        serialized.len(),
+        current
     );
 
     let _ = ray.kill_actor(&handle, true);
