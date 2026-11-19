@@ -234,6 +234,27 @@ ray_bytes_t ray_actor_create_with_options(const char *func_name,
 
 /// Create a Python actor with full ActorCreationOptions.
 /// `options_json` has the same format as ray_actor_create_with_options.
+/// Constructor arguments are always values: there is no `is_ref` here.
+/// Local mode returns an error instead of creating the actor, and it does so
+/// before the options JSON is parsed and before the arguments are built, so in
+/// local mode this entry rejects the call whatever the options and the arguments
+/// are. `ray_actor_create_with_options` (a C++ actor) keeps its option
+/// diagnostics in local mode.
+/// The reason is the local submitter itself: local mode starts no core worker
+/// process and has no Python executor, and `LocalModeTaskSubmitter::Submit`
+/// ignores the language and the module and builds every task as a C++ descriptor
+/// from the function name alone (`local_mode_task_submitter.cc:39-40`, language
+/// CPP at `:52-56`). The creation function name this entry puts in the holder is
+/// `"__init__"`, which the C++ `FunctionManager` usually has no entry for, so
+/// without the refusal `TaskExecutor` would store
+/// `PackError("unknown function: __init__")` as the actor state
+/// (`task_executor.cc:44-52`, `:313-331`) without throwing and without returning
+/// an error, and the caller would see a successful creation. A same-named
+/// function registered in the process would run in place of the Python
+/// constructor, and a named creation would write the name into the local name
+/// table (`local_mode_task_submitter.cc:143-152`), which `ray_get_actor` reads
+/// back (`:159-168`) to hand out a handle nothing can call:
+/// `ray_actor_call_python` rejects every Python actor call in local mode.
 ray_bytes_t ray_actor_create_python_with_options(const char *module_name,
                                                    const char *class_name,
                                                    const ray_bytes_t *args,

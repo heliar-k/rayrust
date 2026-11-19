@@ -20,7 +20,7 @@ rayrust wraps the Ray C++ SDK (`libray_api.so`) via a C ABI layer, providing idi
 | `actor_call_async` (non-blocking) | ✅ | ✅ |
 | `get_async` (bounded `Get` on the tokio blocking pool) | ✅ | ✅ |
 | Python task (cross-language, complex types) | ✅ | ✅ |
-| Python actor (cross-language; local mode returns an error, see #59) | ❌ | ✅ |
+| Python actor (cross-language; local mode refuses creation #68 and calls #59) | ❌ | ✅ |
 | Resource scheduling (`TaskOptions` / `ActorOptions` builder) | ✅ | ✅ |
 | `ActorOptions`: name, namespace, max_restarts, max_concurrency, runtime_env, placement_group | ✅ | ✅ |
 | `ActorLifetime::Detached` (detached actors) | ✅ | ✅ |
