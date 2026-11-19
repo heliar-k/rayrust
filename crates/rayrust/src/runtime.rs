@@ -790,7 +790,24 @@ impl Ray {
 
     /// Get a named actor by name and namespace.
     ///
-    /// Local mode ignores `namespace` and looks the name up in its flat table.
+    /// `name` must not be empty: an empty name returns [`RayError::Ffi`] without
+    /// touching Ray, because the core worker's
+    /// `CoreWorker::GetNamedActorHandle` starts with `RAY_CHECK(!name.empty())`
+    /// (`src/ray/core_worker/core_worker.cc:2594`) and RAY_CHECK terminates the
+    /// process. A name containing an interior NUL byte is rejected the same way:
+    /// it reaches the C side as an empty C string (#27). A name of only
+    /// whitespace characters is legal and is not trimmed, so it is looked up as
+    /// it is. `namespace` may be empty: the C++ submitter falls back to the job
+    /// config's namespace for an empty one
+    /// (`cpp/src/ray/runtime/task/native_task_submitter.cc:181-186`).
+    ///
+    /// Returns `Ok(Some(handle))` when the name is found and `Ok(None)` when it is
+    /// not.
+    ///
+    /// Local mode ignores `namespace` and looks the name up in its flat table. The
+    /// empty-name check runs before the mode decision, so local mode returns
+    /// [`RayError::Ffi`] for an empty name as well; before the check it answered
+    /// `Ok(None)` there.
     pub fn get_actor(
         &self,
         name: &str,
@@ -1315,15 +1332,63 @@ impl ActorHandle {
 
     /// 从一个 handle 字节复原并登记 handle。
     ///
-    /// 空字节返回 [`RayError::Ffi`]。除了空字节，**不是合法 actor handle 的字节也被
-    /// 拒掉**：上游 `ActorHandle(serialized)` 丢弃 `ParseFromString` 的结果
-    /// （`src/ray/core_worker/actor_handle.cc:66`、`:135`），畸形字节会登记成 nil actor，
-    /// 拿到的 handle 的 id 是 16 个 `0xff`。nil handle 在调用方手里没有任何明确的
-    /// 失败：调用提交成功但永远不就绪（`get` 要等到期限才报超时），`serialize()` 把
-    /// 登记的那份 protobuf 再交出来（长度与登记时相同，protobuf 重新序列化可能改写
-    /// 长度前缀；重新序列化结果为空时报错），所以 C 侧看到登记结果是 nil（16 个
-    /// `0xff` 或 16 个 `0x00`，合法 actor id 是散列，不会是这两种）就直接报
-    /// [`RayError::Ffi`]。
+    /// 空字节返回 [`RayError::Ffi`]。字节必须是一段结构良好的 `rpc::ActorHandle`
+    /// protobuf（`src/ray/protobuf/core_worker.proto:27-79`），且 `actor_id`（字段 1）
+    /// 正好 16 字节、`creation_job_id`（字段 4）正好 4 字节。已知字段按 Ray 2.51.1 的
+    /// schema 校验内容：嵌套消息（`owner_address`、
+    /// `actor_creation_task_function_descriptor`、`labels` 的每个 entry）逐层递归，
+    /// proto3 的 `string` 字段校验 UTF-8；未知字段与 wire type 与 schema 不符的字段按
+    /// wire type 跳过，与上游一致。同一字段出现多次时按最后一次。载荷畸形、缺字段、
+    /// 字段长度不对都先在这里报 [`RayError::Ffi`]，错误文本能区分这三种情形。
+    ///
+    /// 嵌套消息与 `string` 的内容必须校验，否则两个长度都不可信：上游的
+    /// `ParseFromString` 在第一条损坏的嵌套消息或非法 UTF-8 的 `string` 处中止，
+    /// `CreateInnerActorHandleFromString` 丢弃这个结果
+    /// （`src/ray/core_worker/actor_handle.cc:66`），登记进去的是中止之前写入的那些
+    /// 字段。所以「3 字节 `actor_id` + 损坏的 `owner_address` + 16 字节 `actor_id`」
+    /// 在上游登记的仍是那个 3 字节值，登记阶段在 `id.h:435` 终止进程；排在损坏内容
+    /// 之后的 `creation_job_id` 上游从未写入，登记出 nil job id 的 handle。两类载荷
+    /// 都由这里拒掉。递归按 schema 的树走，最深三层（`rpc.ActorHandle` →
+    /// `rpc.FunctionDescriptor` → `rpc.PythonFunctionDescriptor`）；超过 8 层的走法
+    /// 按载荷畸形拒绝，构造出来的载荷进不到更深处。
+    ///
+    /// 字段 key 与长度前缀还要求最短编码且能放进 32 位：上游把 tag 读成 `uint32`、把
+    /// 长度前缀读成 `int32`，5 字节但超过 32 位的 key 会被截成别的字段（实测
+    /// `0x10000000a` 被当成 `actor_id`，随后的短内容终止进程），超过 5 字节的 key、
+    /// 达到 2^31 的长度与超过 5 字节的长度前缀都让上游的 `ParseFromString` 失败；
+    /// 5 字节以内但非最短编码的 key 与长度上游会接受，这里当载荷畸形拒掉。这套校验
+    /// 比上游严的地方正好是这三类编码：wire type 3/4/6/7、非最短编码、超过 32 位的
+    /// key 与长度前缀；protobuf 自己的序列化不会产生它们，所以
+    /// [`ActorHandle::serialize`] 交出来的 handle 不会被拒。
+    ///
+    /// 上面那张 schema 表按 Ray 2.51.1 固定：新增字段两侧都当未知字段跳过，不需要改；
+    /// 若某个已有字段的类型变了，表要跟着改，否则新类型的损坏内容会重新变成「只按
+    /// wire type 跳过」。
+    /// 上游丢弃 `ParseFromString` 的返回值，所以「合法字段后面跟损坏字节」的载荷原本
+    /// 能登记成 handle，现在直接报 [`RayError::Ffi`]。
+    /// 三个长度问题都在上游终止进程或让调用失败：`actor_id` 在登记阶段被读成
+    /// `ActorID`（`src/ray/core_worker/actor_manager.cc:33`
+    /// → `src/ray/common/id.h:430-441`）、`creation_job_id` 在第一次调用时被读成
+    /// `JobID`（`src/ray/core_worker/core_worker.cc:2374`，`JobID::kLength` 是 4）。
+    /// 缺 `creation_job_id` 时 nil job id 让 actor 的 worker 在
+    /// `WorkerContext::SetCurrentTask` 的 job id 检查处终止
+    /// （`src/ray/core_worker/context.cc:295`，调用方收到 `ActorError`；实测：一个进程
+    /// 建 detached actor 并写出载荷，另一个进程删掉字段 4 后登记并调用）。载荷校验在
+    /// 本地模式判定之前，所以两种模式下畸形载荷都报载荷错误。
+    ///
+    /// 载荷校验只保证长度：`actor_id` 的 16 个字节原样登记，内容全 `0xff` 时是 nil id、
+    /// 全 `0x00` 时是不属于任何 actor 的字节（合法 actor id 是散列），两者都在登记之后
+    /// 被拒成 [`RayError::Ffi`]。这种 handle 在调用方手里没有任何明确的失败：调用提交成功
+    /// 但永远不就绪（`get` 要等到期限才报超时），`serialize()` 把登记的那份 protobuf 再
+    /// 交出来（长度与登记时相同，protobuf 重新序列化可能改写长度前缀；重新序列化结果为
+    /// 空时报错），所以 C 侧看到这两种内容就直接报 [`RayError::Ffi`]。
+    ///
+    /// 结构良好的（`actor_id` 16 字节、`creation_job_id` 4 字节）载荷即使 `actor_id`
+    /// 是 16 个 `0x11` 也会被收下并返回 16 字节 id：上游不验证 id 是否属于真实 actor。
+    /// 这个字节被登记进本进程的 actor 登记表，所以接着用这个 id 调用会提交成功、对象
+    /// 永不就绪（订阅该 id 收不到 `ALIVE`，`get` 到期才报超时）；#69 说的是另一种情况：
+    /// 从未登记过的裸 16 字节 id 在调用时会命中 `ActorManager::GetActorHandle` 的
+    /// RAY_CHECK（`src/ray/core_worker/actor_manager.cc:52-59`）。
     ///
     /// 本地模式返回 [`RayError::Ffi`]：登记要读 `CoreWorkerProcess::GetCoreWorker()`，
     /// 本地模式从不启动 core worker 进程，那里直接 `QuickExit()`（`_Exit(1)`）。
@@ -1571,7 +1636,7 @@ fn check_task_options(opts: &TaskOptions) -> Result<(), RayError> {
 // ─── Actor Creation Options (builder) ─────────────────────────
 ///
 /// Exposes all fields of the C++ SDK's `ActorCreationOptions`:
-/// - `name` — named actor (looked up later via [`get_actor`])
+/// - `name` — named actor (looked up later via [`Ray::get_actor`])
 /// - `ray_namespace` — namespace for named actor lookup
 /// - `resources` — CPU/GPU requirements
 /// - `max_restarts` — restart on failure (default 0 = no restart)

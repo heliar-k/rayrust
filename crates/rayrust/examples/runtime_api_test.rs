@@ -24,7 +24,8 @@
 //!    `last_error()` 说明 16 字节，进程存活（`Ray::kill_actor` 只收 `&ActorHandle`，
 //!    id 恒为 16 字节，短 id 只能从 C ABI 传进来；这个集群里它在修复前会命中
 //!    `ActorID::FromBinary` 的 RAY_CHECK 终止进程）；随后第 4 项合法 actor 的
-//!    `kill_actor` 照旧工作。
+//!    `kill_actor` 照旧工作。最后是 actor 名字的边界：空名字与带内部 NUL 的名字都报
+//!    `Ffi`（错误说明名字为空、进程存活），只有空白字符的名字合法且按原样查（`Ok(None)`）。
 //! 4. `exit_actor`：`max_restarts=2` 的 actor，方法里调用 `exit_actor()`。
 //!    集群模式：`exit()` 的对象用 `get_timeout` 取（退出路径不写结果，无界 `get` 会永远等），
 //!    随后同一 handle 的普通方法必须失败；再用一个独立 actor 做正向对照——
@@ -36,13 +37,20 @@
 //!    `exit_actor()` 是空操作，任务照常返回它自己的值（1）。
 //! 6. handle 交接（集群）：actor 方法返回数值；`handle.serialize()` 的字节与裸
 //!    `handle.id()` 一起交给工人任务、原样交回；驱动从**交回来的字节**复原 handle、
-//!    调方法、断言数值。另加一条：畸形 handle 字节让 `from_serialized` 报错，而不是
-//!    交出一个永远不就绪的 nil handle。
+//!    调方法、断言数值。另加载荷校验的覆盖：畸形字节、`actor_id` 3 字节、
+//!    `creation_job_id` 3 字节、缺 `actor_id`、缺 `creation_job_id`、5 字节 key 的值
+//!    超过 32 位（上游会将其截成 `actor_id`）、非最短编码的长度前缀、嵌套消息与
+//!    `string` 内容损坏（`owner_address`、`FunctionDescriptor` 及其
+//!    `python_function_descriptor`、`labels` entry 与它的 value、`name`，每一条都先放
+//!    3 字节 `actor_id`、末尾再放 16 字节的，以及一条只出现一次的剥离型），长度合法但
+//!    内容全 0x00 或全 0xff，都报 `Ffi` 且错误文本各自能区分；手写的结构良好的载荷能
+//!    登记成 16 字节 id。
 //! 7. 本地模式：第 2、3 项与第 6 项的集群部分跳过并打印原因；第 1 项、第 4、5、8 项的
 //!    本地模式断言、本地模式下 `wait_ready` 与三个查询的报错、`kill_actor`、`cancel`、
 //!    `actor_create_python` 与 `actor_call_python` 的报错（这些调用被拒之后同一个 actor
 //!    仍然可用，计数逐次上涨）、`actor_create_python` 带名字被拒之后 `get_actor` 读不到
-//!    那个名字、两个 handle 接口的报错实际跑。
+//!    那个名字、两个 handle 接口的报错实际跑；`from_serialized` 对结构良好的载荷报本地
+//!    模式、对畸形载荷报载荷错误，actor 名字的边界与第 3 项跑同一组断言。
 //! 8. 构造函数里调 `exit_actor()`：集群模式 `actor_create` 照常返回 handle、第一次调用
 //!    报 `RayError::Actor`；本地模式那个调用是空操作，actor 正常创建、方法拿到值 11。
 //!
@@ -61,6 +69,32 @@
 //!   `Ffi("... Ray runtime is not initialized")`：`GetRayRuntime()` 在工人 `.so` 里
 //!   是一份没有初始化的 per-DSO 副本（#38）。所以第 6 项的数值断言在驱动侧做，
 //!   工人侧只作为观察打印。
+//! - `from_serialized` 的载荷里只有 `actor_id`（字段 1，16 字节）与
+//!   `creation_job_id`（字段 4，4 字节）是定长 id，载荷里就这两个尺寸会被上游按
+//!   `RAY_CHECK` 检查：`actor_id` 不对在登记阶段终止（`actor_manager.cc:33` →
+//!   `id.h:435`），`creation_job_id` 不对在第一次调用时终止（`core_worker.cc:2374`）。
+//!   缺 `creation_job_id` 不会终止调用方进程：nil job id 让 actor 的 worker 在
+//!   `WorkerContext::SetCurrentTask` 的 job id 检查处终止（`context.cc:295`），调用方
+//!   收到 `ActorError`；这个仓库里用一个建 detached actor 的进程与一个剥掉字段 4 再调用
+//!   的进程实测过（一个进程建 detached actor 并写出载荷，另一个进程删掉字段 4 后登记
+//!   并调用）。上游丢弃 `ParseFromString` 的结果
+//!   （`actor_handle.cc:66`），中止之前写入的字段才是登记的那份，所以 C 侧在进 SDK 之前
+//!   按 protobuf wire format 自己走一遍：已知字段按 Ray 2.51.1 的 schema 校验内容（嵌套
+//!   消息逐层递归、proto3 的 `string` 校验 UTF-8），未知字段按 wire type 跳过。
+//!   只量顶层长度挡不住的两类载荷：先放 3 字节 `actor_id`、再放一段损坏的嵌套消息或
+//!   非法 UTF-8 的 `string`、最后放 16 字节 `actor_id`，上游登记的仍是那个 3 字节值并在
+//!   `id.h:435` 终止进程；把 `creation_job_id` 排在损坏内容之后，上游从未写入它，登记出
+//!   nil job id 的 handle（实测：一个进程登记后 `serialize()` 读回 20 字节，只有
+//!   `actor_id` 与一个空的 owner_address）。
+//!   两个编码层面的差异也实测过：5 字节但值超过 32 位的 tag 会被上游截成 `uint32`
+//!   （`0x10000000a` 变成 `actor_id`，随后的短内容在登记阶段终止进程）；超过 5 字节
+//!   的 key、达到 2^31 的长度与超过 5 字节的长度前缀让上游的 `ParseFromString` 失败，
+//!   5 字节以内但非最短编码的 key 与长度上游会接受。C 侧把这些编码都当载荷畸形拒掉。
+//! - 集群 `get_actor("")` 与 `get_actor("a\0b")`（`to_cstring` 把带内部 NUL 的名字
+//!   变成空串，#27）没有守卫时会在 `core_worker.cc:2594` 的 `RAY_CHECK(!name.empty())`
+//!   终止进程，本地模式则返回 `Ok(None)`；现在两种模式都报 `Ffi`。
+//!   `get_actor(" ", "")` 是合法的未命中，返回 `Ok(None)`。空 namespace 合法：
+//!   `NativeTaskSubmitter::GetActor` 用 job config 的 namespace 顶替它。
 //! - 本地模式没有 core worker，`exit_actor()` 在那里是空操作：哨兵异常会被
 //!   `TaskExecutor::Invoke` 的 `catch (std::exception &)` 打包成错误载荷，返回 `()` 的
 //!   方法看到 `Ok(())`、返回值的方法看到一条与退出无关的 `Serialization` 错误。
@@ -195,6 +229,243 @@ const RESTART_GET_TIMEOUT_MS: i32 = 3000;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// `rpc::ActorHandle` 的字段号：`actor_id = 1`、`creation_job_id = 4`
+/// （`src/ray/protobuf/core_worker.proto:27-79`）。
+const ACTOR_HANDLE_ACTOR_ID: u32 = 1;
+const ACTOR_HANDLE_CREATION_JOB_ID: u32 = 4;
+
+/// protobuf 的长度前缀字段编码：字段号左移 3 位再加 wire type 2（长度前缀），
+/// 后面是一字节长度与载荷。这里用到的载荷都短于 128 字节，一字节长度就够。
+fn proto_bytes_field(field_number: u32, payload: &[u8]) -> Vec<u8> {
+    assert!(payload.len() < 128, "载荷长度必须能用一字节的长度前缀表示");
+    let mut out = vec![((field_number << 3) | 2) as u8, payload.len() as u8];
+    out.extend_from_slice(payload);
+    out
+}
+
+/// 结构良好的 handle 载荷：`actor_id` 16 字节 + `creation_job_id` 4 字节。
+fn well_formed_handle_payload(actor_id_byte: u8, job_id_byte: u8) -> Vec<u8> {
+    let mut payload = proto_bytes_field(ACTOR_HANDLE_ACTOR_ID, &[actor_id_byte; 16]);
+    payload.extend(proto_bytes_field(
+        ACTOR_HANDLE_CREATION_JOB_ID,
+        &[job_id_byte; 4],
+    ));
+    payload
+}
+
+/// 嵌套消息的字段号：`owner_address = 3`、`actor_creation_task_function_descriptor =
+/// 6`、`name = 10`、`labels = 15`（`src/ray/protobuf/core_worker.proto:34-75`）。
+const ACTOR_HANDLE_OWNER_ADDRESS: u32 = 3;
+const ACTOR_HANDLE_FUNCTION_DESCRIPTOR: u32 = 6;
+const ACTOR_HANDLE_NAME: u32 = 10;
+const ACTOR_HANDLE_LABELS: u32 = 15;
+
+/// `rpc::FunctionDescriptor` 的 `python_function_descriptor` 字段
+/// （`src/ray/protobuf/common.proto:158-164`）。
+const FUNCTION_DESCRIPTOR_PYTHON: u32 = 2;
+
+/// `map<string, string> labels` entry 的 `value` 字段
+/// （`src/ray/protobuf/core_worker.proto:73-75`）。
+const LABELS_ENTRY_VALUE: u32 = 2;
+
+/// 断言载荷被 `from_serialized` 拒掉，且错误文本含指定的每一段。
+fn assert_payload_rejected(label: &str, payload: &[u8], expected: &[&str]) {
+    match ActorHandle::from_serialized(payload) {
+        Err(RayError::Ffi(message)) => {
+            for word in expected {
+                assert!(
+                    message.contains(word),
+                    "{} 的错误里没有「{}」: {}",
+                    label,
+                    word,
+                    message
+                );
+            }
+            println!("  {} → Ffi({})", label, message);
+        }
+        Err(other) => panic!("{} 返回了别的错误变体: {}", label, other),
+        Ok(handle) => panic!("{} 被收下了，得到 {} 字节 id", label, handle.id().len()),
+    }
+}
+
+/// handle 载荷的校验：畸形、字段长度不对、缺字段、嵌套消息与字符串内容损坏、
+/// 长度合法但 nil、手写的合法载荷。除了全 `0x00`、全 `0xff` 与对照三条，其余都在
+/// 载荷校验处被拒（不需要运行时）；那三条过了载荷校验，会真的登记，需要集群运行时。
+fn actor_handle_payload_checks() {
+    println!("\n--- 载荷校验（rpc.ActorHandle 的两个 id 字段）---");
+    // 0x5a 是字段 11、wire type 2，长度前缀 90 超出剩下的 62 字节。
+    assert_payload_rejected(
+        "from_serialized(64 字节 0x5a)",
+        &[0x5au8; 64],
+        &["well-formed", "90"],
+    );
+    // 字段 1 `actor_id` 只有 3 字节：登记阶段会命中 ActorID::FromBinary 的 RAY_CHECK。
+    assert_payload_rejected(
+        "from_serialized(actor_id 3 字节)",
+        &proto_bytes_field(ACTOR_HANDLE_ACTOR_ID, &[1, 2, 3]),
+        &["actor_id", "3 bytes", "16 bytes"],
+    );
+    // 字段 4 `creation_job_id` 只有 3 字节：第一次调用会命中 JobID::FromBinary 的
+    // RAY_CHECK，所以这条只能在 from_serialized 断言。
+    let mut short_job_id = proto_bytes_field(ACTOR_HANDLE_ACTOR_ID, &[0x11; 16]);
+    short_job_id.extend(proto_bytes_field(ACTOR_HANDLE_CREATION_JOB_ID, &[1, 2, 3]));
+    assert_payload_rejected(
+        "from_serialized(actor_id 16 字节 + creation_job_id 3 字节)",
+        &short_job_id,
+        &["creation_job_id", "3 bytes", "4 bytes"],
+    );
+    // 缺字段 4：上游接受，但 nil job id 让 actor 的 worker 在 job id 检查处终止，
+    // 所以这条只能在 from_serialized 断言。
+    assert_payload_rejected(
+        "from_serialized(只有 actor_id 16 字节)",
+        &proto_bytes_field(ACTOR_HANDLE_ACTOR_ID, &[0x11; 16]),
+        &["no creation_job_id field"],
+    );
+    // 缺字段 1：上游把它登记成 nil actor。
+    assert_payload_rejected(
+        "from_serialized(只有 creation_job_id 4 字节)",
+        &proto_bytes_field(ACTOR_HANDLE_CREATION_JOB_ID, &[0x22; 4]),
+        &["no actor_id field"],
+    );
+    // 长度都合法、内容全 0：不属于任何 actor，由登记后的检查拒掉。
+    assert_payload_rejected(
+        "from_serialized(actor_id 16 个 0x00 + creation_job_id 4 个 0x00)",
+        &well_formed_handle_payload(0x00, 0x00),
+        &["all 0x00", "no actor has"],
+    );
+    // 长度都合法、内容全 0xff：就是 nil id，同样被登记后的检查拒掉。
+    assert_payload_rejected(
+        "from_serialized(actor_id 16 个 0xff + creation_job_id 4 个 0x00)",
+        &well_formed_handle_payload(0xff, 0x00),
+        &["all 0xff", "the nil id"],
+    );
+    // 字段号超出 32 位的 key：上游把 tag 读成 uint32，`0x10000000a`（5 字节编码）
+    // 会被截成 `actor_id`（字段 1），随后的 3 字节覆盖前面的合法值。这种 key 必须在
+    // 这里就被拒掉，否则集群下会在登记阶段终止进程。
+    let mut overflowing_key = well_formed_handle_payload(0x11, 0x22);
+    overflowing_key.extend_from_slice(&[0x8a, 0x80, 0x80, 0x80, 0x10, 0x03, 1, 2, 3]);
+    assert_payload_rejected(
+        "from_serialized(5 字节 key，值超过 32 位，随后 3 字节)",
+        &overflowing_key,
+        &["field key", "32 bits"],
+    );
+    // 非最短编码的长度前缀：protobuf 自己的序列化不会产生这种编码，长度 16 用 4 个字节
+    // 表示（`0x90 0x80 0x80 0x00`）。
+    let mut non_minimal_length = vec![0x0au8];
+    non_minimal_length.extend_from_slice(&[0x90, 0x80, 0x80, 0x00]);
+    non_minimal_length.extend_from_slice(&[0x11u8; 16]);
+    non_minimal_length.extend(proto_bytes_field(ACTOR_HANDLE_CREATION_JOB_ID, &[0x22; 4]));
+    assert_payload_rejected(
+        "from_serialized(长度前缀 4 字节，非最短编码)",
+        &non_minimal_length,
+        &["length prefix", "not minimally encoded"],
+    );
+    // 嵌套消息与 `string` 字段的内容：上游的 `ParseFromString` 在第一条损坏的嵌套消息
+    // 或非法 UTF-8 的 `string` 处中止，登记进去的是中止之前写入的字段。下面几条都在
+    // 中间放损坏内容、末尾再放一个 16 字节的 `actor_id`：只看最后一次出现的长度会放行，
+    // 上游登记的却是前面那个 3 字节值，登记阶段在 `id.h:435` 终止进程。
+    let bypass = |broken: Vec<u8>| {
+        let mut payload = proto_bytes_field(ACTOR_HANDLE_ACTOR_ID, &[1, 2, 3]);
+        payload.extend(broken);
+        payload.extend(proto_bytes_field(ACTOR_HANDLE_ACTOR_ID, &[0x11; 16]));
+        payload.extend(proto_bytes_field(ACTOR_HANDLE_CREATION_JOB_ID, &[0x22; 4]));
+        payload
+    };
+    assert_payload_rejected(
+        "from_serialized(3 字节 actor_id + 损坏 owner_address + 16 字节 actor_id)",
+        &bypass(proto_bytes_field(ACTOR_HANDLE_OWNER_ADDRESS, &[0xff])),
+        &["owner_address", "truncated"],
+    );
+    assert_payload_rejected(
+        "from_serialized(3 字节 actor_id + 损坏 FunctionDescriptor + 16 字节 actor_id)",
+        &bypass(proto_bytes_field(ACTOR_HANDLE_FUNCTION_DESCRIPTOR, &[0xff])),
+        // 冒号紧跟字段名，才能与下面那条「子消息里损坏」的路径区分开。
+        &["actor_creation_task_function_descriptor: ", "truncated"],
+    );
+    assert_payload_rejected(
+        "from_serialized(3 字节 actor_id + 损坏 PythonFunctionDescriptor + 16 字节 actor_id)",
+        &bypass(proto_bytes_field(
+            ACTOR_HANDLE_FUNCTION_DESCRIPTOR,
+            &proto_bytes_field(FUNCTION_DESCRIPTOR_PYTHON, &[0xff]),
+        )),
+        &["python_function_descriptor: ", "truncated"],
+    );
+    assert_payload_rejected(
+        "from_serialized(3 字节 actor_id + 损坏 labels entry + 16 字节 actor_id)",
+        &bypass(proto_bytes_field(ACTOR_HANDLE_LABELS, &[0xff])),
+        &["labels: ", "truncated"],
+    );
+    assert_payload_rejected(
+        "from_serialized(3 字节 actor_id + 非 UTF-8 的 labels entry value + 16 字节 actor_id)",
+        &bypass(proto_bytes_field(
+            ACTOR_HANDLE_LABELS,
+            &proto_bytes_field(LABELS_ENTRY_VALUE, &[0xff]),
+        )),
+        &["labels.value", "UTF-8"],
+    );
+    assert_payload_rejected(
+        "from_serialized(3 字节 actor_id + 非 UTF-8 的 name + 16 字节 actor_id)",
+        &bypass(proto_bytes_field(ACTOR_HANDLE_NAME, &[0xff])),
+        &["name", "UTF-8"],
+    );
+    // 剥离型：每个字段只出现一次，损坏的 owner_address 让上游读不到后面的
+    // `creation_job_id`，登记的 handle 带着 nil job id。
+    let mut stripped_job_id = proto_bytes_field(ACTOR_HANDLE_ACTOR_ID, &[0x11; 16]);
+    stripped_job_id.extend(proto_bytes_field(ACTOR_HANDLE_OWNER_ADDRESS, &[0xff]));
+    stripped_job_id.extend(proto_bytes_field(ACTOR_HANDLE_CREATION_JOB_ID, &[0x22; 4]));
+    assert_payload_rejected(
+        "from_serialized(16 字节 actor_id + 损坏 owner_address + creation_job_id)",
+        &stripped_job_id,
+        &["owner_address", "truncated"],
+    );
+    // 对照：同样结构、非 nil 的载荷能登记，说明上面几条拒的是长度、编码、嵌套内容
+    // 与 nil，结构良好的载荷本身不在拒绝之列。
+    match ActorHandle::from_serialized(&well_formed_handle_payload(0x11, 0x22)) {
+        Ok(handle) => println!(
+            "  对照 from_serialized(actor_id 16 个 0x11 + creation_job_id 4 个 0x22) → Ok({} 字节 id)",
+            handle.id().len()
+        ),
+        Err(error) => panic!("结构良好的载荷被拒了: {}", error),
+    }
+    println!("  进程存活：以上载荷要么在进 Ray 之前被拒，要么在登记之后被拒；最后一条对照成功登记");
+}
+
+/// actor 名字的边界：空名字与带内部 NUL 的名字都在 C 侧被拒（集群模式里它们会命中
+/// `CoreWorker::GetNamedActorHandle` 的 `RAY_CHECK(!name.empty())`），只有空白字符的
+/// 名字合法、按原样去查。两种模式判定相同，集群与本地各跑一遍。
+fn actor_name_boundary_checks(ray: &Ray) {
+    println!("\n--- actor 名字的边界 ---");
+    for (label, name) in [
+        ("get_actor(\"\", \"\")", ""),
+        ("get_actor(\"a\\0b\", \"\")", "a\0b"),
+    ] {
+        match ray.get_actor(name, "") {
+            Err(RayError::Ffi(message)) => {
+                assert!(
+                    message.contains("empty"),
+                    "{} 的错误里没有说明名字为空: {}",
+                    label,
+                    message
+                );
+                println!("  {} → Ffi({})", label, message);
+            }
+            Err(other) => panic!("{} 返回了别的错误变体: {}", label, other),
+            Ok(found) => panic!("{} 返回了 Ok({} 个结果)", label, found.is_some()),
+        }
+    }
+    match ray.get_actor(" ", "") {
+        Ok(None) => {
+            println!("  get_actor(\" \", \"\") → Ok(None)（只有空白字符的名字合法、不 trim）")
+        }
+        Ok(Some(handle)) => panic!(
+            "get_actor(\" \") 找到了 {} 字节 id，这个名字没有注册过",
+            handle.id().len()
+        ),
+        Err(error) => panic!("get_actor(\" \") 报错: {}", error),
+    }
+    println!("  进程存活：空名字在进 Ray 之前被拒");
 }
 
 /// 本地模式 init 时配的 namespace，第 1 项的断言要拿它对比。
@@ -740,24 +1011,9 @@ async fn handle_handoff_check(ray: &Ray) {
         by_raw_id
     );
 
-    // 畸形字节：上游会把它登记成 nil actor，那种 handle 的调用永远不就绪、
-    // serialize() 还能给它一个空 handle 继续传播，所以 C 侧看到 nil 就报错。
-    match ActorHandle::from_serialized(&[0x5au8; 64]) {
-        Err(RayError::Ffi(message)) => {
-            assert!(
-                message.contains("nil actor"),
-                "畸形 handle 的错误文本没有说明登记结果是 nil actor: {}",
-                message
-            );
-            println!("  from_serialized(64 字节 0x5a) → Ffi({})", message);
-        }
-        Err(other) => panic!("畸形 handle 返回了别的错误变体: {}", other),
-        Ok(dead) => panic!(
-            "畸形 handle 被收下了，得到 {} 字节 id（全 0xff: {}）",
-            dead.id().len(),
-            dead.id().iter().all(|byte| *byte == 0xff)
-        ),
-    }
+    // 载荷校验：畸形字节、两个 id 字段的长度不对、缺字段、长度合法但 nil，
+    // 以及结构良好的载荷能登记。
+    actor_handle_payload_checks();
 }
 
 /// 7. 本地模式：这四条查询/等待、两个 handle 接口、kill_actor、cancel、
@@ -857,14 +1113,37 @@ async fn local_mode_rejections(ray: &Ray) {
         Err(other) => panic!("本地模式 serialize 返回了别的错误变体: {}", other),
         Ok(bytes) => panic!("本地模式 serialize 返回了 {} 字节", bytes.len()),
     }
+    // 载荷畸形的：载荷校验在本地模式判定之前，错误文本里没有 local mode。
     match ActorHandle::from_serialized(&[1u8, 2, 3]) {
+        Err(RayError::Ffi(message)) => {
+            assert!(
+                message.contains("well-formed") && !message.contains("local mode"),
+                "畸形载荷的错误应该说明载荷本身有问题: {}",
+                message
+            );
+            println!(
+                "  ActorHandle::from_serialized(畸形载荷) → Ffi({})",
+                message
+            );
+        }
+        Err(other) => panic!("本地模式 from_serialized 返回了别的错误变体: {}", other),
+        Ok(handle) => panic!(
+            "本地模式 from_serialized 收下了畸形载荷，返回 {} 字节 id",
+            handle.id().len()
+        ),
+    }
+    // 结构良好的：载荷过了校验，本地模式那条报错才出现。
+    match ActorHandle::from_serialized(&well_formed_handle_payload(0x11, 0x22)) {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains("local mode"),
                 "from_serialized 的错误没有说明本地模式: {}",
                 message
             );
-            println!("  ActorHandle::from_serialized → Ffi({})", message);
+            println!(
+                "  ActorHandle::from_serialized(结构良好的载荷) → Ffi({})",
+                message
+            );
         }
         Err(other) => panic!("本地模式 from_serialized 返回了别的错误变体: {}", other),
         Ok(handle) => panic!(
@@ -964,6 +1243,8 @@ async fn local_mode_rejections(ray: &Ray) {
         after_py_create
     );
     println!("  进程存活：以上被拒的调用都是提交侧的报错，没有 abort");
+
+    actor_name_boundary_checks(ray);
 }
 
 #[tokio::main]
@@ -985,12 +1266,14 @@ async fn main() {
         placement_group_flow(&ray).await;
         placement_group_rejections(&ray);
         actor_kill_id_width_c_abi();
+        actor_name_boundary_checks(&ray);
     } else {
         println!("\n--- 2、3. placement group 流程与非法输入 ---");
         println!("  本地模式跳过：三个查询在本地模式没有 GCS accessor，C 侧直接报错；");
         println!("  第 7 项会实际跑这四条报错。");
         println!("  第 3b 项（C ABI 传 3 字节 actor id）也跳过：它的承重性来自集群模式下");
         println!("  修复前会终止进程；本地模式那条报错由第 7 项的 kill_actor 覆盖。");
+        println!("  第 3 项的 actor 名字边界与第 7 项跑同一组断言。");
     }
     exit_actor_check(&ray, cluster).await;
     exit_from_task_check(&ray, cluster).await;

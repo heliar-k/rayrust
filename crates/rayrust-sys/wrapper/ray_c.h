@@ -344,17 +344,79 @@ ray_bytes_t ray_actor_handle_serialize(const char *actor_id_data, size_t actor_i
 
 /// Register an actor handle from its serialized bytes and return its binary
 /// actor id (16 bytes).
-/// Empty input is rejected without touching Ray. Upstream
-/// `ActorHandle(serialized)` discards the `ParseFromString` result
-/// (`src/ray/core_worker/actor_handle.cc:66`, `:135`), so bytes that are not a
-/// valid protobuf register as the nil actor and come back as 16 bytes of 0xff.
-/// Such bytes are rejected here as well, and so are 16 bytes of 0x00: a real
-/// actor id is a hash and never either pattern. What a nil handle does instead is
-/// why: its calls are submitted but never become ready (`get` waits out its
+/// Empty input is rejected without touching Ray.
+///
+/// The bytes must be a well-formed `rpc::ActorHandle` protobuf
+/// (`src/ray/protobuf/core_worker.proto:27-79`) whose `actor_id` (field 1) is
+/// exactly 16 bytes and whose `creation_job_id` (field 4) is exactly 4 bytes.
+/// The wheel ships no `core_worker.pb.h`, so the payload is walked here over the
+/// protobuf wire format against the Ray 2.51.1 schema: nested messages
+/// (`owner_address`, `actor_creation_task_function_descriptor`, the `labels`
+/// entries) are validated recursively and proto3 `string` fields by their UTF-8
+/// content, while unknown fields — and fields whose wire type does not match the
+/// schema — are skipped by their wire type, the way upstream treats them. A
+/// field that appears more than once counts by its last occurrence, as protobuf
+/// does.
+/// The nested and string validation is what keeps the two lengths reliable:
+/// upstream's `ParseFromString` stops at the first damaged nested message or
+/// invalid `string`, `CreateInnerActorHandleFromString` discards that result
+/// (`src/ray/core_worker/actor_handle.cc:66`), and the fields written before the
+/// stop are what gets registered. A three-byte `actor_id` followed by a damaged
+/// `owner_address` and then a 16-byte `actor_id` therefore registers the
+/// three-byte one and ends the process at `id.h:435`; a `creation_job_id` behind
+/// damaged content is never written and the handle registers with a nil job id.
+/// Both are rejected here. The recursion follows the schema tree, which is three
+/// levels deep (`rpc.ActorHandle` → `rpc.FunctionDescriptor` →
+/// `rpc.PythonFunctionDescriptor`); a walk that goes past eight levels is rejected
+/// as malformed, so no crafted payload can drive it deeper.
+/// Field keys and length prefixes must be minimally encoded and must fit in 32
+/// bits. Upstream reads tags as `uint32` and length prefixes as `int32`: a
+/// five-byte key above 32 bits is truncated into a different field
+/// (`0x10000000a` becomes `actor_id`, and a short payload there ends the
+/// process), a key longer than five bytes or a length at or above 2^31 makes its
+/// `ParseFromString` fail, and a length varint longer than five bytes fails as
+/// well. Non-minimal encodings within five bytes are accepted upstream and
+/// rejected here. Protobuf's own serialization produces none of these, so
+/// rejecting them cannot refuse a handle `serialize()` handed out.
+///
+/// The table above mirrors Ray 2.51.1. A release that adds fields needs nothing
+/// (both sides treat them as unknown), while one that *changes* an existing
+/// field's type would need the table updated, or damaged content of the new type
+/// would be skipped again.
+/// The two lengths are checked here because upstream reads them as fixed-size
+/// ids and RAY_CHECKs the size, which `RAY_CATCH` cannot catch: `actor_id` at
+/// registration (`ActorManager::RegisterActorHandle`,
+/// `src/ray/core_worker/actor_manager.cc:33` → `ActorID::FromBinary`,
+/// `src/ray/common/id.h:430-441`) and `creation_job_id` on the first call
+/// (`CoreWorker::SubmitActorTask`, `src/ray/core_worker/core_worker.cc:2374` →
+/// `JobID::FromBinary`, `JobID::kLength` at `src/ray/common/id.h:105`). A
+/// payload without `creation_job_id` is accepted by upstream, and its nil job id
+/// ends the actor's worker at `WorkerContext::SetCurrentTask`
+/// (`src/ray/core_worker/context.cc:295`) on the first call.
+///
+/// Bit for bit, a payload that upstream would register with a broken handle is
+/// rejected here: `ParseFromString` discards its result, so valid fields followed
+/// by damaged bytes used to register fine, while this walk reports them as
+/// malformed. The walk is stricter than upstream in exactly these encodings: wire
+/// types 3/4/6/7, and field keys or length prefixes that are not minimally
+/// encoded or exceed 32 bits. Protobuf's own serialization produces none of them,
+/// so rejecting them cannot refuse a handle `serialize()` handed out.
+///
+/// The payload check runs before the runtime and local-mode checks: a payload
+/// error is reported in both modes, and only a well-formed payload reaches the
+/// local-mode error below.
+///
+/// The payload check only guarantees the lengths. Upstream reads `actor_id` with
+/// `ActorID::FromBinary`, which rejects an empty or wrong-sized input and keeps
+/// 16 bytes as they are: 16 bytes of 0xff are the nil id, and 16 bytes of 0x00
+/// belong to no actor (a real id is a hash). Both are rejected here after
+/// registration, because such a handle has no clear failure in the caller's
+/// hands: its calls are submitted but never become ready (`get` waits out its
 /// deadline), and `serialize()` hands the registered protobuf back — the same
 /// length as the bytes that were registered, with protobuf re-serialization free
 /// to rewrite a length prefix — or an error when re-serializing produces nothing,
 /// so a bad handle would keep spreading.
+///
 /// Local mode returns an error: `DeserializeAndRegisterActorHandle` reads
 /// `CoreWorkerProcess::GetCoreWorker()`, whose `EnsureInitialized` calls
 /// `QuickExit()` (`_Exit(1)`, `src/ray/util/process.cc`) because local mode never
@@ -459,7 +521,18 @@ bool ray_is_local_mode(void);
 ray_bytes_t ray_get_namespace(void);
 
 /// Get a named actor by name.
-/// `name` is the actor name. `namespace` can be NULL for current namespace.
+/// `name` is the actor name: a null pointer and an empty string are both rejected
+/// in both modes, and the check runs before the mode decision, so local mode
+/// reports the error where it used to answer `Ok(None)`. The empty name reaches
+/// `CoreWorker::GetNamedActorHandle`, whose first statement is
+/// `RAY_CHECK(!name.empty())` (`src/ray/core_worker/core_worker.cc:2594`), and
+/// that RAY_CHECK terminates the process. A name with an interior NUL byte reads
+/// as an empty C string on the Rust side, so it is rejected the same way (#27).
+/// A name of only whitespace characters is legal and is not trimmed.
+/// `namespace` can be NULL or an empty string for the current namespace: with an
+/// empty namespace `NativeTaskSubmitter::GetActor` falls back to the job config's
+/// namespace (`cpp/src/ray/runtime/task/native_task_submitter.cc:181-186`), and
+/// only the name is RAY_CHECKed.
 /// Returns a ray_bytes_t containing the binary actor ID, or data=NULL if not found.
 ray_bytes_t ray_get_actor(const char *name, const char *ray_namespace);
 

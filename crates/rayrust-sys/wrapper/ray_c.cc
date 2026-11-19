@@ -391,6 +391,12 @@ static constexpr size_t kPlacementGroupIdLength = 18;
 /// `ActorID::FromBinary` 对非空且长度不符的输入 RAY_CHECK。
 static constexpr size_t kActorIdLength = 16;
 
+/// `ray::JobID` 的长度：`JobID::kLength` 是 4（src/ray/common/id.h:105）。
+/// `JobID::FromBinary` 同样 RAY_CHECK 长度；`rpc::ActorHandle` 的
+/// `creation_job_id`（字段 4）在第一次调用时按它解码，所以载荷校验按它检查。
+/// 字段缺省时解码成 nil job id，调用会在 actor 侧终止 worker（见下面的载荷校验注释）。
+static constexpr size_t kJobIdLength = 4;
+
 /// group id 的共同前置检查：非空且正好 18 字节。
 static int check_placement_group_id(const char *group_id_data, size_t group_id_len) {
     if (!group_id_data || group_id_len == 0) {
@@ -1414,6 +1420,452 @@ ray_bytes_t ray_actor_handle_serialize(const char *actor_id_data, size_t actor_i
     return ray_bytes_t{nullptr, 0};
 }
 
+// ─── rpc::ActorHandle 载荷校验 ──────────────────────────────────
+//
+// `ray_actor_handle_deserialize` 收下的字节是一段 `rpc::ActorHandle` protobuf
+// （src/ray/protobuf/core_worker.proto:27-79）。wheel 只带 `ray/api/*` 头文件，没有
+// `core_worker.pb.h`（#19），所以这里按 protobuf 的 wire format 自己走一遍：已知字段
+// 按 schema 校验内容（嵌套消息递归进去，proto3 的 `string` 校验 UTF-8），未知字段与
+// wire type 与 schema 不符的字段按 wire type 跳过。
+//
+// 两个字段在上游都按固定尺寸读成 id，长度不对就 RAY_CHECK 终止进程：
+// - 字段 1 `actor_id`：登记阶段 `ActorManager::RegisterActorHandle`
+//   （src/ray/core_worker/actor_manager.cc:33）调 `ActorHandle::GetActorID`
+//   （src/ray/core_worker/actor_handle.h:64）→ `ActorID::FromBinary`，要求 16 字节
+//   （src/ray/common/id.h:124-142、:430-441）。
+// - 字段 4 `creation_job_id`：第一次 `actor_call` 走 `CoreWorker::SubmitActorTask`
+//   （src/ray/core_worker/core_worker.cc:2374）→ `ActorHandle::CreationJobID`
+//   （actor_handle.h:72）→ `JobID::FromBinary`，要求 4 字节（src/ray/common/id.h:105）。
+//   字段缺省时 `FromBinary("")` 给出 nil job id：任务带着 nil job id 发到 actor，
+//   `WorkerContext::SetCurrentTask` 的 `RAY_CHECK(current_job_id_ == task_spec.JobId())`
+//   （src/ray/core_worker/context.cc:295）终止 actor 的 worker 进程，调用方收到
+//   `ActorError`（实测：一个进程建 detached actor 并写出载荷，另一个进程删掉字段 4 后
+//   登记并调用，actor worker 在 `:295` 终止，调用立即失败）。actor id 不属于任何
+//   actor 时则是另一种后果：订阅永远收不到 ALIVE，调用留在队列里到超时。
+//
+// 上游把 `ParseFromString` 的返回值丢弃了（src/ray/core_worker/actor_handle.cc:66），
+// 被中止的解析还把已经写入的字段留在 `inner` 里，长度问题只能在进 SDK 之前发现。
+// 所以只量顶层的长度不够：先放一个短的 `actor_id`，再用一段损坏的嵌套消息或非法
+// UTF-8 的 `string` 让上游的解析在那里中止，登记的 `actor_id` 仍然是那个短值，登记
+// 阶段照样在 `id.h:435` 终止进程；排在损坏字段之后的 `creation_job_id` 同样读不到，
+// 登记出 nil job id 的 handle。这两类载荷由下面的递归校验拒掉。
+
+/// `rpc::ActorHandle` 的字段号：`actor_id = 1`、`creation_job_id = 4`
+/// （src/ray/protobuf/core_worker.proto:29、:39）。
+static constexpr uint64_t kActorHandleActorIdField = 1;
+static constexpr uint64_t kActorHandleCreationJobIdField = 4;
+
+/// protobuf 的长度前缀是 int32（上游 `ReadVarintSizeAsInt` 的界限）。
+static constexpr uint64_t kPayloadMaxLengthVarint = 0x7fffffff;
+
+/// 允许的最深嵌套层数。真实载荷最多三层（`rpc.ActorHandle` →
+/// `actor_creation_task_function_descriptor` → `python_function_descriptor`），更深
+/// 的消息都是构造出来的。每层至少占两个字节，总长度因此仍受输入长度约束。
+static constexpr size_t kPayloadMaxNestingDepth = 8;
+
+/// varint 的读取结果。
+enum class VarintResult { kOk, kTruncated, kTooLong, kNotMinimal, kAboveLimit };
+
+/// 字段内容的校验方式。
+enum class PayloadFieldKind {
+    /// 定长 id 或任意字节：只看长度，内容交给上游。
+    kBytes,
+    /// proto3 的 `string`：内容必须是合法 UTF-8，上游的解析器同样校验。
+    kString,
+    /// 嵌套消息：内容按子 schema 递归校验。
+    kMessage,
+    /// varint 编码的标量：只看 varint 是否完整，取值不校验（proto3 不校验枚举值）。
+    kVarint,
+};
+
+struct PayloadSchema;
+
+/// schema 的一个字段：`number` 是 protobuf 字段号，`kind` 决定内容怎么校验，
+/// `message` 指向嵌套消息的 schema（只有 `kMessage` 用它）。
+struct PayloadField {
+    uint64_t number;
+    const char *name;
+    PayloadFieldKind kind;
+    const PayloadSchema *message;
+};
+
+/// 一条消息的字段表。wire type 由 `kind` 决定：`kVarint` 是 0，其余三种是 2。
+struct PayloadSchema {
+    const PayloadField *fields;
+    size_t field_count;
+};
+
+/// 从字段数组造 schema，字段数由数组长度推出。
+template <size_t N>
+static constexpr PayloadSchema payload_schema(const PayloadField (&fields)[N]) {
+    return PayloadSchema{fields, N};
+}
+
+// 字段表逐条抄自 Ray 2.51.1 的 proto：`rpc.ActorHandle` 在
+// src/ray/protobuf/core_worker.proto:27-79，`rpc.Address` 与三个函数描述符在
+// src/ray/protobuf/common.proto:126-164。
+
+static const PayloadField kJavaFunctionDescriptorFields[] = {
+    {1, "class_name", PayloadFieldKind::kString, nullptr},
+    {2, "function_name", PayloadFieldKind::kString, nullptr},
+    {3, "signature", PayloadFieldKind::kString, nullptr},
+};
+static const PayloadSchema kJavaFunctionDescriptorSchema =
+    payload_schema(kJavaFunctionDescriptorFields);
+
+static const PayloadField kPythonFunctionDescriptorFields[] = {
+    {1, "module_name", PayloadFieldKind::kString, nullptr},
+    {2, "class_name", PayloadFieldKind::kString, nullptr},
+    {3, "function_name", PayloadFieldKind::kString, nullptr},
+    {4, "function_hash", PayloadFieldKind::kString, nullptr},
+};
+static const PayloadSchema kPythonFunctionDescriptorSchema =
+    payload_schema(kPythonFunctionDescriptorFields);
+
+static const PayloadField kCppFunctionDescriptorFields[] = {
+    {1, "function_name", PayloadFieldKind::kString, nullptr},
+    {2, "caller", PayloadFieldKind::kString, nullptr},
+    {3, "class_name", PayloadFieldKind::kString, nullptr},
+};
+static const PayloadSchema kCppFunctionDescriptorSchema =
+    payload_schema(kCppFunctionDescriptorFields);
+
+static const PayloadField kFunctionDescriptorFields[] = {
+    {1, "java_function_descriptor", PayloadFieldKind::kMessage,
+     &kJavaFunctionDescriptorSchema},
+    {2, "python_function_descriptor", PayloadFieldKind::kMessage,
+     &kPythonFunctionDescriptorSchema},
+    {3, "cpp_function_descriptor", PayloadFieldKind::kMessage,
+     &kCppFunctionDescriptorSchema},
+};
+static const PayloadSchema kFunctionDescriptorSchema =
+    payload_schema(kFunctionDescriptorFields);
+
+static const PayloadField kAddressFields[] = {
+    {1, "node_id", PayloadFieldKind::kBytes, nullptr},
+    {2, "ip_address", PayloadFieldKind::kString, nullptr},
+    {3, "port", PayloadFieldKind::kVarint, nullptr},
+    {4, "worker_id", PayloadFieldKind::kBytes, nullptr},
+};
+static const PayloadSchema kAddressSchema = payload_schema(kAddressFields);
+
+/// `map<string, string> labels`（core_worker.proto:73-75）的每个 entry 都是一条
+/// 这样的子消息。
+static const PayloadField kActorHandleLabelsEntryFields[] = {
+    {1, "key", PayloadFieldKind::kString, nullptr},
+    {2, "value", PayloadFieldKind::kString, nullptr},
+};
+static const PayloadSchema kActorHandleLabelsEntrySchema =
+    payload_schema(kActorHandleLabelsEntryFields);
+
+static const PayloadField kActorHandleFields[] = {
+    {1, "actor_id", PayloadFieldKind::kBytes, nullptr},
+    {2, "owner_id", PayloadFieldKind::kBytes, nullptr},
+    {3, "owner_address", PayloadFieldKind::kMessage, &kAddressSchema},
+    {4, "creation_job_id", PayloadFieldKind::kBytes, nullptr},
+    {5, "actor_language", PayloadFieldKind::kVarint, nullptr},
+    {6, "actor_creation_task_function_descriptor", PayloadFieldKind::kMessage,
+     &kFunctionDescriptorSchema},
+    {7, "actor_cursor", PayloadFieldKind::kBytes, nullptr},
+    {8, "extension_data", PayloadFieldKind::kBytes, nullptr},
+    {9, "max_task_retries", PayloadFieldKind::kVarint, nullptr},
+    {10, "name", PayloadFieldKind::kString, nullptr},
+    {11, "ray_namespace", PayloadFieldKind::kString, nullptr},
+    {12, "allow_out_of_order_execution", PayloadFieldKind::kVarint, nullptr},
+    {13, "max_pending_calls", PayloadFieldKind::kVarint, nullptr},
+    {14, "enable_task_events", PayloadFieldKind::kVarint, nullptr},
+    {15, "labels", PayloadFieldKind::kMessage, &kActorHandleLabelsEntrySchema},
+    {16, "enable_tensor_transport", PayloadFieldKind::kVarint, nullptr},
+    {17, "is_detached", PayloadFieldKind::kVarint, nullptr},
+};
+static const PayloadSchema kActorHandlePayloadSchema = payload_schema(kActorHandleFields);
+
+/// 顶层两个定长 id 字段的最后一次出现（protobuf 合并同一字段时取最后一次）。
+struct ActorHandleIdFields {
+    bool has_actor_id = false;
+    size_t actor_id_len = 0;
+    bool has_creation_job_id = false;
+    size_t creation_job_id_len = 0;
+};
+
+/// 从 `payload[pos]` 起读一个 protobuf varint，`end` 是本条消息的末尾。`limit` 是
+/// 允许的最大值，`require_minimal` 要求最短编码。失败时 `pos` 已经前移，调用方
+/// 只用来报错。
+static VarintResult read_varint(const std::string &payload, size_t end, size_t &pos,
+                               uint64_t limit, bool require_minimal, uint64_t &value) {
+    size_t start = pos;
+    uint64_t result = 0;
+    size_t bytes = 0;
+    bool complete = false;
+    for (int shift = 0; shift <= 63; shift += 7) {
+        if (pos >= end) return VarintResult::kTruncated;
+        unsigned char byte = static_cast<unsigned char>(payload[pos]);
+        ++pos;
+        ++bytes;
+        result |= static_cast<uint64_t>(byte & 0x7f) << shift;
+        if ((byte & 0x80) == 0) {
+            complete = true;
+            break;
+        }
+    }
+    if (!complete) return VarintResult::kTooLong;
+    if (require_minimal) {
+        size_t minimal = 1;
+        for (uint64_t rest = result >> 7; rest != 0; rest >>= 7) ++minimal;
+        if (bytes != minimal) {
+            pos = start;
+            return VarintResult::kNotMinimal;
+        }
+    }
+    if (result > limit) {
+        pos = start;
+        return VarintResult::kAboveLimit;
+    }
+    value = result;
+    return VarintResult::kOk;
+}
+
+/// `read_varint` 失败的共同说法。
+static std::string varint_failure(VarintResult result, const std::string &subject,
+                                  size_t offset) {
+    const std::string at = subject + " at offset " + std::to_string(offset);
+    switch (result) {
+        case VarintResult::kTruncated:
+            return at + " is truncated";
+        case VarintResult::kTooLong:
+            return at + " is longer than 10 bytes";
+        case VarintResult::kNotMinimal:
+            return at + " is not minimally encoded";
+        case VarintResult::kAboveLimit:
+            return at + " does not fit in 32 bits";
+        case VarintResult::kOk:
+            break;
+    }
+    return at + " is malformed";
+}
+
+/// proto3 的 `string` 内容校验：拒绝过长编码、代理区间（U+D800-U+DFFF）与超过
+/// U+10FFFF 的码位，与上游 `ParseFromString` 的校验一致。
+static bool is_valid_utf8(const char *data, size_t len) {
+    size_t i = 0;
+    while (i < len) {
+        unsigned char lead = static_cast<unsigned char>(data[i]);
+        if (lead < 0x80) {
+            ++i;
+            continue;
+        }
+        size_t extra = 0;
+        uint32_t code_point = 0;
+        if ((lead & 0xe0) == 0xc0) {
+            extra = 1;
+            code_point = lead & 0x1f;
+        } else if ((lead & 0xf0) == 0xe0) {
+            extra = 2;
+            code_point = lead & 0x0f;
+        } else if ((lead & 0xf8) == 0xf0) {
+            extra = 3;
+            code_point = lead & 0x07;
+        } else {
+            return false;
+        }
+        if (len - i - 1 < extra) return false;
+        for (size_t k = 1; k <= extra; ++k) {
+            unsigned char next = static_cast<unsigned char>(data[i + k]);
+            if ((next & 0xc0) != 0x80) return false;
+            code_point = (code_point << 6) | (next & 0x3f);
+        }
+        if (extra == 1 && code_point < 0x80) return false;
+        if (extra == 2 && code_point < 0x800) return false;
+        if (extra == 3 && code_point < 0x10000) return false;
+        if (code_point > 0x10ffff) return false;
+        if (code_point >= 0xd800 && code_point <= 0xdfff) return false;
+        i += extra + 1;
+    }
+    return true;
+}
+
+/// 载荷校验的错误说法：统一的前缀，`where` 指出嵌套在哪条子消息里（顶层为空串）。
+static void set_payload_error(const std::string &where, const std::string &detail) {
+    set_last_error(("the serialized actor handle is not a well-formed rpc.ActorHandle "
+                    "protobuf: " +
+                    where + detail)
+                       .c_str());
+}
+
+/// 按 `schema` 校验 `payload[pos, end)` 里的一条消息，嵌套消息递归进来。
+/// `path` 是出错时指路的字段路径，顶层为空串；`ids` 只在顶层非空，用来记两个 id
+/// 字段的最后一次出现。
+static int check_payload_message(const std::string &payload, size_t &pos, size_t end,
+                                 const PayloadSchema &schema, const std::string &path,
+                                 size_t depth, ActorHandleIdFields *ids) {
+    if (depth > kPayloadMaxNestingDepth) {
+        set_payload_error(std::string(), path + " nests deeper than " +
+                                              std::to_string(kPayloadMaxNestingDepth) +
+                                              " levels");
+        return -1;
+    }
+    const std::string where = path.empty() ? std::string() : path + ": ";
+    while (pos < end) {
+        size_t key_offset = pos;
+        uint64_t key = 0;
+        VarintResult key_result = read_varint(payload, end, pos, UINT32_MAX, true, key);
+        if (key_result != VarintResult::kOk) {
+            set_payload_error(where, varint_failure(key_result, "the field key", key_offset));
+            return -1;
+        }
+        uint64_t field_number = key >> 3;
+        uint64_t wire_type = key & 0x7;
+        if (field_number == 0) {
+            set_payload_error(where,
+                              "field number 0 at offset " + std::to_string(key_offset));
+            return -1;
+        }
+        const PayloadField *field = nullptr;
+        for (size_t i = 0; i < schema.field_count; ++i) {
+            if (schema.fields[i].number == field_number) {
+                field = &schema.fields[i];
+                break;
+            }
+        }
+        // wire type 与 schema 不符的字段，protobuf 当作未知字段跳过，这里同样跳过。
+        if (field != nullptr) {
+            uint64_t schema_wire_type = field->kind == PayloadFieldKind::kVarint ? 0 : 2;
+            if (wire_type != schema_wire_type) field = nullptr;
+        }
+        if (wire_type == 0) {
+            uint64_t ignored = 0;
+            size_t value_offset = pos;
+            VarintResult value_result =
+                read_varint(payload, end, pos, UINT64_MAX, false, ignored);
+            if (value_result != VarintResult::kOk) {
+                set_payload_error(where, varint_failure(value_result,
+                    "the varint value of field " + std::to_string(field_number),
+                    value_offset));
+                return -1;
+            }
+            continue;
+        }
+        if (wire_type == 1) {
+            if (end - pos < 8) {
+                set_payload_error(where, "the 8-byte value of field " +
+                    std::to_string(field_number) + " at offset " + std::to_string(pos) +
+                    " is truncated, " + std::to_string(end - pos) + " bytes remain");
+                return -1;
+            }
+            pos += 8;
+            continue;
+        }
+        if (wire_type == 5) {
+            if (end - pos < 4) {
+                set_payload_error(where, "the 4-byte value of field " +
+                    std::to_string(field_number) + " at offset " + std::to_string(pos) +
+                    " is truncated, " + std::to_string(end - pos) + " bytes remain");
+                return -1;
+            }
+            pos += 4;
+            continue;
+        }
+        if (wire_type != 2) {
+            set_payload_error(where, "wire type " + std::to_string(wire_type) +
+                " of field " + std::to_string(field_number) + " at offset " +
+                std::to_string(key_offset) + " is not a protobuf wire type");
+            return -1;
+        }
+        size_t length_offset = pos;
+        uint64_t length = 0;
+        VarintResult length_result =
+            read_varint(payload, end, pos, kPayloadMaxLengthVarint, true, length);
+        if (length_result != VarintResult::kOk) {
+            set_payload_error(where, varint_failure(length_result,
+                "the length prefix of field " + std::to_string(field_number),
+                length_offset));
+            return -1;
+        }
+        if (length > end - pos) {
+            set_payload_error(where, "the length prefix of field " +
+                std::to_string(field_number) + " at offset " +
+                std::to_string(length_offset) + " says " + std::to_string(length) +
+                " bytes, only " + std::to_string(end - pos) + " remain");
+            return -1;
+        }
+        size_t content_end = pos + static_cast<size_t>(length);
+        if (field != nullptr) {
+            const std::string label =
+                path.empty() ? std::string(field->name) : path + "." + field->name;
+            if (field->kind == PayloadFieldKind::kString) {
+                if (!is_valid_utf8(payload.data() + pos, static_cast<size_t>(length))) {
+                    set_payload_error(std::string(), label + " is not valid UTF-8");
+                    return -1;
+                }
+            } else if (field->kind == PayloadFieldKind::kMessage) {
+                if (check_payload_message(payload, pos, content_end, *field->message, label,
+                                          depth + 1, nullptr) != 0) {
+                    return -1;
+                }
+            } else if (ids != nullptr) {
+                if (field_number == kActorHandleActorIdField) {
+                    ids->has_actor_id = true;
+                    ids->actor_id_len = static_cast<size_t>(length);
+                } else if (field_number == kActorHandleCreationJobIdField) {
+                    ids->has_creation_job_id = true;
+                    ids->creation_job_id_len = static_cast<size_t>(length);
+                }
+            }
+        }
+        pos = content_end;
+    }
+    return 0;
+}
+
+/// 校验载荷是结构良好的 `rpc::ActorHandle`，并且 `actor_id` 正好 16 字节、
+/// `creation_job_id` 正好 4 字节。失败返回 -1 并设置错误：载荷畸形、缺字段、
+/// 字段长度不对三种情形各有一句自己的说法。
+///
+/// 字段 key 与长度前缀要求最短编码且能放进 32 位：上游把 tag 读成 `uint32`，
+/// 5 字节但超过 32 位的 key 会被截断成别的字段（实测 `0x10000000a` 被当成
+/// `actor_id`，短内容直接终止进程），长度前缀超过 32 位时上游的 `ParseFromString`
+/// 失败。这两类编码不会出现在 protobuf 自己的序列化结果里，直接当载荷畸形拒掉。
+static int check_actor_handle_payload(const char *data, size_t len) {
+    const std::string payload(data, len);
+    ActorHandleIdFields ids;
+    size_t pos = 0;
+    if (check_payload_message(payload, pos, payload.size(), kActorHandlePayloadSchema,
+                              std::string(), 0, &ids) != 0) {
+        return -1;
+    }
+    if (!ids.has_actor_id) {
+        set_last_error(
+            "the serialized actor handle has no actor_id field (protobuf field 1 of "
+            "rpc.ActorHandle): a handle without it registers as the nil actor");
+        return -1;
+    }
+    if (ids.actor_id_len != kActorIdLength) {
+        set_last_error(("the actor_id field of the serialized actor handle is " +
+                        std::to_string(ids.actor_id_len) + " bytes, must be " +
+                        std::to_string(kActorIdLength) +
+                        " bytes (the Ray 2.51.1 ActorID length)")
+                           .c_str());
+        return -1;
+    }
+    if (!ids.has_creation_job_id) {
+        set_last_error(
+            "the serialized actor handle has no creation_job_id field (protobuf field 4 "
+            "of rpc.ActorHandle): the nil job id it decodes to ends the actor's worker at "
+            "the job id check in WorkerContext::SetCurrentTask "
+            "(src/ray/core_worker/context.cc:295) on the first call");
+        return -1;
+    }
+    if (ids.creation_job_id_len != kJobIdLength) {
+        set_last_error(("the creation_job_id field of the serialized actor handle is " +
+                        std::to_string(ids.creation_job_id_len) + " bytes, must be " +
+                        std::to_string(kJobIdLength) +
+                        " bytes (the Ray 2.51.1 JobID length)")
+                           .c_str());
+        return -1;
+    }
+    return 0;
+}
+
 ray_bytes_t ray_actor_handle_deserialize(const char *serialized_data,
                                          size_t serialized_len) {
     ray_clear_error();
@@ -1422,6 +1874,9 @@ ray_bytes_t ray_actor_handle_deserialize(const char *serialized_data,
         return ray_bytes_t{nullptr, 0};
     }
     try {
+        if (check_actor_handle_payload(serialized_data, serialized_len) != 0) {
+            return ray_bytes_t{nullptr, 0};
+        }
         auto runtime = ray::internal::GetRayRuntime();
         if (!runtime) {
             set_last_error("Ray runtime is not initialized");
@@ -1446,23 +1901,29 @@ ray_bytes_t ray_actor_handle_deserialize(const char *serialized_data,
                     .c_str());
             return ray_bytes_t{nullptr, 0};
         }
-        // 畸形字节：上游丢弃 `ParseFromString` 的结果（actor_handle.cc:66、:135），
-        // 空 actor id 变成 `ActorID::Nil()` 并登记成 nil actor。合法 actor id 是
-        // `ActorID::Of(job_id, task_id, counter)` 算出来的散列，不会是全 0xff（
-        // `BaseID()` 的填充）也不会是全 0x00。拒掉它，因为 nil handle 在调用方手里
-        // 没有任何明确的失败：调用提交成功但永远不就绪（`get` 到期才报超时），
-        // `serialize()` 把登记的那份 protobuf 再交出来（长度与登记时相同，protobuf
-        // 重新序列化可能改写长度前缀；重新序列化结果为空时报错），坏 handle 因此会一路传播。
+        // 载荷校验只保证长度：`actor_id` 的 16 个字节原样登记，内容为空时上游给出
+        // `ActorID::Nil()`（全 0xff），全 0x00 则是另一串没有 actor 会有的字节。合法
+        // actor id 是 `ActorID::Of(job_id, task_id, counter)` 算出来的散列，不会是这
+        // 两种。两种都拒掉，因为这种 handle 在调用方手里没有任何明确的失败：调用提交
+        // 成功但永远不就绪（`get` 到期才报超时），`serialize()` 把登记的那份 protobuf
+        // 再交出来（长度与登记时相同，protobuf 重新序列化可能改写长度前缀；重新序列化
+        // 结果为空时报错），坏 handle 因此会一路传播。
         bool all_ff = true;
         bool all_zero = true;
         for (char byte : actor_id) {
             if (byte != static_cast<char>(0xff)) all_ff = false;
             if (byte != '\0') all_zero = false;
         }
-        if (all_ff || all_zero) {
+        if (all_ff) {
             set_last_error(
-                "the bytes are not a valid actor handle: they register as the nil actor, "
-                "which never answers a call");
+                "the bytes register an actor id of 16 bytes that is all 0xff, the nil id: "
+                "such a handle never answers a call");
+            return ray_bytes_t{nullptr, 0};
+        }
+        if (all_zero) {
+            set_last_error(
+                "the bytes register an actor id of 16 bytes that is all 0x00: no actor has "
+                "that id, and a handle for it never answers a call");
             return ray_bytes_t{nullptr, 0};
         }
         return dup_bytes(actor_id);
@@ -1696,6 +2157,24 @@ ray_bytes_t ray_get_namespace(void) {
 
 ray_bytes_t ray_get_actor(const char *name, const char *ray_namespace) {
     ray_clear_error();
+    if (!name) {
+        set_last_error("actor name is null");
+        return ray_bytes_t{nullptr, 0};
+    }
+    if (name[0] == '\0') {
+        // 集群模式把名字交给 `CoreWorker::GetNamedActorHandle`，它的第一句是
+        // `RAY_CHECK(!name.empty())`（src/ray/core_worker/core_worker.cc:2594），
+        // RAY_CATCH 拦不住，进程直接终止。带内部 NUL 的名字经 Rust 侧的 to_cstring
+        // 也变成空串（#27），所以两者都在这里拒掉。只有空白字符的名字是合法的，
+        // 不做 trim。
+        set_last_error(
+            "actor name is empty: the core worker requires a non-empty name "
+            "(RAY_CHECK(!name.empty()) at src/ray/core_worker/core_worker.cc:2594) and "
+            "stops the process on the empty one. A name with an interior NUL byte "
+            "arrives here as an empty C string as well (#27); a whitespace-only name "
+            "is not trimmed and is looked up as it is");
+        return ray_bytes_t{nullptr, 0};
+    }
     try {
         auto runtime = ray::internal::GetRayRuntime();
         if (!runtime) {
@@ -1703,6 +2182,9 @@ ray_bytes_t ray_get_actor(const char *name, const char *ray_namespace) {
             return ray_bytes_t{nullptr, 0};
         }
 
+        // namespace 允许为空：`NativeTaskSubmitter::GetActor` 在 namespace 为空时用
+        // job config 的 namespace 顶替（cpp/src/ray/runtime/task/native_task_submitter.cc:181-186），
+        // 空指针按空串处理（现状就是 `ray_namespace ? ... : ""`）。
         std::string ns_str = ray_namespace ? std::string(ray_namespace) : "";
         std::string actor_id = runtime->GetActorId(std::string(name), ns_str);
         if (actor_id.empty()) return ray_bytes_t{nullptr, 0};
