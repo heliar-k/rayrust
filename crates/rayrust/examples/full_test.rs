@@ -145,7 +145,8 @@ async fn main() {
     match ray.placement_group_create("test_pg", bundles_json, 0) {
         Ok(pg_id) => {
             println!("PlacementGroup created ✓ (id_len={})", pg_id.len());
-            ray.placement_group_remove(&pg_id);
+            ray.placement_group_remove(&pg_id)
+                .expect("placement_group_remove failed");
             println!("PlacementGroup removed ✓");
         }
         Err(e) => println!("PlacementGroup create failed: {}", e),

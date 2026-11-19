@@ -124,7 +124,7 @@ extern "C" {
         bundles_json: *const c_char,
         strategy: c_int,
     ) -> RayBytes;
-    pub fn ray_placement_group_remove(group_id_data: *const c_char, group_id_len: usize);
+    pub fn ray_placement_group_remove(group_id_data: *const c_char, group_id_len: usize) -> c_int;
     pub fn ray_placement_group_wait_ready(
         group_id_data: *const c_char,
         group_id_len: usize,

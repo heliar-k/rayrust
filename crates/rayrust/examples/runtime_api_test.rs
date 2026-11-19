@@ -26,6 +26,13 @@
 //!    `ActorID::FromBinary` 的 RAY_CHECK 终止进程）；随后第 4 项合法 actor 的
 //!    `kill_actor` 照旧工作。最后是 actor 名字的边界：空名字与带内部 NUL 的名字都报
 //!    `Ffi`（错误说明名字为空、进程存活），只有空白字符的名字合法且按原样查（`Ok(None)`）。
+//! 3c. `placement_group_remove` 的守卫与错误出口（两个模式都跑）：3 字节与空字节 id →
+//!    `Ffi` 且消息说明 18 字节（crate 内侧先拒，进不了 FFI）；从 C ABI 直接调同一入口传
+//!    3 字节与 `(NULL, 0)`/`(NULL, 18)` → 返回 -1、`last_error()` 说明原因、进程存活（C 入口
+//!    那道检查与空指针检查）；未知的 18 字节 id → `Ok(())`；同一个组 remove 两次 → 两次都
+//!    `Ok(())`。两项在不同模式下的分量不同：集群模式第一次走到「从登记表移除」、第二次走
+//!    「已经移除的分支」；本地模式没有查询能看那个 map，这一段只证明建组返回的 18 字节 id
+//!    能连续走两次 erase 而不报错。
 //! 4. `exit_actor`：`max_restarts=2` 的 actor，方法里调用 `exit_actor()`。
 //!    集群模式：`exit()` 的对象用 `get_timeout` 取（退出路径不写结果，无界 `get` 会永远等），
 //!    随后同一 handle 的普通方法必须失败；再用一个独立 actor 做正向对照——
@@ -63,6 +70,12 @@
 //!   （同文件 414-427），`by_name` 因此报错。
 //! - `wait_ready` 的时限原样交给 GCS：正数与 `0` 等这次 GCS 查询（`0` 在已就绪的组上
 //!   实测仍然返回 `true`），负数的截止时间已经过期，即使组已就绪也返回 `false`。
+//! - 移除一个不存在或已经移除的组两个模式都返回 `Ok(())`：GCS 在表里找不到这个 id 时
+//!   直接回 `Status::OK()`（`src/ray/gcs/gcs_placement_group_manager.cc:404-408`），本地
+//!   模式则是在 map 上 `erase`（`local_mode_task_submitter.cc:182-184`），未知 id 不命中
+//!   任何表项。`CoreWorker::RemovePlacementGroup` 的 status 只在 GCS RPC 本身失败时非
+//!   OK（超时被改写成带 id 的文本，`core_worker.cc:2293-2306`），也就是第 3c 项的
+//!   `Ffi` 出口在正常集群上不会被这两种输入触发。
 //! - actor id 是 16 字节（12 个唯一字节 + 4 字节 JobID，`src/ray/common/id.h:124-142`），
 //!   不是 ObjectID 的 28 字节。
 //! - 工人进程里 `ActorHandle::from_serialized` 与裸 id 的调用都返回
@@ -216,9 +229,9 @@ const PG_STATE_CREATED: i32 = 2;
 /// `PlacementGroupState::REMOVED`。
 const PG_STATE_REMOVED: i32 = 3;
 
-/// 移除之后巡检的轮数与间隔：GCS 把表项改成 REMOVED 是异步的。
-const REMOVE_POLL_TIMES: usize = 50;
-const REMOVE_POLL_INTERVAL_MS: u64 = 200;
+/// 移除走的是同步 RPC：`SyncRemovePlacementGroup` 在 GCS 把状态改成 `REMOVED`、
+/// 删掉名字映射、写回表项之后才回复，所以调用返回后的第一次查询就该看到结果，
+/// 不需要轮询。
 
 /// 重启对照的轮数与间隔：`kill_actor(no_restart = false)` 之后等状态回到初值。
 const RESTART_POLL_TIMES: usize = 15;
@@ -595,46 +608,45 @@ async fn placement_group_flow(ray: &Ray) {
         listed.strategy
     );
 
-    ray.placement_group_remove(&group_id);
-    println!("  placement_group_remove → 已提交");
+    ray.placement_group_remove(&group_id)
+        .expect("placement_group_remove");
+    println!("  placement_group_remove → 已返回");
 
-    // 移除是异步的。GCS 把表项改成 REMOVED 之后就留着这一行，名字映射同时消失，
-    // 所以这里等的是「state 变成 REMOVED + by_name 报错」，不是等表项消失。
-    let mut observed: Option<(i32, i32, String)> = None;
-    for attempt in 0..REMOVE_POLL_TIMES {
-        let by_id = ray.placement_group_by_id(&group_id);
-        let by_name = ray.placement_group_by_name(&name);
-        let all = ray.placement_groups().unwrap_or_default();
-        let listed_state = all
-            .iter()
-            .find(|group| group.id == group_id)
-            .map(|group| group.state);
-        if let (Ok(current), Err(by_name_error), Some(listed_state)) =
-            (by_id, by_name, listed_state)
-        {
-            if current.state == PG_STATE_REMOVED && listed_state == PG_STATE_REMOVED {
-                observed = Some((current.state, listed_state, by_name_error.to_string()));
-                println!(
-                    "  移除后第 {} 次巡检：by_id state {} (REMOVED)、placement_groups() 里 state {}、by_name 报错",
-                    attempt, current.state, listed_state
-                );
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(REMOVE_POLL_INTERVAL_MS)).await;
-    }
-    let (by_id_state, listed_state, by_name_error) = observed.unwrap_or_else(|| {
-        panic!(
-            "移除之后 {} 次巡检（{}ms 一次）没有看到 state 变成 REMOVED 或 by_name 报错",
-            REMOVE_POLL_TIMES, REMOVE_POLL_INTERVAL_MS
-        )
-    });
-    assert_eq!(by_id_state, PG_STATE_REMOVED);
-    assert_eq!(listed_state, PG_STATE_REMOVED);
+    // 移除是同步 RPC：GCS 先删名字映射、把状态改成 REMOVED、写回表项，回调里才回复，
+    // 所以 remove 返回后的第一次查询就该看到 state 3 与 by_name 报错。表项不会消失
+    // （GCS 保留历史行），晚一些才归还的是节点上预留的那份资源。
+    let by_id = ray
+        .placement_group_by_id(&group_id)
+        .expect("remove 返回后 by_id");
+    let by_name = ray.placement_group_by_name(&name);
+    let all = ray.placement_groups().expect("placement_groups");
+    let listed_state = all
+        .iter()
+        .find(|group| group.id == group_id)
+        .map(|group| group.state);
+    assert_eq!(
+        by_id.state, PG_STATE_REMOVED,
+        "remove 返回后 by_id 的 state 是 {}",
+        by_id.state
+    );
+    assert_eq!(
+        listed_state,
+        Some(PG_STATE_REMOVED),
+        "remove 返回后 placement_groups() 里这一行的 state 是 {:?}",
+        listed_state
+    );
+    let by_name_error = match by_name {
+        Err(error) => error.to_string(),
+        Ok(found) => panic!("remove 返回后 by_name 还查到了 state {}", found.state),
+    };
     assert!(
         by_name_error.contains(&name),
         "by_name 的错误里没有查询用的名字: {}",
         by_name_error
+    );
+    println!(
+        "  remove 返回后第一次查询：by_id state {} (REMOVED)、placement_groups() 里 state {:?}、by_name 报错",
+        by_id.state, listed_state
     );
     println!("  by_name 的错误文本带上名字: {}", by_name_error);
 }
@@ -711,6 +723,102 @@ fn placement_group_rejections(ray: &Ray) {
         Err(other) => panic!("未知名字返回了别的错误变体: {}", other),
         Ok(group) => panic!("未知名字成功返回了 {:?}", group),
     }
+}
+
+/// 3c. `placement_group_remove` 的宽度检查与错误出口，两个模式都跑。
+fn placement_group_remove_checks(ray: &Ray) {
+    println!("\n--- 3c. placement_group_remove 的守卫与错误出口 ---");
+
+    // a) 宽度不对：两道检查里 crate 内侧那一道先返回，进不了 FFI。
+    for (label, id) in [("3 字节", vec![0u8; 3]), ("空字节", Vec::new())] {
+        match ray.placement_group_remove(&id) {
+            Err(RayError::Ffi(message)) => {
+                assert!(
+                    message.contains("18 bytes") && message.contains(&id.len().to_string()),
+                    "{} 的 remove 错误里没有说明长度: {}",
+                    label,
+                    message
+                );
+                println!("  remove({}) → Ffi({})", label, message);
+            }
+            Err(other) => panic!("remove({}) 返回了别的错误变体: {}", label, other),
+            Ok(()) => panic!("remove({}) 成功了", label),
+        }
+    }
+
+    // b) C 入口上还有一道同样的宽度检查，crate 内侧那道挡在它前面，所以这一道只能从
+    //    C ABI 直接调。返回值是 -1，消息在 last_error()。
+    rayrust::sys::clear_error();
+    let short = [0u8; 3];
+    let ret = unsafe {
+        rayrust::sys::ray_placement_group_remove(short.as_ptr() as *const _, short.len())
+    };
+    assert_eq!(ret, -1, "C 入口对 3 字节 id 返回了 {}", ret);
+    match rayrust::sys::last_error() {
+        Some(message) => {
+            assert!(
+                message.contains("placement group id must be 18 bytes"),
+                "C 入口的错误文本不对: {}",
+                message
+            );
+            println!("  C ABI remove(3 字节) → {}，last_error: {}", ret, message);
+        }
+        None => panic!("C 入口接受了 3 字节 id"),
+    }
+
+    // b2) 空指针：入口先看指针再看长度，不能拿它构造 std::string。
+    for len in [0usize, 18] {
+        rayrust::sys::clear_error();
+        let ret = unsafe { rayrust::sys::ray_placement_group_remove(std::ptr::null(), len) };
+        assert_eq!(ret, -1, "C 入口对 (NULL, {}) 返回了 {}", len, ret);
+        match rayrust::sys::last_error() {
+            Some(message) => assert!(
+                message.contains("empty"),
+                "C 入口对 (NULL, {}) 的错误文本不对: {}",
+                len,
+                message
+            ),
+            None => panic!("C 入口接受了 (NULL, {})", len),
+        }
+        println!(
+            "  C ABI remove(NULL, {}) → -1，last_error 说明 id 为空",
+            len
+        );
+    }
+    println!("  进程存活：两道宽度检查与空指针检查都在进 Ray 之前返回");
+
+    // c) 未知的 18 字节 id：两个模式都返回 Ok(())，上游按「已经移除」处理。
+    let unknown = [0x5au8; 18];
+    match ray.placement_group_remove(&unknown) {
+        Ok(()) => println!(
+            "  remove(未知 18 字节 {}) → Ok(())（GCS 与本地 map 都把它当已经移除）",
+            hex(&unknown)
+        ),
+        Err(error) => panic!("未知 18 字节 id 返回了 {}", error),
+    }
+
+    // d) 同一个组 remove 两次：两次都 Ok(())，进程存活。集群模式下两次走的是不同的上游分支
+    //    （第一次从登记表移除、第二次命中「已经移除」），本地模式下两者都是同一个 map 上的
+    //    erase，且本地没有查询能观察它。
+    let name = format!("rayrust_runtime_api_remove_twice_{}", std::process::id());
+    let group_id = ray
+        .placement_group_create(&name, r#"[{"CPU":0.5}]"#, PG_STRATEGY)
+        .expect("remove_twice: placement_group_create");
+    assert_eq!(group_id.len(), 18, "建组返回了 {} 字节 id", group_id.len());
+    println!(
+        "  建组 {} → {} 字节 id {}",
+        name,
+        group_id.len(),
+        hex(&group_id)
+    );
+    ray.placement_group_remove(&group_id)
+        .expect("第一次 remove");
+    println!("  第一次 remove → Ok(())");
+    match ray.placement_group_remove(&group_id) {
+        Ok(()) => println!("  第二次 remove → Ok(())"),
+        Err(error) => panic!("第二次 remove 返回了 {}", error),
+    }
+    println!("  进程存活：重复移除同一个组没有报错");
 }
 
 /// 3b. actor id 宽度：短 id 只能从 C ABI 传进 `ray_actor_kill`。
@@ -1275,6 +1383,7 @@ async fn main() {
         println!("  修复前会终止进程；本地模式那条报错由第 7 项的 kill_actor 覆盖。");
         println!("  第 3 项的 actor 名字边界与第 7 项跑同一组断言。");
     }
+    placement_group_remove_checks(&ray);
     exit_actor_check(&ray, cluster).await;
     exit_from_task_check(&ray, cluster).await;
     ctor_exit_check(&ray, cluster).await;

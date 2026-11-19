@@ -317,7 +317,8 @@ async fn name_and_placement_group_check(ray: &Ray, cluster: bool) {
 
     // g) 移除组，再把同一个不绑组的任务提交一次：这次它应该能跑完。这一步把
     //「b/c 的不就绪」归因到组本身，而不是任务或调用器有问题。
-    ray.placement_group_remove(&pg_id);
+    ray.placement_group_remove(&pg_id)
+        .expect("remove the placement group after the cancel check");
     println!("  placement group 已 remove，资源归还");
 
     let unbound_after = sleep_for_remote_async_with_options(ray, &queued_opts, TASK_SLEEP_S)
@@ -499,7 +500,8 @@ async fn default_cpu_check(ray: &Ray, cluster: bool) {
     );
 
     // e) 移除组：a) 与 d) 里不就绪的任务都该跑完，不就绪确实来自被占住的 CPU。
-    ray.placement_group_remove(&pg_id);
+    ray.placement_group_remove(&pg_id)
+        .expect("remove the placement group after the Custom resource check");
     println!("  placement group 已 remove，资源归还");
 
     let value = python_task

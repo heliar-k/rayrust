@@ -435,8 +435,35 @@ ray_bytes_t ray_placement_group_create(const char *name,
                                         int strategy);
 
 /// Remove a placement group by ID.
-/// `group_id_data`/`group_id_len` is the binary group ID.
-void ray_placement_group_remove(const char *group_id_data, size_t group_id_len);
+/// `group_id_data`/`group_id_len` must be exactly 18 bytes
+/// (`PlacementGroupID::kLength`); any other length, a null pointer and an empty
+/// length are rejected without touching Ray, because
+/// `PlacementGroupID::FromBinary` RAY_CHECKs the length (`src/ray/common/id.h:435`)
+/// and that check ends the process instead of throwing.
+/// Returns 0 on success, -1 on error with the message in ray_last_error().
+/// An id that names no group, and one that was already removed, both return 0:
+/// upstream treats them as "already removed" and does nothing
+/// (`src/ray/gcs/gcs_placement_group_manager.cc:404-408` answers `Status::OK()`
+/// from the GCS side, `cpp/src/ray/runtime/task/local_mode_task_submitter.cc:182-184`
+/// erases from a map that does not hold the id). Measured in both modes.
+/// A -1 comes from the SDK only when the call itself fails:
+/// `NativeTaskSubmitter::RemovePlacementGroup` turns a non-OK status of
+/// `CoreWorker::RemovePlacementGroup` into `RayException`
+/// (`cpp/src/ray/runtime/task/native_task_submitter.cc:219-226`), and that status is
+/// the GCS RPC result, whose timeout is rewritten into a message carrying the id
+/// (`src/ray/core_worker/core_worker.cc:2293-2306`).
+/// Local mode is not rejected: `LocalModeTaskSubmitter::CreatePlacementGroup` inserts
+/// the group into its own map with `PlacementGroupID::Of(job_id)`
+/// (`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:170-180`) and removes it by
+/// erasing from that map (same file, `:182-184`). Nothing in local mode reads that map
+/// — the three queries throw, `wait_ready` falls back to the interface default, and
+/// tasks and actors drop the group binding — so the erase has no observable effect and
+/// `Ok(())` is the whole result. `wait_ready` is rejected instead because its default
+/// answers `ready` for any id, which is a false answer a caller can see.
+/// The crate wraps this entry in `Ray::placement_group_remove`, which returns
+/// `Result<(), RayError>`: it checks the width a second time before the call and
+/// turns a -1 into an error carrying this message.
+int ray_placement_group_remove(const char *group_id_data, size_t group_id_len);
 
 /// Wait for a placement group to be ready.
 /// `group_id_data`/`group_id_len` must be exactly 18 bytes

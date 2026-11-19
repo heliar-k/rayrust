@@ -376,7 +376,8 @@ async fn bundle_index_range_check(ray: &Ray, cluster: bool) {
     );
 
     if cluster {
-        ray.placement_group_remove(&pg_id);
+        ray.placement_group_remove(&pg_id)
+            .expect("remove the placement group after the raw ABI check");
         println!("  placement group 已 remove；进程存活");
     } else {
         println!("  进程存活（本地模式没有组需要移除）");
@@ -543,7 +544,8 @@ async fn default_bundle_index_not_pinned_check(ray: &Ray, cluster: bool) {
     ray.cancel(long.id(), false, true)
         .expect("cancel the long task with its handle alive");
     println!("  长任务已 cancel");
-    ray.placement_group_remove(&pg_id);
+    ray.placement_group_remove(&pg_id)
+        .expect("remove the placement group after the cancellation");
     println!("  placement group 已 remove");
 
     // f) 正向对照：组没了之后，不绑组的 actor 仍然能建并调通。
@@ -582,7 +584,8 @@ async fn default_bundle_index_not_pinned_check(ray: &Ray, cluster: bool) {
         value,
         started.elapsed()
     );
-    ray.placement_group_remove(&fresh_id);
+    ray.placement_group_remove(&fresh_id)
+        .expect("remove the fresh placement group");
     println!("  新组已 remove");
 }
 
