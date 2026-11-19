@@ -701,9 +701,45 @@ impl Ray {
         placement_group_create_inner(name, bundles_json, strategy)
     }
 
-    /// Remove a placement group by binary ID.
-    pub fn placement_group_remove(&self, group_id: &[u8]) {
-        placement_group_remove_inner(group_id);
+    /// 移除一个 placement group。
+    ///
+    /// `group_id` 是 [`Ray::placement_group_create`] 返回的二进制 id，必须正好 18
+    /// 字节；其他长度（包括空字节）返回 [`RayError::Ffi`]，进程存活。这个宽度在 crate
+    /// 内侧与 C 入口各查一次：`PlacementGroupID::FromBinary` 对非空且长度不符的输入
+    /// `RAY_CHECK` 终止进程（`src/ray/common/id.h:435`），`RAY_CATCH` 抓不到。
+    ///
+    /// 移除一个不存在或已经移除的组返回 `Ok(())`，两个模式实测都如此：上游按「已经
+    /// 移除」处理，什么也不做。集群模式的判断在 GCS（表里没有这个 id 时直接回
+    /// `Status::OK()`，`src/ray/gcs/gcs_placement_group_manager.cc:404-408`），本地模式是
+    /// 自己 map 的 `erase`（`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:182-184`，
+    /// 未知 id 不命中任何表项）。
+    ///
+    /// 本地模式不拒绝这个调用：`CreatePlacementGroup` 把组插进自己的 map
+    /// （`local_mode_task_submitter.cc:170-180`，`PlacementGroupID::Of(job_id)`，18 字节），
+    /// 移除就是从这个 map 里删掉那一项。这个 map 在本地模式下没有读取方——三个查询都抛
+    /// 异常，`wait_ready` 用接口默认实现，任务与 actor 直接丢掉组绑定——所以删除与否在外
+    /// 部看不到，`Ok(())` 是这里全部可观察的结果。`wait_ready` 被拒绝是因为它会报「任何
+    /// id 都已就绪」，那是一个看得见的假答案。
+    ///
+    /// [`RayError::Ffi`] 的另一条来路是上游真的失败：
+    /// `CoreWorker::RemovePlacementGroup` 把 GCS 调用的 status 交回
+    /// （超时被改写成带 id 的文本，`src/ray/core_worker/core_worker.cc:2293-2306`），
+    /// `NativeTaskSubmitter::RemovePlacementGroup` 在 status 非 OK 时抛出 `RayException`
+    /// （`cpp/src/ray/runtime/task/native_task_submitter.cc:219-226`）。实测：把 GCS 挂起
+    /// （`SIGSTOP`）并把 `RAY_gcs_server_request_timeout_seconds` 调到 2 秒，调用返回
+    /// `Ffi`，消息为 `ray_placement_group_remove (<id 的 hex>): There was timeout in removing
+    /// the placement group of id <...>`；直接把 GCS 杀掉则走不到这里，驱动会先在上游
+    /// `rpc_client.h:202-214` 的 `_Exit` 终止。
+    /// C 入口在 runtime 未初始化时也返回 `-1`，但本方法拿 `&self`，拿到 `&self` 就已经
+    /// `connect` 过，所以这条只在 C 调用方与尚未 `ray_init` 的工人进程里出现。
+    ///
+    /// 调用返回时 GCS 的表项已经是 `REMOVED`：`SyncRemovePlacementGroup` 是同步 RPC，
+    /// GCS 先删名字映射、把状态改成 `REMOVED`、写回表项，回调里才回复
+    /// （`src/ray/gcs/gcs_placement_group_manager.cc:411-469`）。表项不会消失（GCS 保留历史
+    /// 行），节点上预留的那份资源晚一些才归还——[`Ray::placement_groups`] 与
+    /// [`Ray::placement_group_by_id`] 的文档写了表项保留这件事。
+    pub fn placement_group_remove(&self, group_id: &[u8]) -> Result<(), RayError> {
+        placement_group_remove_inner(group_id)
     }
 
     /// 等一个 placement group 就绪。
@@ -2061,7 +2097,7 @@ pub(crate) fn actor_handle_from_serialized_inner(bytes: &[u8]) -> Result<ActorHa
 
 /// `PlacementGroupID` 的长度：14 个唯一字节 + 4 字节 JobID
 /// （`src/ray/common/id.h:300-306`）。`PlacementGroupID::FromBinary` 对非空且长度
-/// 不符的输入 RAY_CHECK 终止进程，所以带 id 的两个入口在进 FFI 之前就按它检查。
+/// 不符的输入 RAY_CHECK 终止进程，所以带 id 的三个入口在进 FFI 之前就按它检查。
 const PLACEMENT_GROUP_ID_LEN: usize = 18;
 
 /// 一个 placement group 的查询结果。
@@ -2092,7 +2128,7 @@ pub struct PlacementGroupInfo {
     pub strategy: i32,
 }
 
-/// 带 group id 的两个入口的共同前置检查。
+/// 带 group id 的三个入口的共同前置检查。
 fn check_placement_group_id(group_id: &[u8]) -> Result<(), RayError> {
     if group_id.len() != PLACEMENT_GROUP_ID_LEN {
         return Err(RayError::Ffi(format!(
@@ -2195,14 +2231,22 @@ pub(crate) fn placement_group_create_inner(
     Ok(guard.as_slice().to_vec())
 }
 
-/// Remove a placement group by binary ID.
-pub(crate) fn placement_group_remove_inner(group_id: &[u8]) {
-    unsafe {
+/// 移除一个 placement group。
+pub(crate) fn placement_group_remove_inner(group_id: &[u8]) -> Result<(), RayError> {
+    check_placement_group_id(group_id)?;
+    let ret = unsafe {
         rayrust_sys::ray_placement_group_remove(
             group_id.as_ptr() as *const std::os::raw::c_char,
             group_id.len(),
         )
     };
+    if ret != 0 {
+        return Err(ffi_error_detail(
+            "ray_placement_group_remove",
+            hex_encode(group_id),
+        ));
+    }
+    Ok(())
 }
 
 /// 等一个 placement group 就绪。
@@ -2909,6 +2953,42 @@ mod tests {
                 ),
                 other => panic!("{} 字节的 id 返回了 {:?}", len, other),
             }
+        }
+    }
+
+    #[test]
+    fn placement_group_remove_rejects_a_wrong_width_before_the_ffi_boundary() {
+        for len in [0usize, 3, 17, 19] {
+            match placement_group_remove_inner(&vec![0u8; len]) {
+                // 这条文本来自 crate 内侧的检查，没有入口名前缀；进了 FFI 会拿到
+                // C 入口的 `ray_placement_group_remove: ...`。
+                Err(RayError::Ffi(message)) => assert_eq!(
+                    message,
+                    format!("placement group id must be 18 bytes, got {} bytes", len),
+                    "{} 字节的 remove 错误文本不对",
+                    len
+                ),
+                other => panic!("{} 字节的 id 返回了 {:?}", len, other),
+            }
+        }
+    }
+
+    #[test]
+    fn placement_group_remove_reports_the_c_entry_error() {
+        // 单元测试进程不 connect，所以进程里没有 Ray runtime：C 入口在
+        // `GetRayRuntime()` 为空时返回 -1，错误经 Result 报出来，消息由 C 侧写入。
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        match placement_group_remove_inner(&[0u8; 18]) {
+            Err(RayError::Ffi(message)) => assert!(
+                message.contains("ray_placement_group_remove")
+                    && message.contains("Ray runtime is not initialized"),
+                "错误文本没有带上入口名与原因: {}",
+                message
+            ),
+            other => panic!("没有 runtime 时返回了 {:?}", other),
         }
     }
 }

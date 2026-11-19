@@ -1972,16 +1972,29 @@ ray_bytes_t ray_placement_group_create(const char *name,
     }
 }
 
-void ray_placement_group_remove(const char *group_id_data, size_t group_id_len) {
+int ray_placement_group_remove(const char *group_id_data, size_t group_id_len) {
+    ray_clear_error();
+    if (check_placement_group_id(group_id_data, group_id_len) != 0) return -1;
     try {
         auto runtime = ray::internal::GetRayRuntime();
-        if (runtime) {
-            std::string group_id(group_id_data, group_id_len);
-            runtime->RemovePlacementGroup(group_id);
+        if (!runtime) {
+            set_last_error("Ray runtime is not initialized");
+            return -1;
         }
-    } catch (const std::exception &e) {
-        set_last_error_exception(e);
-    }
+        // 本地模式不拒绝这一个：`LocalModeTaskSubmitter::CreatePlacementGroup` 把组插进
+        // 自己的 map（cpp/src/ray/runtime/task/local_mode_task_submitter.cc:170-180，id 是
+        // `PlacementGroupID::Of(job_id)`，18 字节），`RemovePlacementGroup` 就从那个 map 里
+        // `erase`（同文件 :182-184）。这个 map 在本地模式下没有读取方（三个查询都抛异常，
+        // wait_ready 用接口默认实现，任务与 actor 丢掉组绑定），所以删不删外部看不到，
+        // `Ok(())` 是唯一可观察结果。兄弟入口不同：wait_ready 拒绝本地模式是因为接口默认
+        // 实现对任何 id 都答 ready，那是一个看得见的假答案
+        // （cpp/src/ray/runtime/task/task_submitter.h:49-52）；三个查询拒绝是因为 GCS
+        // accessor 在本地模式里是空指针（cpp/src/ray/runtime/abstract_ray_runtime.cc:342-372）。
+        std::string group_id(group_id_data, group_id_len);
+        runtime->RemovePlacementGroup(group_id);
+        return 0;
+    } RAY_CATCH
+    return -1;
 }
 
 /// 把一个组打包成 4 元数组 [id(bin), name(str), state(int), strategy(int)]。
