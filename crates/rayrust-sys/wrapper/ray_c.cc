@@ -1227,6 +1227,25 @@ ray_bytes_t ray_actor_create_python_with_options(const char *module_name,
             set_last_error("Ray runtime is not initialized");
             return ray_bytes_t{nullptr, 0};
         }
+        if (runtime->IsLocalMode()) {
+            // LocalModeTaskSubmitter::Submit 忽略语言与 module，只用函数名建 C++
+            // descriptor（cpp/src/ray/runtime/task/local_mode_task_submitter.cc:39-40），
+            // 任务规格的语言也写成 CPP（同文件 :52-56）。这个入口放进 holder 的函数名是
+            // "__init__"，TaskExecutor 拿它在 C++ FunctionManager 里查，查不到就把
+            // PackError("unknown function: __init__") 的结果当成 actor 状态存起来
+            // （cpp/src/ray/runtime/task/task_executor.cc:44-52、:313-331），既不抛异常也不
+            // 返回错误，调用方只看到 Ok。进程里恰好注册了同名函数时被执行的是那个函数，
+            // Python 类的构造函数仍然没有跑过。本地模式也没有 Python 执行器，且带名字创建
+            // 会把名字写进本地名字表（local_mode_task_submitter.cc:143-152），
+            // ray_get_actor 从同一张表里读回来（同文件 :159-168）交出一个谁都调不到的
+            // handle。因此这个入口在本地模式直接返回错误，不进入 CreateActor。
+            set_last_error(
+                "Python actors cannot be created in local mode: local mode never starts "
+                "a core worker process and has no Python executor, and its task "
+                "submitter builds every task as a C++ descriptor from the function "
+                "name, so the constructor never runs");
+            return ray_bytes_t{nullptr, 0};
+        }
 
         ray::internal::RemoteFunctionHolder holder(
             std::string(module_name), "__init__",

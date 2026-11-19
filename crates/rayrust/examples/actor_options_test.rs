@@ -54,8 +54,10 @@
 //!    的 actor 第一次调用必须很快完成（证明同一条绑定路径在 bundle 空着时不是启动慢）。
 //!    两个 actor 都要显式要 1 个 CPU：不写 `resources` 的 actor 不申请 CPU，占住
 //!    bundle 的长任务挡不住它。
-//! 8. 本地模式：任何带组的 `ActorOptions` → `Err(RayError::Ffi(_))`，消息含
-//!    "local mode"，进程存活；不带组照常建 actor 并调通。
+//! 8. 本地模式：`Ray::actor_create` 带组的 `ActorOptions` → `Err(RayError::Ffi(_))`，
+//!    消息含 "local mode"，进程存活；不带组照常建 actor 并调通。`Ray::actor_create_python`
+//!    在本地模式无论带不带组都报创建被拒（#68），由 `runtime_api_test` 第 7 项断言
+//!    （那里只传名字、不带组；带组的拒绝由同一守卫先于 options 解析生效）。
 //! 9. 只有手写 options JSON 才能到达的 C 侧分支：`bundle_index` 没有组、
 //!    `bundle_index` 不是 JSON 整数、`placement_group_id` 不是 JSON 字符串，三条都是
 //!    `Ffi` + `Generic` 类别 + 进程存活。

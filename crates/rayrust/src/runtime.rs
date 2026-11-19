@@ -516,6 +516,47 @@ impl Ray {
     }
 
     /// Create a Python actor with full creation options.
+    ///
+    /// Pass `&ActorOptions::new()` for defaults (no name, no restarts, etc.).
+    ///
+    /// Cluster mode creates the actor as usual.
+    ///
+    /// Local mode returns [`RayError::Ffi`]. The refusal runs before the options and
+    /// the arguments are looked at, so in local mode this entry rejects every call
+    /// whatever they are. The reason is the local submitter:
+    /// `LocalModeTaskSubmitter::Submit` ignores the language and the module and
+    /// builds every task as a C++ descriptor from the function name alone
+    /// (`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:39-40`), and the
+    /// creation function name this entry sends is `"__init__"`. Without the refusal
+    /// such a task reaches `TaskExecutor`, which finds no C++ function of that name
+    /// and stores `PackError("unknown function: __init__")` as the actor state
+    /// (`task_executor.cc:44-52`, `:313-331`) without raising anything: the caller
+    /// would get `Ok` with a 16-byte id for an actor whose constructor never ran and
+    /// whose Python calls are all refused (see [`Ray::actor_call_python`]), plus a
+    /// name, when one is given, that `LocalModeTaskSubmitter::CreateActor` registers
+    /// (`:143-152`) for [`Ray::get_actor`] to hand back (`:159-168`) (#68). With the
+    /// refusal nothing is submitted and nothing is registered, so after a refused
+    /// call [`Ray::get_actor`] still answers whatever the name held before it, which
+    /// is `Ok(None)` when the name was free.
+    ///
+    /// The refusal covers one more case: a process that registers
+    /// `#[rayrust::remote] fn __init__`. Without it, that Rust function would run in
+    /// place of the Python constructor and its serialized return value would become
+    /// the actor state.
+    ///
+    /// [`ActorOptions`] combinations that [`RayError::Ffi`] rejects before the FFI
+    /// call keep their message: an isolated `bundle_index` reports
+    /// `bundle_index N requires placement_group_id` in local mode too. The option
+    /// diagnostics produced on the C side (a placement group in local mode, a group
+    /// id of the wrong length, a `bundle_index` below -1) do not appear on this entry
+    /// in local mode, because the refusal comes first; [`Ray::actor_create`] keeps
+    /// all of them.
+    ///
+    /// `args` hold msgpack-serialized values. There is no `is_ref` here: constructor
+    /// arguments cannot be passed by reference.
+    ///
+    /// `module` and `class` are read in cluster mode only, because local mode refuses
+    /// the call before the holder is built.
     pub fn actor_create_python(
         &self,
         module: &str,
