@@ -25,6 +25,22 @@ typedef struct {
     size_t len;
 } ray_bytes_t;
 
+/// 一个 actor handle 的语言与创建描述符类型，由 `ray_actor_handle_deserialize` 与
+/// `ray_get_actor` 交给 Rust 侧的登记表。
+///
+/// `language` 是 `rpc.ActorHandle.actor_language`（`src/ray/protobuf/core_worker.proto:42`，
+/// 字段 5）的取值：`PYTHON = 0`、`JAVA = 1`、`CPP = 2`
+/// （`src/ray/protobuf/common.proto:26-30`）。
+/// `creation_descriptor` 是字段 6 里那个 oneof 成员的字段号
+/// （`src/ray/protobuf/common.proto:158-164`）：0 = 没有描述符，java 1、python 2、cpp 3。
+/// 这个类型要一起记下来，因为 Python 调用路径会把 handle 的创建描述符按
+/// `PythonFunctionDescriptor` 读（`cpp/src/ray/runtime/abstract_ray_runtime.cc:202-211`），
+/// 描述符缺席或类型不符时读越界。
+typedef struct {
+    int language;
+    int creation_descriptor;
+} ray_actor_handle_meta_t;
+
 /// Rust 回调返回的哨兵长度（`data` 为空指针），配合 `ray_func_callback_t` 与
 /// `ray_member_callback_t` 使用。真实结果不可能有这么长（`std::malloc` 申请不到
 /// 2^64-1 字节），所以它们不会与合法结果相撞。
@@ -197,6 +213,15 @@ ray_bytes_t ray_task_call_with_options(const char *func_name,
 ///   `GetOwnerAddressOrDie`, which terminates the process. It must also come
 ///   from a Python worker; objects put through this SDK carry no metadata and
 ///   Python rejects them as an argument.
+/// Local mode returns an error instead of submitting when a `#[rayrust::remote]`
+/// function is registered under `function_name`: `LocalModeTaskSubmitter::Submit`
+/// drops the module and the language and resolves the function name in the C++
+/// remote function map
+/// (`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:39-40`), so that Rust
+/// function would run in place of the Python one. A local submission under any
+/// other name — including a method of a `#[rayrust::actor]` type, which registers
+/// in the member function map — is submitted as a C++ task and fails at the C++
+/// function lookup.
 ray_bytes_t ray_task_call_python(const char *module_name,
                                   const char *function_name,
                                   const ray_bytes_t *args,
@@ -266,6 +291,14 @@ ray_bytes_t ray_actor_create_python_with_options(const char *module_name,
 /// bytes (the Ray 2.51.1 ActorID length, `src/ray/common/id.h:124-142`); any
 /// other length is rejected without touching Ray, because `ActorID::FromBinary`
 /// RAY_CHECKs the length (`src/ray/common/id.h:430-441`).
+/// Beyond the length there is no registration check here: the core worker's
+/// `ActorManager::GetActorHandle` terminates the process on an id it holds no
+/// handle for (`src/ray/core_worker/actor_manager.cc:52-59`), and the actor
+/// manager is reachable only through the core worker. The `rayrust` crate keeps
+/// its own registry of the handles it handed out and checks it before calling
+/// this entry, so a driver through that crate never reaches the RAY_CHECK.
+/// The method call this entry builds is a C++ one (hence the language note in
+/// `rayrust`'s `Ray::actor_call`).
 /// `is_ref` is an array of booleans (same length as args). If is_ref[i] is true,
 ///   args[i] is treated as a binary ObjectRef ID (pass by reference).
 ///   Pass NULL to treat all args as values. Any other length is rejected by the
@@ -284,6 +317,18 @@ ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
 /// and the same rejection as ray_actor_call. The width check runs before the
 /// local mode rejection below, so local mode with a short actor id reports the
 /// width error, in the same order as ray_cancel.
+/// As in ray_actor_call there is no registration check here: the core worker's
+/// `ActorManager::GetActorHandle` terminates the process on an unknown id
+/// (`src/ray/core_worker/actor_manager.cc:52-59`) and the actor manager is
+/// reachable only through the core worker. `rayrust`'s `Ray::actor_call_python`
+/// checks its own registry first. That registry also records each handle's
+/// language (`rpc.ActorHandle.actor_language`), which this entry does not look
+/// at either: an id of a C++ actor reaches `AbstractRayRuntime::CallActor`, whose
+/// PYTHON branch reads the creation descriptor as a `PythonFunctionDescriptor`
+/// (`cpp/src/ray/runtime/abstract_ray_runtime.cc:202-211`), and the C++ worker
+/// then ends at `RAY_CHECK(ray_function.GetLanguage() == ray::Language::CPP)`
+/// (`cpp/src/ray/runtime/task/task_executor.cc:145`). `rayrust` refuses a
+/// non-Python id before this entry.
 /// `method_name` is the Python method name (without `self`).
 /// `is_ref[i] = true` means args[i] is an ObjectRef ID (pass by reference).
 ///   Such an id must be exactly 28 bytes, the same requirement and the same
@@ -332,9 +377,10 @@ void ray_actor_kill(const char *actor_id_data, size_t actor_id_len, bool no_rest
 /// `ActorManager::GetActorHandle` RAY_CHECKs an unknown id and terminates the
 /// process (`src/ray/core_worker/actor_manager.cc:52-59`), so the Rust side only
 /// exposes this on handles obtained from creation, `ray_get_actor` or
-/// `ray_actor_handle_deserialize`. Measured: a handle held across a shutdown and
-/// re-init of the runtime aborts the process here, the same way `ray_actor_call`
-/// does for the same stale id.
+/// `ray_actor_handle_deserialize`, and it checks its own registry before calling
+/// this entry: an id the registry does not hold is refused there, and a handle
+/// held across a shutdown and re-init of the runtime reports that refusal
+/// instead of reaching the RAY_CHECK here.
 /// Local mode returns an error: `AbstractRayRuntime::SerializeActorHandle` starts
 /// with `CoreWorkerProcess::GetCoreWorker()`, whose `EnsureInitialized` calls
 /// `QuickExit()` (`_Exit(1)`, `src/ray/util/process.cc`) because local mode never
@@ -421,7 +467,25 @@ ray_bytes_t ray_actor_handle_serialize(const char *actor_id_data, size_t actor_i
 /// `CoreWorkerProcess::GetCoreWorker()`, whose `EnsureInitialized` calls
 /// `QuickExit()` (`_Exit(1)`, `src/ray/util/process.cc`) because local mode never
 /// starts a core worker process.
-ray_bytes_t ray_actor_handle_deserialize(const char *serialized_data, size_t serialized_len);
+///
+/// `out_meta` must be a non-null pointer: a null one is rejected without touching
+/// Ray. Once the payload checks out and the handle is registered, it receives the
+/// handle's language and creation descriptor type. The language comes from
+/// `actor_language` (field 5, `src/ray/protobuf/core_worker.proto:42`):
+/// `PYTHON = 0`, `JAVA = 1`, `CPP = 2` (`src/ray/protobuf/common.proto:26-30`). A
+/// payload without field 5 yields `PYTHON` (0), because proto3 omits fields at
+/// their default value and `PYTHON` is 0 — the same language upstream parses out
+/// of those bytes. The creation descriptor type is the field number of the oneof
+/// member in `actor_creation_task_function_descriptor` (field 6,
+/// `src/ray/protobuf/common.proto:158-164`): 0 when field 6 is absent, 1 java,
+/// 2 python, 3 cpp. Both are handed out because the registry the Rust side keeps
+/// needs them: the language decides which call entry accepts the handle, and the
+/// creation descriptor type decides whether the Python entry may run at all —
+/// that path reads the descriptor as a `PythonFunctionDescriptor`
+/// (`cpp/src/ray/runtime/abstract_ray_runtime.cc:202-211`).
+ray_bytes_t ray_actor_handle_deserialize(const char *serialized_data,
+                                         size_t serialized_len,
+                                         ray_actor_handle_meta_t *out_meta);
 
 // ─── Placement Group ──────────────────────────────────────────
 
@@ -560,8 +624,28 @@ ray_bytes_t ray_get_namespace(void);
 /// empty namespace `NativeTaskSubmitter::GetActor` falls back to the job config's
 /// namespace (`cpp/src/ray/runtime/task/native_task_submitter.cc:181-186`), and
 /// only the name is RAY_CHECKed.
+/// `out_meta` must be a non-null pointer: a null one is rejected without
+/// touching Ray. A found actor writes its language and creation descriptor type
+/// there, and a name that resolves to nothing leaves them alone.
+/// Cluster mode reads both out of the handle's serialized bytes:
+/// `runtime->SerializeActorHandle(actor_id)` returns the `rpc.ActorHandle` of the
+/// handle `GetNamedActorHandle` just registered
+/// (`src/ray/core_worker/actor_manager.cc:68-83`), and `actor_language` (field 5)
+/// carries `PYTHON = 0`, `JAVA = 1`, `CPP = 2`
+/// (`src/ray/protobuf/common.proto:26-30`) while the oneof member inside
+/// `actor_creation_task_function_descriptor` (field 6) carries 1 java, 2 python,
+/// 3 cpp (`src/ray/protobuf/common.proto:158-164`). `GetActorId` itself returns
+/// only the 16-byte id (`cpp/src/ray/runtime/abstract_ray_runtime.cc:255-263`), so
+/// the serialized bytes are the only place those two are available.
+/// Local mode writes `CPP` (2) with the cpp creation descriptor (3) instead: only
+/// a C++ actor can be created there (`ray_actor_create_python_with_options`
+/// refuses local mode) and the local submitter runs the registered Rust functions
+/// (`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:39-40`), building every
+/// task as a C++ descriptor and writing `CPP` as the task language
+/// (same file, `:52-56`).
 /// Returns a ray_bytes_t containing the binary actor ID, or data=NULL if not found.
-ray_bytes_t ray_get_actor(const char *name, const char *ray_namespace);
+ray_bytes_t ray_get_actor(const char *name, const char *ray_namespace,
+                          ray_actor_handle_meta_t *out_meta);
 
 /// Cancel a remote task by object ID.
 /// `id_data` must be exactly 28 bytes (the Ray 2.51.1 ObjectID length); any

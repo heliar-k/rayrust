@@ -15,9 +15,10 @@
 //! 2. placement group 全流程（集群）：建带名字的单 bundle 组（`CPU 0.5`、
 //!    `STRICT_PACK`）→ `wait_ready(10)` 为 `true` → `by_id` 的 id 与建组返回一致、
 //!    name 一致、`state == 2`（CREATED）、`strategy` 与建组时传的一致 → `by_name`
-//!    同上 → `placement_groups()` 里按 id 找到它 → 移除 → 有界重试直到
+//!    同上 → `placement_groups()` 里按 id 找到它 → 移除 → remove 返回后的第一次查询里
 //!    `by_id` 的 `state == 3`（REMOVED）、`by_name` 报错、`placement_groups()` 里
-//!    那一项也是 REMOVED。
+//!    那一项也是 REMOVED（移除是同步 RPC，GCS 先删名字映射、改状态、写回表项，回调里
+//!    才回复）。
 //! 3. 非法与未知（集群）：17 / 19 / 空字节 id → `Ffi` 错误，随后合法调用照常完成；
 //!    未知 18 字节 id → 错误且消息里带 id；未知名字 → 错误且消息里带名字。
 //!    另加一条 C ABI 直接调用：`rayrust::sys::ray_actor_kill` 传 3 字节 actor id →
@@ -103,6 +104,14 @@
 //!   （`0x10000000a` 变成 `actor_id`，随后的短内容在登记阶段终止进程）；超过 5 字节
 //!   的 key、达到 2^31 的长度与超过 5 字节的长度前缀让上游的 `ParseFromString` 失败，
 //!   5 字节以内但非最短编码的 key 与长度上游会接受。C 侧把这些编码都当载荷畸形拒掉。
+//! - 只有字段 1 与 4 的载荷会被登记：字段 5 缺席按 proto3 的默认值算 `PYTHON`，字段 6
+//!   缺席则 handle 里没有创建描述符。这种 handle 的 `actor_call` 报语言不符，
+//!   `actor_call_python` 必须在进 SDK 之前被拒：`AbstractRayRuntime::CallActor` 把创建
+//!   描述符按 `PythonFunctionDescriptor` 读
+//!   （`cpp/src/ray/runtime/abstract_ray_runtime.cc:202-211`，`As` 是 `reinterpret_cast`，
+//!   `src/ray/common/function_descriptor.h:67-70`），字段 6 缺席时描述符是
+//!   `EmptyFunctionDescriptor`，`ModuleName()`/`ClassName()` 读越过对象末尾；实测
+//!   SIGSEGV，`PC` 在 `CallActor()`，退出码 139。第 6 项断言拒掉它并且进程存活。
 //! - 集群 `get_actor("")` 与 `get_actor("a\0b")`（`to_cstring` 把带内部 NUL 的名字
 //!   变成空串，#27）没有守卫时会在 `core_worker.cc:2594` 的 `RAY_CHECK(!name.empty())`
 //!   终止进程，本地模式则返回 `Ok(None)`；现在两种模式都报 `Ffi`。
@@ -306,7 +315,7 @@ fn assert_payload_rejected(label: &str, payload: &[u8], expected: &[&str]) {
 /// handle 载荷的校验：畸形、字段长度不对、缺字段、嵌套消息与字符串内容损坏、
 /// 长度合法但 nil、手写的合法载荷。除了全 `0x00`、全 `0xff` 与对照三条，其余都在
 /// 载荷校验处被拒（不需要运行时）；那三条过了载荷校验，会真的登记，需要集群运行时。
-fn actor_handle_payload_checks() {
+fn actor_handle_payload_checks(ray: &Ray) {
     println!("\n--- 载荷校验（rpc.ActorHandle 的两个 id 字段）---");
     // 0x5a 是字段 11、wire type 2，长度前缀 90 超出剩下的 62 字节。
     assert_payload_rejected(
@@ -436,13 +445,29 @@ fn actor_handle_payload_checks() {
     // 对照：同样结构、非 nil 的载荷能登记，说明上面几条拒的是长度、编码、嵌套内容
     // 与 nil，结构良好的载荷本身不在拒绝之列。
     match ActorHandle::from_serialized(&well_formed_handle_payload(0x11, 0x22)) {
-        Ok(handle) => println!(
-            "  对照 from_serialized(actor_id 16 个 0x11 + creation_job_id 4 个 0x22) → Ok({} 字节 id)",
-            handle.id().len()
-        ),
+        Ok(handle) => {
+            println!(
+                "  对照 from_serialized(actor_id 16 个 0x11 + creation_job_id 4 个 0x22) → Ok({} 字节 id)",
+                handle.id().len()
+            );
+            // 这份载荷没有字段 6，handle 里因此没有创建描述符；Python 入口必须在进 SDK
+            // 之前拒掉（见模块文档）。
+            match ray.actor_call_python(handle.id(), "get", &[], &[]) {
+                Err(RayError::Ffi(message)) => {
+                    assert!(
+                        message.contains("no Python creation descriptor"),
+                        "缺创建描述符的 handle 没有报描述符: {}",
+                        message
+                    );
+                    println!("  对照 handle 的 actor_call_python → Ffi({})", message);
+                }
+                Err(other) => panic!("缺创建描述符的 handle 返回了别的错误变体: {}", other),
+                Ok(_) => panic!("缺创建描述符的 handle 被 Python 入口提交了"),
+            }
+        }
         Err(error) => panic!("结构良好的载荷被拒了: {}", error),
     }
-    println!("  进程存活：以上载荷要么在进 Ray 之前被拒，要么在登记之后被拒；最后一条对照成功登记");
+    println!("  进程存活：以上载荷要么在进 Ray 之前被拒，要么在登记之后被拒；最后一条对照成功登记，它的 Python 入口也在进 SDK 之前被拒");
 }
 
 /// actor 名字的边界：空名字与带内部 NUL 的名字都在 C 侧被拒（集群模式里它们会命中
@@ -1120,8 +1145,8 @@ async fn handle_handoff_check(ray: &Ray) {
     );
 
     // 载荷校验：畸形字节、两个 id 字段的长度不对、缺字段、长度合法但 nil，
-    // 以及结构良好的载荷能登记。
-    actor_handle_payload_checks();
+    // 以及结构良好的载荷能登记、它的 Python 入口因为没有创建描述符被拒。
+    actor_handle_payload_checks(ray);
 }
 
 /// 7. 本地模式：这四条查询/等待、两个 handle 接口、kill_actor、cancel、

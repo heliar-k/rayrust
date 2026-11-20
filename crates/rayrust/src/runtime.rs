@@ -8,6 +8,7 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use rayrust_sys::{self, build_args_array, to_cstring, CBytesGuard, ErrorKind, RayBytes};
 
+use crate::actor_registry::{self, ActorLanguage};
 use crate::error::RayError;
 use crate::object_ref::{check_epoch, ObjectRef};
 use crate::serialize::serialize;
@@ -193,6 +194,9 @@ impl Drop for RayInner {
         // 推进。闸门只覆盖引用计数两个函数，`get`/`put`/`wait` 这些阻塞调用不在
         // 其中（阻塞调用不能让关闭等）。
         crate::object_ref::retract_live_epoch();
+        // 登记表跟着运行时清空：旧运行时的 handle 在新运行时里查不到，几个调用入口
+        // 会因此在进 SDK 之前把它们拒掉。
+        actor_registry::clear();
         shutdown();
         // 登记表已经清空、C++ 侧已经关掉，等着的 `connect` 可以初始化新运行时了。
         LIVE_CHANGED.notify_all();
@@ -490,6 +494,16 @@ impl Ray {
     /// - it must come from a Python worker: objects put through the C++ SDK carry
     ///   no metadata and Python rejects them when they arrive as an argument (see
     ///   [`Ray::put_xlang`], #21).
+    ///
+    /// Local mode returns [`RayError::Ffi`] instead of submitting when `function`
+    /// is also the name a `#[rayrust::remote]` function registered in this
+    /// process: `LocalModeTaskSubmitter::Submit` drops the module and the
+    /// language and resolves the function name in the C++ remote function map
+    /// (`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:39-40`), so that
+    /// Rust function would run in place of the Python one. A local submission
+    /// under any other name — including a method of a `#[rayrust::actor]` type,
+    /// which registers in the member function map — is submitted as a C++ task
+    /// and fails at the C++ function lookup.
     pub fn task_call_python(
         &self,
         module: &str,
@@ -571,7 +585,35 @@ impl Ray {
     ///
     /// `actor_id` must be exactly 16 bytes (the Ray 2.51.1 ActorID length); any
     /// other length returns [`RayError::Ffi`] before submission, with the process
-    /// still alive. `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID
+    /// still alive.
+    ///
+    /// Beyond its length, the id must be a handle this process registered:
+    /// [`Ray::actor_create`], [`Ray::actor_create_python`], [`Ray::get_actor`] or
+    /// [`ActorHandle::from_serialized`]. Any other 16 bytes — garbage, a handle
+    /// left over from a runtime that was shut down, the nil id of 16 `0xff`
+    /// bytes — return [`RayError::Ffi`] naming the id. The reason is the
+    /// core worker: `ActorManager::GetActorHandle` RAY_CHECKs an id it holds no
+    /// handle for (`src/ray/core_worker/actor_manager.cc:52-59`), and a RAY_CHECK
+    /// ends the process, which `RAY_CATCH` cannot catch.
+    ///
+    /// An actor created through the raw C ABI
+    /// (`rayrust::sys::ray_actor_create_with_options`) does not enter that
+    /// registry, so the typed call entries refuse its id as unregistered. In
+    /// cluster mode, take the bytes from `rayrust::sys::ray_actor_handle_serialize`
+    /// and hand them to [`ActorHandle::from_serialized`] to register it here;
+    /// local mode has no such path back, so such an actor can only be called
+    /// through the C ABI.
+    ///
+    /// The call this entry submits is a C++ one, so in cluster mode the handle
+    /// must be a C++ actor. A Python actor returns [`RayError::Ffi`] naming its
+    /// language and pointing at [`Ray::actor_call_python`]; a Java actor returns
+    /// one saying this crate can neither create nor call Java actors. Local mode
+    /// requires a registered handle but skips the language decision: no Python
+    /// actor can be created there ([`Ray::actor_create_python`] refuses local
+    /// mode) and the local submitter runs the registered Rust functions
+    /// (`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:39-40`).
+    ///
+    /// `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID
     /// (pass by reference); such an id must be exactly 28 bytes, and it must be a
     /// reference this process holds and whose owner Ray knows; see
     /// [`Ray::task_call`].
@@ -603,6 +645,13 @@ impl Ray {
     ///
     /// `actor_id` must be exactly 16 bytes; any other length returns
     /// [`RayError::Ffi`] before submission, with the process still alive.
+    ///
+    /// The handle and language requirements are the ones [`Ray::actor_call`]
+    /// documents: a handle this process registered ([`Ray::actor_create`],
+    /// [`Ray::actor_create_python`], [`Ray::get_actor`] or
+    /// [`ActorHandle::from_serialized`]), and in cluster mode a C++ actor. A
+    /// handle from a runtime that is gone is refused before the call reaches the
+    /// core worker, which would end the process on it.
     pub fn actor_call_async(
         &self,
         actor_id: &[u8],
@@ -632,6 +681,29 @@ impl Ray {
     /// [`RayError::Ffi`] before the call reaches the SDK, with the process still
     /// alive. That width check runs before the local mode rejection below, so
     /// local mode with a short actor id reports the width error.
+    ///
+    /// In cluster mode the id must also be a handle this process registered
+    /// ([`Ray::actor_create`], [`Ray::actor_create_python`], [`Ray::get_actor`] or
+    /// [`ActorHandle::from_serialized`]) whose language is Python. An unregistered
+    /// id returns [`RayError::Ffi`] naming it, because the SDK reads the actor's
+    /// module and class from the core worker's actor handle, and that lookup
+    /// RAY_CHECKs an id it holds no handle for
+    /// (`src/ray/core_worker/actor_manager.cc:52-59`). A C++ actor's id is refused
+    /// by the language check too: the SDK would read its creation descriptor as a
+    /// `PythonFunctionDescriptor`
+    /// (`cpp/src/ray/runtime/abstract_ray_runtime.cc:202-211`), and the C++ worker
+    /// it lands on ends at
+    /// `RAY_CHECK(ray_function.GetLanguage() == ray::Language::CPP)`
+    /// (`cpp/src/ray/runtime/task/task_executor.cc:145`). A Java actor's id is
+    /// refused as well: this crate can neither create nor call Java actors.
+    ///
+    /// A Python actor's id is accepted only when its handle carries a Python
+    /// creation descriptor (field 6 of the serialized `rpc.ActorHandle`,
+    /// `src/ray/protobuf/common.proto:158-164`). An id this process registered
+    /// through [`ActorHandle::from_serialized`] with a handle whose descriptor is
+    /// absent or of another type returns [`RayError::Ffi`] before the SDK runs,
+    /// because that path reads the descriptor as a `PythonFunctionDescriptor`
+    /// whatever the handle holds.
     ///
     /// `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID (pass by
     /// reference). Three requirements apply to such an id:
@@ -670,6 +742,12 @@ impl Ray {
     /// 16-byte id. The width check sits at the C entry, which a C caller can reach
     /// with a shorter id.
     ///
+    /// A handle this process did not register — one left over from a runtime that
+    /// was shut down — returns [`RayError::Ffi`] naming the id, in both modes. The
+    /// core worker's `AbstractRayRuntime::KillActor` reads the id as an `ActorID`
+    /// and asks the core worker for it; a cluster core worker that holds no such
+    /// handle cannot report the failure without ending the process.
+    ///
     /// Local mode returns [`RayError::Ffi`]: `AbstractRayRuntime::KillActor`
     /// starts with `CoreWorkerProcess::GetCoreWorker()`, whose
     /// `EnsureInitialized` calls `QuickExit()` (`_Exit(1)`,
@@ -677,6 +755,7 @@ impl Ray {
     /// worker process. A local actor lives in the calling process and ends with
     /// it, so there is nothing to kill.
     pub fn kill_actor(&self, handle: &ActorHandle, no_restart: bool) -> Result<(), RayError> {
+        check_registered_actor("ray_actor_kill", handle.id())?;
         rayrust_sys::clear_error();
         actor_kill_inner(handle.id(), no_restart);
         // The C ABI returns void and reports both the local mode rejection and
@@ -838,7 +917,17 @@ impl Ray {
     /// (`cpp/src/ray/runtime/task/native_task_submitter.cc:181-186`).
     ///
     /// Returns `Ok(Some(handle))` when the name is found and `Ok(None)` when it is
-    /// not.
+    /// not. A found handle joins the actor registry this process keeps, with the
+    /// language and creation descriptor type the core worker recorded for the
+    /// actor (`rpc.ActorHandle.actor_language`, field 5, and the oneof member in
+    /// `actor_creation_task_function_descriptor`, field 6, of
+    /// `src/ray/protobuf/core_worker.proto:27-79`; local mode reports C++ with the
+    /// cpp descriptor), because the core worker hands out only the 16-byte id.
+    /// [`Ray::actor_call`], [`Ray::actor_call_python`], [`Ray::kill_actor`] and
+    /// [`ActorHandle::serialize`] then accept it under the requirements each of
+    /// them documents: an entry whose language differs from the actor's refuses
+    /// it, and [`Ray::actor_call_python`] additionally needs the Python creation
+    /// descriptor.
     ///
     /// Local mode ignores `namespace` and looks the name up in its flat table. The
     /// empty-name check runs before the mode decision, so local mode returns
@@ -1347,21 +1436,19 @@ impl ActorHandle {
     /// [`ActorHandle::from_serialized`] 是它的逆操作。
     ///
     /// 只对「这个进程登记过的 handle」成立：[`Ray::actor_create`]、
-    /// [`Ray::get_actor`]、[`ActorHandle::from_serialized`] 都会在 core worker 的
-    /// actor manager 里登记。[`ActorHandle::id`] 背后是 crate 私有的字段，用户造
-    /// 不出没登记过的 handle，这条不变式就是本方法安全的前提——SDK 的
-    /// `ActorManager::GetActorHandle` 对查不到的 id 直接 RAY_CHECK 终止进程，没有
-    /// 错误可以返回。
+    /// [`Ray::actor_create_python`]、[`Ray::get_actor`]、
+    /// [`ActorHandle::from_serialized`] 都会在 core worker 的 actor manager 里登记。
+    /// 本方法在进 SDK 之前查登记表：SDK 的 `ActorManager::GetActorHandle` 对查不到的 id
+    /// 直接 RAY_CHECK 终止进程、没有错误可以返回，那条终止因此不可达。
     ///
     /// 本地模式返回 [`RayError::Ffi`]：`AbstractRayRuntime::SerializeActorHandle` 的第一句
     /// 就是 `CoreWorkerProcess::GetCoreWorker()`，本地模式从不启动 core worker 进程，
     /// 那里直接 `QuickExit()`（`_Exit(1)`，`src/ray/util/process.cc`）。
     ///
     /// 上一个运行时留下的 handle（同一个进程里 `drop` 掉 `Ray` 之后重新 `connect`）
-    /// 不在新运行时的 actor manager 里，`serialize()` 会命中 SDK 的 RAY_CHECK 终止
-    /// 进程（实测终止在 `ActorManager::GetActorHandle` 的 RAY_CHECK）。[`Ray::actor_call`]
-    /// 拿同一个陈旧 handle 时的处境相同；[`Ray::kill_actor`] 只在集群模式相同，本地
-    /// 模式先被本地模式守卫拒绝，陈旧与否无关。
+    /// 返回 [`RayError::Ffi`]，消息里带这个 id 并说明它没有登记：登记表随运行时清空，
+    /// 它在新的运行时里查不到，两个模式下都在进 SDK 之前被拒掉。[`Ray::actor_call`] 与
+    /// [`Ray::kill_actor`] 拿同一个陈旧 handle 时报同一个错。
     pub fn serialize(&self) -> Result<Vec<u8>, RayError> {
         actor_handle_serialize_inner(&self.id)
     }
@@ -1421,10 +1508,30 @@ impl ActorHandle {
     ///
     /// 结构良好的（`actor_id` 16 字节、`creation_job_id` 4 字节）载荷即使 `actor_id`
     /// 是 16 个 `0x11` 也会被收下并返回 16 字节 id：上游不验证 id 是否属于真实 actor。
-    /// 这个字节被登记进本进程的 actor 登记表，所以接着用这个 id 调用会提交成功、对象
-    /// 永不就绪（订阅该 id 收不到 `ALIVE`，`get` 到期才报超时）；#69 说的是另一种情况：
-    /// 从未登记过的裸 16 字节 id 在调用时会命中 `ActorManager::GetActorHandle` 的
-    /// RAY_CHECK（`src/ray/core_worker/actor_manager.cc:52-59`）。
+    /// 这个 id 进本 crate 的 actor 登记表，语言就是载荷的 `actor_language` 字段
+    /// （`src/ray/protobuf/core_worker.proto:42`；字段缺席时是 proto3 的默认值
+    /// `PYTHON = 0`），创建描述符类型是字段 6 里那个 oneof 成员的字段号（`java` 1、
+    /// `python` 2、`cpp` 3，字段 6 缺席时是「没有」）。两个调用入口按这两项判定，实测
+    /// 的四种形态（集群上的运行；「提交成功」指进了队，`get` 到期报超时，因为 actor id
+    /// 不属于任何真实 actor）：
+    ///
+    /// | 载荷 | [`Ray::actor_call`] | [`Ray::actor_call_python`] |
+    /// | --- | --- | --- |
+    /// | 字段 1 + 4 | 语言不符而拒（`is a Python actor`） | 没有 Python 创建描述符而拒 |
+    /// | 字段 1 + 4 + 字段 5 = `CPP` | 提交成功，`get` 到期报超时 | 语言不符而拒 |
+    /// | 字段 1 + 4 + 字段 6 = `python_function_descriptor` | 语言不符而拒 | 提交成功，`get` 到期报超时 |
+    /// | 字段 1 + 4 + 字段 5 = `PYTHON` + 字段 6 = `cpp_function_descriptor` | 语言不符而拒 | 没有 Python 创建描述符而拒 |
+    ///
+    /// 第二行提交成功是因为 C++ 分支不读创建描述符
+    /// （`cpp/src/ray/runtime/task/native_task_submitter.cc:81-82` 只读
+    /// `MaxTaskRetries`）。第一、四行被 Python 入口拒掉，是因为字段 6 缺席或放的是 cpp
+    /// 描述符，而 Python 分支会把它按 `PythonFunctionDescriptor` 读
+    /// （`cpp/src/ray/runtime/abstract_ray_runtime.cc:202-211`，`As` 是
+    /// `reinterpret_cast`）；两行都停在 crate 的守卫里，没有进 SDK。
+    ///
+    /// 同一个 id 已经登记过时保留首次登记的语言与创建描述符类型，载荷里的语言字段只在
+    /// 首次登记时生效，与上游 actor manager 的 `emplace` 一致
+    /// （`src/ray/core_worker/actor_manager.cc:179`）。
     ///
     /// 本地模式返回 [`RayError::Ffi`]：登记要读 `CoreWorkerProcess::GetCoreWorker()`，
     /// 本地模式从不启动 core worker 进程，那里直接 `QuickExit()`（`_Exit(1)`）。
@@ -1907,6 +2014,12 @@ pub(crate) fn actor_create_with_options_inner(
 
     let guard = CBytesGuard::from(bytes)
         .ok_or_else(|| ffi_error_detail("ray_actor_create_with_options", func_name))?;
+    // 这个入口建的永远是 C++ actor（holder 的语言固定为 CPP，见 ray_c.cc）。
+    actor_registry::record(
+        guard.as_slice(),
+        ActorLanguage::Cpp,
+        actor_registry::CREATION_DESCRIPTOR_CPP,
+    );
     Ok(ActorHandle { id: guard.as_slice().to_vec() })
 }
 
@@ -1943,7 +2056,137 @@ pub(crate) fn actor_create_python_with_options_inner(
             "ray_actor_create_python_with_options",
             format!("{}.{}", module, class),
         ))?;
+    actor_registry::record(
+        guard.as_slice(),
+        ActorLanguage::Python,
+        actor_registry::CREATION_DESCRIPTOR_PYTHON,
+    );
     Ok(ActorHandle { id: guard.as_slice().to_vec() })
+}
+
+/// actor id 的宽度与登记状态，返回登记项（语言码与创建描述符类型）。
+///
+/// 宽度最先查：`ActorID::FromBinary` 对长度不符的输入 RAY_CHECK 终止进程
+/// （`src/ray/common/id.h:430-441`），0 字节的 id 还会变成 nil id。登记表排在宽度
+/// 之后，短 id 因此永远先拿到宽度错误。
+///
+/// 登记表只认本 crate 发出的四类 handle，理由见 `crate::actor_registry`。
+fn check_registered_actor(
+    entry: &str,
+    actor_id: &[u8],
+) -> Result<actor_registry::Registration, RayError> {
+    if actor_id.len() != actor_registry::ACTOR_ID_LEN {
+        return Err(RayError::Ffi(format!(
+            "{}: actor id must be {} bytes, got {} bytes",
+            entry,
+            actor_registry::ACTOR_ID_LEN,
+            actor_id.len()
+        )));
+    }
+    actor_registry::registration_of(actor_id).ok_or_else(|| {
+        RayError::Ffi(format!(
+            "{}: actor {} is not registered in this process; this crate only accepts the \
+             handles it handed out (Ray::actor_create, Ray::actor_create_python, \
+             Ray::get_actor or ActorHandle::from_serialized), because the core worker's \
+             lookup of an id it does not hold ends the process \
+             (src/ray/core_worker/actor_manager.cc:52-59)",
+            entry,
+            hex_encode(actor_id)
+        ))
+    })
+}
+
+/// 登记的语言与入口要求不符时的错误。
+fn language_mismatch(entry: &str, actor_id: &[u8], actual: ActorLanguage, hint: &str) -> RayError {
+    RayError::Ffi(format!(
+        "{}: actor {} is a {} actor; {}",
+        entry,
+        hex_encode(actor_id),
+        actual.name(),
+        hint
+    ))
+}
+
+/// 登记表里有这个 id，但上游给的语言码不是这个 crate 认识的三个。
+fn unknown_language(entry: &str, actor_id: &[u8], code: i32) -> RayError {
+    RayError::Ffi(format!(
+        "{}: actor {} reports language code {}; this crate knows CPP (2), PYTHON (0) and \
+         JAVA (1)",
+        entry,
+        hex_encode(actor_id),
+        code
+    ))
+}
+
+/// `actor_call` 要求的语言：C++ actor。
+///
+/// `registration` 是 `check_registered_actor` 交出的那一份登记：语言判定直接用
+/// 它，不第二次查表。
+fn check_cpp_actor_language(
+    entry: &str,
+    actor_id: &[u8],
+    registration: actor_registry::Registration,
+) -> Result<(), RayError> {
+    match ActorLanguage::from_code(registration.language) {
+        Some(ActorLanguage::Cpp) => Ok(()),
+        Some(ActorLanguage::Python) => Err(language_mismatch(
+            entry,
+            actor_id,
+            ActorLanguage::Python,
+            "this entry submits a C++ method call, use Ray::actor_call_python for a Python \
+             actor",
+        )),
+        Some(ActorLanguage::Java) => Err(language_mismatch(
+            entry,
+            actor_id,
+            ActorLanguage::Java,
+            "this crate can neither create nor call Java actors",
+        )),
+        None => Err(unknown_language(entry, actor_id, registration.language)),
+    }
+}
+
+/// `actor_call_python` 要求的语言：Python actor，且 handle 带 Python 创建描述符。
+///
+/// `registration` 是 `check_registered_actor` 交出的那一份登记：语言判定直接用
+/// 它，不第二次查表。
+fn check_python_actor_language(
+    entry: &str,
+    actor_id: &[u8],
+    registration: actor_registry::Registration,
+) -> Result<(), RayError> {
+    match ActorLanguage::from_code(registration.language) {
+        Some(ActorLanguage::Python) => {
+            // 语言对还不够：SDK 的 Python 分支把 handle 的创建描述符按
+            // `PythonFunctionDescriptor` 读（cpp/src/ray/runtime/abstract_ray_runtime.cc:202-211，
+            // `As` 是 reinterpret_cast），描述符缺席或是另一种类型时读越过对象末尾。
+            if registration.creation_descriptor != actor_registry::CREATION_DESCRIPTOR_PYTHON {
+                return Err(RayError::Ffi(format!(
+                    "{}: actor {} is a Python actor whose handle carries no Python creation \
+                     descriptor; the Python call path reads that descriptor from the handle \
+                     (cpp/src/ray/runtime/abstract_ray_runtime.cc:202-211) and an empty or \
+                     differently typed one makes the driver read past the end of the \
+                     descriptor object",
+                    entry,
+                    hex_encode(actor_id)
+                )));
+            }
+            Ok(())
+        }
+        Some(ActorLanguage::Cpp) => Err(language_mismatch(
+            entry,
+            actor_id,
+            ActorLanguage::Cpp,
+            "this entry submits a Python method call, use Ray::actor_call for a C++ actor",
+        )),
+        Some(ActorLanguage::Java) => Err(language_mismatch(
+            entry,
+            actor_id,
+            ActorLanguage::Java,
+            "this crate can neither create nor call Java actors",
+        )),
+        None => Err(unknown_language(entry, actor_id, registration.language)),
+    }
 }
 
 /// Call a method on an actor by binary actor ID and function name.
@@ -1954,6 +2197,13 @@ pub(crate) fn actor_call_inner(
     args: &[&[u8]],
     is_ref: &[bool],
 ) -> Result<ObjectRef<()>, RayError> {
+    let registration = check_registered_actor("ray_actor_call", actor_id)?;
+    // 本地模式没有 Python actor（`actor_create_python` 在那里被拒），本地 submitter 又只
+    // 执行注册过的 Rust 函数（local_mode_task_submitter.cc:39-40），所以本地模式不做语言
+    // 判定；登记照查，旧运行时的 handle 在那里一样是错的。
+    if !is_local_mode() {
+        check_cpp_actor_language("ray_actor_call", actor_id, registration)?;
+    }
     check_is_ref_len(args.len(), is_ref)?;
     let func_c = to_cstring(func_name);
     let args_arr = build_args_array(args);
@@ -2027,6 +2277,12 @@ pub(crate) fn actor_call_python_inner(
     args: &[&[u8]],
     is_ref: &[bool],
 ) -> Result<Vec<u8>, RayError> {
+    // 本地模式保持既有行为：C 入口在读 actor handle 之前就拒掉整个调用（见 ray_c.h），
+    // 所以那里连宽度检查都不在 crate 侧。
+    if !is_local_mode() {
+        let registration = check_registered_actor("ray_actor_call_python", actor_id)?;
+        check_python_actor_language("ray_actor_call_python", actor_id, registration)?;
+    }
     check_is_ref_len(args.len(), is_ref)?;
     let method_c = to_cstring(method_name);
     let args_arr = build_args_array(args);
@@ -2065,9 +2321,11 @@ pub(crate) fn actor_kill_inner(actor_id: &[u8], no_restart: bool) {
 
 /// 序列化一个已登记的 actor handle。
 ///
-/// 长度与「是否登记过」都在 C 侧检查：`ActorID::FromBinary` 与
-/// `ActorManager::GetActorHandle` 都是 RAY_CHECK，进 SDK 之前拦不住就会终止进程。
+/// 登记表在进 SDK 之前查：`ActorManager::GetActorHandle` 对查不到的 id 是 RAY_CHECK，
+/// `RAY_CATCH` 拦不住，所以陈旧 handle 只能在这里拒。宽度由 `&ActorHandle` 保证，C 入口
+/// 另有一道给 C 调用方。
 pub(crate) fn actor_handle_serialize_inner(actor_id: &[u8]) -> Result<Vec<u8>, RayError> {
+    check_registered_actor("ray_actor_handle_serialize", actor_id)?;
     let bytes = unsafe {
         rayrust_sys::ray_actor_handle_serialize(
             actor_id.as_ptr() as *const std::os::raw::c_char,
@@ -2079,15 +2337,21 @@ pub(crate) fn actor_handle_serialize_inner(actor_id: &[u8]) -> Result<Vec<u8>, R
     Ok(guard.as_slice().to_vec())
 }
 
-/// 从 handle 字节复原并登记 handle。
+/// 从 handle 字节复原并登记 handle，同时把它的语言与创建描述符类型记进登记表。
 pub(crate) fn actor_handle_from_serialized_inner(bytes: &[u8]) -> Result<ActorHandle, RayError> {
+    let mut meta = rayrust_sys::RayActorHandleMeta {
+        language: 0,
+        creation_descriptor: 0,
+    };
     let out = unsafe {
         rayrust_sys::ray_actor_handle_deserialize(
             bytes.as_ptr() as *const std::os::raw::c_char,
             bytes.len(),
+            &mut meta,
         )
     };
     let guard = CBytesGuard::from(out).ok_or_else(|| ffi_error("ray_actor_handle_deserialize"))?;
+    actor_registry::record_codes(guard.as_slice(), meta.language, meta.creation_descriptor);
     Ok(ActorHandle {
         id: guard.as_slice().to_vec(),
     })
@@ -2353,7 +2617,11 @@ pub(crate) fn get_actor(name: &str, namespace: &str) -> Result<Option<ActorHandl
     let name_c = to_cstring(name);
     let ns_c = to_cstring(namespace);
     rayrust_sys::clear_error();
-    let bytes = unsafe { rayrust_sys::ray_get_actor(name_c.as_ptr(), ns_c.as_ptr()) };
+    let mut meta = rayrust_sys::RayActorHandleMeta {
+        language: 0,
+        creation_descriptor: 0,
+    };
+    let bytes = unsafe { rayrust_sys::ray_get_actor(name_c.as_ptr(), ns_c.as_ptr(), &mut meta) };
     let guard = CBytesGuard::from(bytes);
     match guard {
         Some(g) => {
@@ -2361,6 +2629,9 @@ pub(crate) fn get_actor(name: &str, namespace: &str) -> Result<Option<ActorHandl
             if id.is_empty() {
                 Ok(None)
             } else {
+                // 语言与创建描述符类型由 C 侧从 handle 的序列化字节里读出来
+                // （本地模式是 C++ / cpp）。
+                actor_registry::record_codes(&id, meta.language, meta.creation_descriptor);
                 Ok(Some(ActorHandle { id }))
             }
         }
@@ -2498,7 +2769,21 @@ mod tests {
         let arg = [0u8; 4];
         let args: [&[u8]; 2] = [&arg, &arg];
         let flags = [true];
-        let actor_id = [0u8; 16];
+        // actor 入口的登记表与语言判定都排在 `is_ref` 长度检查之前，所以这里的 id 先用
+        // 各自入口要求的语言登记（含 Python 创建描述符）：没登记的 id 会在长度检查之前
+        // 被拒。
+        let cpp_actor = [0x21u8; 16];
+        let python_actor = [0x22u8; 16];
+        actor_registry::record(
+            &cpp_actor,
+            ActorLanguage::Cpp,
+            actor_registry::CREATION_DESCRIPTOR_CPP,
+        );
+        actor_registry::record(
+            &python_actor,
+            ActorLanguage::Python,
+            actor_registry::CREATION_DESCRIPTOR_PYTHON,
+        );
 
         assert_len_rejected(
             "task_call_inner",
@@ -2506,7 +2791,7 @@ mod tests {
         );
         assert_len_rejected(
             "actor_call_inner",
-            actor_call_inner(&actor_id, "counter::increment", &args, &flags),
+            actor_call_inner(&cpp_actor, "counter::increment", &args, &flags),
         );
         assert_len_rejected(
             "task_call_python_inner",
@@ -2514,8 +2799,117 @@ mod tests {
         );
         assert_len_rejected(
             "actor_call_python_inner",
-            actor_call_python_inner(&actor_id, "increment", &args, &flags),
+            actor_call_python_inner(&python_actor, "increment", &args, &flags),
         );
+    }
+
+    /// 登记表里的语言码不是这个 crate 认识的三个时，两个入口都报出实际取值。
+    #[test]
+    fn an_unknown_language_code_is_reported_by_both_entries() {
+        let actor = [0x23u8; 16];
+        actor_registry::record_codes(&actor, 7, actor_registry::CREATION_DESCRIPTOR_PYTHON);
+        let registration = actor_registry::registration_of(&actor).expect("the id was registered");
+        for (entry, result) in [
+            (
+                "ray_actor_call",
+                check_cpp_actor_language("ray_actor_call", &actor, registration),
+            ),
+            (
+                "ray_actor_call_python",
+                check_python_actor_language("ray_actor_call_python", &actor, registration),
+            ),
+        ] {
+            match result {
+                Err(RayError::Ffi(msg)) => assert!(
+                    msg.contains("reports language code 7"),
+                    "{} 的错误里没有实际语言码: {}",
+                    entry,
+                    msg
+                ),
+                Err(other) => panic!("{} 返回了别的错误变体: {}", entry, other),
+                Ok(()) => panic!("{} 收下了语言码 7", entry),
+            }
+        }
+    }
+
+    /// 同一个 id 重复登记时保留首次记录：一个语言字段说谎的载荷改变不了已经发出去的
+    /// handle 被哪些入口接受（上游 `ActorManager::AddActorHandle` 的 `emplace` 同样如此）。
+    #[test]
+    fn a_second_registration_keeps_the_first_record() {
+        let actor = [0x24u8; 16];
+        actor_registry::record(
+            &actor,
+            ActorLanguage::Cpp,
+            actor_registry::CREATION_DESCRIPTOR_CPP,
+        );
+        actor_registry::record(
+            &actor,
+            ActorLanguage::Python,
+            actor_registry::CREATION_DESCRIPTOR_PYTHON,
+        );
+        let registration = actor_registry::registration_of(&actor).expect("the id was registered");
+        assert_eq!(registration.language, ActorLanguage::Cpp.code());
+        assert_eq!(
+            registration.creation_descriptor,
+            actor_registry::CREATION_DESCRIPTOR_CPP
+        );
+    }
+
+    /// Python 入口要求 handle 带 Python 创建描述符：字段 6 缺席的载荷按 PYTHON 登记，
+    /// 那条路径会读越过描述符对象，所以在调用门前拒掉。
+    #[test]
+    fn actor_call_python_requires_a_python_creation_descriptor() {
+        let actor = [0x25u8; 16];
+        actor_registry::record(&actor, ActorLanguage::Python, 0);
+        let registration = actor_registry::registration_of(&actor).expect("the id was registered");
+        match check_python_actor_language("ray_actor_call_python", &actor, registration) {
+            Err(RayError::Ffi(msg)) => assert!(
+                msg.contains("no Python creation descriptor"),
+                "错误里没有说明缺描述符: {}",
+                msg
+            ),
+            Err(other) => panic!("返回了别的错误变体: {}", other),
+            Ok(()) => panic!("缺少 Python 创建描述符的 handle 被接受了"),
+        }
+    }
+
+    /// Java handle：两个入口都拒，消息里点名 Java。语言码 1 只可能来自 handle 的
+    /// 序列化字节（[`ActorHandle::from_serialized`] 与 [`crate::Ray::get_actor`]），
+    /// crate 自己建不出 Java actor。
+    #[test]
+    fn a_java_handle_is_refused_by_both_entries() {
+        let actor = [0x26u8; 16];
+        actor_registry::record_codes(&actor, 1, 1);
+        let registration = actor_registry::registration_of(&actor).expect("the id was registered");
+        for (entry, result) in [
+            (
+                "ray_actor_call",
+                check_cpp_actor_language("ray_actor_call", &actor, registration),
+            ),
+            (
+                "ray_actor_call_python",
+                check_python_actor_language("ray_actor_call_python", &actor, registration),
+            ),
+        ] {
+            match result {
+                Err(RayError::Ffi(msg)) => {
+                    assert!(
+                        msg.contains("is a Java actor"),
+                        "{} 的错误里没有点出 Java: {}",
+                        entry,
+                        msg
+                    );
+                    assert!(
+                        msg.contains("can neither create nor call Java actors"),
+                        "{} 的错误没有说明这个 crate 不支持 Java: {}",
+                        entry,
+                        msg
+                    );
+                }
+                Err(other) => panic!("{} 返回了别的错误变体: {}", entry, other),
+                Ok(()) => panic!("{} 收下了一个 Java handle", entry),
+            }
+        }
     }
 
     #[test]

@@ -17,6 +17,15 @@ pub struct RayBytes {
     pub len: usize,
 }
 
+/// 一个 actor handle 的语言与创建描述符类型（`wrapper/ray_c.h` 的
+/// `ray_actor_handle_meta_t`）。`creation_descriptor` 是 `rpc.FunctionDescriptor`
+/// 那个 oneof 成员的字段号：0 没有、java 1、python 2、cpp 3。
+#[repr(C)]
+pub struct RayActorHandleMeta {
+    pub language: c_int,
+    pub creation_descriptor: c_int,
+}
+
 // ─── Rust 回调的哨兵长度 ──────────────────
 
 /// Rust 回调返回「actor 方法里调用了 `exit_actor()`」的长度，`data` 为空指针。
@@ -116,6 +125,7 @@ extern "C" {
     pub fn ray_actor_handle_deserialize(
         serialized_data: *const c_char,
         serialized_len: usize,
+        out_meta: *mut RayActorHandleMeta,
     ) -> RayBytes;
 
     // Placement Group
@@ -155,7 +165,11 @@ extern "C" {
     pub fn ray_was_current_actor_restarted() -> bool;
     pub fn ray_is_local_mode() -> bool;
     pub fn ray_get_namespace() -> RayBytes;
-    pub fn ray_get_actor(name: *const c_char, ray_namespace: *const c_char) -> RayBytes;
+    pub fn ray_get_actor(
+        name: *const c_char,
+        ray_namespace: *const c_char,
+        out_meta: *mut RayActorHandleMeta,
+    ) -> RayBytes;
     pub fn ray_cancel(id_data: *const c_char, id_len: usize, force_kill: bool, recursive: bool) -> c_int;
     pub fn ray_get_many(ids: *const RayBytes, count: usize, timeout_ms: c_int) -> *mut RayBytes;
     pub fn ray_free_bytes_array(array: *mut RayBytes, count: usize);

@@ -1168,6 +1168,26 @@ ray_bytes_t ray_task_call_python(const char *module_name,
             set_last_error("Ray runtime is not initialized");
             return ray_bytes_t{nullptr, 0};
         }
+        if (runtime->IsLocalMode()) {
+            // 本地 submitter 丢掉 module 与语言，只按函数名建 C++ descriptor
+            // （cpp/src/ray/runtime/task/local_mode_task_submitter.cc:39-40），任务规格的
+            // 语言也写成 CPP（同文件 :52-56）。进程里注册过同名 Rust 函数时，这个「Python
+            // 任务」执行的是那个 Rust 回调。
+            auto &fns = get_rust_functions();
+            if (fns.find(std::string(function_name)) != fns.end()) {
+                set_last_error(
+                    ("task_call_python cannot submit \"" + std::string(module_name) + "." +
+                     std::string(function_name) +
+                     "\" in local mode: the local submitter drops the module and the "
+                     "language and resolves the function name in the registered Rust "
+                     "function map "
+                     "(cpp/src/ray/runtime/task/local_mode_task_submitter.cc:39-40), so the "
+                     "Rust function registered under that name would run instead of the "
+                     "Python function")
+                        .c_str());
+                return ray_bytes_t{nullptr, 0};
+            }
+        }
 
         ray::internal::RemoteFunctionHolder holder(
             std::string(module_name), std::string(function_name),
@@ -1450,10 +1470,25 @@ ray_bytes_t ray_actor_handle_serialize(const char *actor_id_data, size_t actor_i
 // 阶段照样在 `id.h:435` 终止进程；排在损坏字段之后的 `creation_job_id` 同样读不到，
 // 登记出 nil job id 的 handle。这两类载荷由下面的递归校验拒掉。
 
-/// `rpc::ActorHandle` 的字段号：`actor_id = 1`、`creation_job_id = 4`
-/// （src/ray/protobuf/core_worker.proto:29、:39）。
+/// `rpc::ActorHandle` 的字段号：`actor_id = 1`、`creation_job_id = 4`、
+/// `actor_language = 5`、`actor_creation_task_function_descriptor = 6`
+/// （src/ray/protobuf/core_worker.proto:29、:39、:42、:45）。
 static constexpr uint64_t kActorHandleActorIdField = 1;
 static constexpr uint64_t kActorHandleCreationJobIdField = 4;
+static constexpr uint64_t kActorHandleActorLanguageField = 5;
+static constexpr uint64_t kActorHandleCreationDescriptorField = 6;
+
+/// `actor_language` 的取值来自 `ray::Language`（src/ray/protobuf/common.proto:26-30）。
+/// proto3 省略等于默认值 0 的字段，所以载荷里没有字段 5 时读出来的也是 Python。
+static constexpr int kLanguagePython = 0;
+static constexpr int kLanguageJava = 1;
+static constexpr int kLanguageCpp = 2;
+
+/// 创建描述符的类型就是 `rpc.FunctionDescriptor` 那个 oneof 成员的字段号：java 1、
+/// python 2、cpp 3，0 表示字段 6 缺席（`src/ray/protobuf/common.proto:158-164`）。
+/// 本地模式建出来的就是 Cpp 描述符
+/// （`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:39-40`）。
+static constexpr int kCreationDescriptorCpp = 3;
 
 /// protobuf 的长度前缀是 int32（上游 `ReadVarintSizeAsInt` 的界限）。
 static constexpr uint64_t kPayloadMaxLengthVarint = 0x7fffffff;
@@ -1580,12 +1615,17 @@ static const PayloadField kActorHandleFields[] = {
 };
 static const PayloadSchema kActorHandlePayloadSchema = payload_schema(kActorHandleFields);
 
-/// 顶层两个定长 id 字段的最后一次出现（protobuf 合并同一字段时取最后一次）。
-struct ActorHandleIdFields {
+/// 顶层定长 id 字段、语言字段与创建描述符类型的最后一次出现（protobuf 合并同一
+/// 字段时取最后一次；字段 6 里的 oneof 同理）。
+struct ActorHandlePayloadFields {
     bool has_actor_id = false;
     size_t actor_id_len = 0;
     bool has_creation_job_id = false;
     size_t creation_job_id_len = 0;
+    /// 字段 5 缺席时是 proto3 的默认值 `PYTHON = 0`，与上游解析出来的语言一致。
+    int actor_language = kLanguagePython;
+    /// 字段 6 里那个 oneof 成员的字段号，0 表示字段 6 缺席。
+    int creation_descriptor = 0;
 };
 
 /// 从 `payload[pos]` 起读一个 protobuf varint，`end` 是本条消息的末尾。`limit` 是
@@ -1693,11 +1733,13 @@ static void set_payload_error(const std::string &where, const std::string &detai
 }
 
 /// 按 `schema` 校验 `payload[pos, end)` 里的一条消息，嵌套消息递归进来。
-/// `path` 是出错时指路的字段路径，顶层为空串；`ids` 只在顶层非空，用来记两个 id
-/// 字段的最后一次出现。
+/// `path` 是出错时指路的字段路径，顶层为空串；`fields` 只在顶层非空，用来记两个 id
+/// 字段、语言字段与创建描述符类型的最后一次出现。`oneof_member` 只在顶层字段 6 的
+/// 递归里非空：那条消息的 oneof 成员字段号就是创建描述符的类型。
 static int check_payload_message(const std::string &payload, size_t &pos, size_t end,
                                  const PayloadSchema &schema, const std::string &path,
-                                 size_t depth, ActorHandleIdFields *ids) {
+                                 size_t depth, ActorHandlePayloadFields *fields,
+                                 int *oneof_member) {
     if (depth > kPayloadMaxNestingDepth) {
         set_payload_error(std::string(), path + " nests deeper than " +
                                               std::to_string(kPayloadMaxNestingDepth) +
@@ -1733,15 +1775,20 @@ static int check_payload_message(const std::string &payload, size_t &pos, size_t
             if (wire_type != schema_wire_type) field = nullptr;
         }
         if (wire_type == 0) {
-            uint64_t ignored = 0;
+            uint64_t value = 0;
             size_t value_offset = pos;
             VarintResult value_result =
-                read_varint(payload, end, pos, UINT64_MAX, false, ignored);
+                read_varint(payload, end, pos, UINT64_MAX, false, value);
             if (value_result != VarintResult::kOk) {
                 set_payload_error(where, varint_failure(value_result,
                     "the varint value of field " + std::to_string(field_number),
                     value_offset));
                 return -1;
+            }
+            if (fields != nullptr && field_number == kActorHandleActorLanguageField) {
+                // proto3 的 enum 字段是 int32：上游把取值读成 `Language` 的整数形式，
+                // 未知取值照样保留。这里不拒绝未知码，由调用方按实际取值报错。
+                fields->actor_language = static_cast<int>(value);
             }
             continue;
         }
@@ -1798,17 +1845,25 @@ static int check_payload_message(const std::string &payload, size_t &pos, size_t
                     return -1;
                 }
             } else if (field->kind == PayloadFieldKind::kMessage) {
+                int *nested_oneof = nullptr;
+                if (fields != nullptr &&
+                    field_number == kActorHandleCreationDescriptorField) {
+                    nested_oneof = &fields->creation_descriptor;
+                }
+                if (oneof_member != nullptr) {
+                    *oneof_member = static_cast<int>(field_number);
+                }
                 if (check_payload_message(payload, pos, content_end, *field->message, label,
-                                          depth + 1, nullptr) != 0) {
+                                          depth + 1, nullptr, nested_oneof) != 0) {
                     return -1;
                 }
-            } else if (ids != nullptr) {
+            } else if (fields != nullptr) {
                 if (field_number == kActorHandleActorIdField) {
-                    ids->has_actor_id = true;
-                    ids->actor_id_len = static_cast<size_t>(length);
+                    fields->has_actor_id = true;
+                    fields->actor_id_len = static_cast<size_t>(length);
                 } else if (field_number == kActorHandleCreationJobIdField) {
-                    ids->has_creation_job_id = true;
-                    ids->creation_job_id_len = static_cast<size_t>(length);
+                    fields->has_creation_job_id = true;
+                    fields->creation_job_id_len = static_cast<size_t>(length);
                 }
             }
         }
@@ -1818,36 +1873,39 @@ static int check_payload_message(const std::string &payload, size_t &pos, size_t
 }
 
 /// 校验载荷是结构良好的 `rpc::ActorHandle`，并且 `actor_id` 正好 16 字节、
-/// `creation_job_id` 正好 4 字节。失败返回 -1 并设置错误：载荷畸形、缺字段、
-/// 字段长度不对三种情形各有一句自己的说法。
+/// `creation_job_id` 正好 4 字节，把顶层的 id 长度、语言字段与创建描述符类型从
+/// `fields` 交出去。
+/// 失败返回 -1 并设置错误：载荷畸形、缺字段、字段长度不对三种情形各有一句自己的
+/// 说法，`fields` 不被写入。
 ///
 /// 字段 key 与长度前缀要求最短编码且能放进 32 位：上游把 tag 读成 `uint32`，
 /// 5 字节但超过 32 位的 key 会被截断成别的字段（实测 `0x10000000a` 被当成
 /// `actor_id`，短内容直接终止进程），长度前缀超过 32 位时上游的 `ParseFromString`
 /// 失败。这两类编码不会出现在 protobuf 自己的序列化结果里，直接当载荷畸形拒掉。
-static int check_actor_handle_payload(const char *data, size_t len) {
+static int check_actor_handle_payload(const char *data, size_t len,
+                                      ActorHandlePayloadFields *fields) {
     const std::string payload(data, len);
-    ActorHandleIdFields ids;
+    ActorHandlePayloadFields parsed;
     size_t pos = 0;
     if (check_payload_message(payload, pos, payload.size(), kActorHandlePayloadSchema,
-                              std::string(), 0, &ids) != 0) {
+                              std::string(), 0, &parsed, nullptr) != 0) {
         return -1;
     }
-    if (!ids.has_actor_id) {
+    if (!parsed.has_actor_id) {
         set_last_error(
             "the serialized actor handle has no actor_id field (protobuf field 1 of "
             "rpc.ActorHandle): a handle without it registers as the nil actor");
         return -1;
     }
-    if (ids.actor_id_len != kActorIdLength) {
+    if (parsed.actor_id_len != kActorIdLength) {
         set_last_error(("the actor_id field of the serialized actor handle is " +
-                        std::to_string(ids.actor_id_len) + " bytes, must be " +
+                        std::to_string(parsed.actor_id_len) + " bytes, must be " +
                         std::to_string(kActorIdLength) +
                         " bytes (the Ray 2.51.1 ActorID length)")
                            .c_str());
         return -1;
     }
-    if (!ids.has_creation_job_id) {
+    if (!parsed.has_creation_job_id) {
         set_last_error(
             "the serialized actor handle has no creation_job_id field (protobuf field 4 "
             "of rpc.ActorHandle): the nil job id it decodes to ends the actor's worker at "
@@ -1855,26 +1913,41 @@ static int check_actor_handle_payload(const char *data, size_t len) {
             "(src/ray/core_worker/context.cc:295) on the first call");
         return -1;
     }
-    if (ids.creation_job_id_len != kJobIdLength) {
+    if (parsed.creation_job_id_len != kJobIdLength) {
         set_last_error(("the creation_job_id field of the serialized actor handle is " +
-                        std::to_string(ids.creation_job_id_len) + " bytes, must be " +
+                        std::to_string(parsed.creation_job_id_len) + " bytes, must be " +
                         std::to_string(kJobIdLength) +
                         " bytes (the Ray 2.51.1 JobID length)")
                            .c_str());
         return -1;
     }
+    *fields = parsed;
     return 0;
 }
 
+/// 从序列化字节里复原并登记一个 actor handle，同时交出它的语言与创建描述符类型。
+///
+/// `out_meta` 必须是调用方提供的非空指针：载荷校验通过、handle 真正登记成功之后写入
+/// 语言与创建描述符类型。语言是 `rpc.ActorHandle.actor_language`
+/// （`src/ray/protobuf/core_worker.proto:42`，字段 5），取值 `PYTHON = 0`、`JAVA = 1`、
+/// `CPP = 2`（`src/ray/protobuf/common.proto:26-30`）；字段 5 缺席时写
+/// `kLanguagePython`：proto3 省略等于默认值的字段，上游解析出来的也是 `PYTHON`。
+/// 创建描述符类型是字段 6 里那个 oneof 成员的字段号（字段 6 缺席时是 0）。
 ray_bytes_t ray_actor_handle_deserialize(const char *serialized_data,
-                                         size_t serialized_len) {
+                                         size_t serialized_len,
+                                         ray_actor_handle_meta_t *out_meta) {
     ray_clear_error();
+    if (!out_meta) {
+        set_last_error("out_meta is null");
+        return ray_bytes_t{nullptr, 0};
+    }
     if (!serialized_data || serialized_len == 0) {
         set_last_error("the serialized actor handle is empty");
         return ray_bytes_t{nullptr, 0};
     }
     try {
-        if (check_actor_handle_payload(serialized_data, serialized_len) != 0) {
+        ActorHandlePayloadFields fields;
+        if (check_actor_handle_payload(serialized_data, serialized_len, &fields) != 0) {
             return ray_bytes_t{nullptr, 0};
         }
         auto runtime = ray::internal::GetRayRuntime();
@@ -1926,6 +1999,8 @@ ray_bytes_t ray_actor_handle_deserialize(const char *serialized_data,
                 "that id, and a handle for it never answers a call");
             return ray_bytes_t{nullptr, 0};
         }
+        out_meta->language = fields.actor_language;
+        out_meta->creation_descriptor = fields.creation_descriptor;
         return dup_bytes(actor_id);
     } RAY_CATCH
     return ray_bytes_t{nullptr, 0};
@@ -2168,8 +2243,23 @@ ray_bytes_t ray_get_namespace(void) {
     return ray_bytes_t{nullptr, 0};
 }
 
-ray_bytes_t ray_get_actor(const char *name, const char *ray_namespace) {
+/// 按名字查一个 actor，同时交出它的语言与创建描述符类型。
+///
+/// `out_meta` 必须是调用方提供的非空指针。查到 actor 时写这两项：集群模式从
+/// `runtime->SerializeActorHandle(actor_id)` 拿回的 `rpc.ActorHandle` 里读
+/// `actor_language`（`src/ray/protobuf/core_worker.proto:42`，字段 5，取值 `PYTHON = 0`、
+/// `JAVA = 1`、`CPP = 2`，`src/ray/protobuf/common.proto:26-30`）与字段 6 里那个
+/// oneof 成员的字段号（java 1、python 2、cpp 3，字段 6 缺席时是 0）；本地模式写
+/// `kLanguageCpp` 与 `kCreationDescriptorCpp`。查不到时不写。语言只能从序列化字节里
+/// 读：`GetActorId` 只给回 16 字节 id
+/// （`cpp/src/ray/runtime/abstract_ray_runtime.cc:255-263`）。
+ray_bytes_t ray_get_actor(const char *name, const char *ray_namespace,
+                          ray_actor_handle_meta_t *out_meta) {
     ray_clear_error();
+    if (!out_meta) {
+        set_last_error("out_meta is null");
+        return ray_bytes_t{nullptr, 0};
+    }
     if (!name) {
         set_last_error("actor name is null");
         return ray_bytes_t{nullptr, 0};
@@ -2201,6 +2291,31 @@ ray_bytes_t ray_get_actor(const char *name, const char *ray_namespace) {
         std::string ns_str = ray_namespace ? std::string(ray_namespace) : "";
         std::string actor_id = runtime->GetActorId(std::string(name), ns_str);
         if (actor_id.empty()) return ray_bytes_t{nullptr, 0};
+        if (runtime->IsLocalMode()) {
+            // 本地模式只建得出 C++ actor（`ray_actor_create_python_with_options` 在
+            // 本地模式拒绝），submitter 也只执行注册过的 Rust 函数
+            // （cpp/src/ray/runtime/task/local_mode_task_submitter.cc:39-40），所以名字
+            // 表里给出的 handle 语言是 C++、创建描述符是 Cpp
+            // （同文件 :52-56 把任务规格的语言写成 CPP）。
+            out_meta->language = kLanguageCpp;
+            out_meta->creation_descriptor = kCreationDescriptorCpp;
+            return dup_bytes(actor_id);
+        }
+        // 集群模式：这个 id 刚刚由 `GetNamedActorHandle` 的 `AddNewActorHandle` 登记
+        // 进 actor manager（src/ray/core_worker/actor_manager.cc:68-83），所以下面这句
+        // 不会再走到「查不到 handle」的 RAY_CHECK。语言只能从序列化字节里读：
+        // `AbstractRayRuntime` 只给回 16 字节 id。
+        std::string serialized = runtime->SerializeActorHandle(actor_id);
+        if (serialized.empty()) {
+            set_last_error("the core worker returned no serialized actor handle");
+            return ray_bytes_t{nullptr, 0};
+        }
+        ActorHandlePayloadFields fields;
+        if (check_actor_handle_payload(serialized.data(), serialized.size(), &fields) != 0) {
+            return ray_bytes_t{nullptr, 0};
+        }
+        out_meta->language = fields.actor_language;
+        out_meta->creation_descriptor = fields.creation_descriptor;
         return dup_bytes(actor_id);
     } catch (const std::exception &e) {
         set_last_error_exception(e);
