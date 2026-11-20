@@ -81,6 +81,12 @@ typedef struct {
 /// `namespace` is the job-level namespace for named actors.
 ///   Pass NULL or empty string for default (no namespace).
 /// Returns 0 on success, -1 on failure.
+/// A local-mode shutdown that is still running reports -1 with
+/// `a ray_shutdown is still in progress` in ray_last_error(), and
+/// leaves the runtime and the bookkeeping of the running shutdown untouched.
+/// A call while Ray is already initialized is a no-op that keeps the pending
+/// local-mode task list: the runtime does not change, so the tasks still have to
+/// be waited for on shutdown.
 int ray_init(const char *address, int local_mode, const char *node_ip,
              const char *code_search_path,
              const char *runtime_env_json,
@@ -92,6 +98,21 @@ int ray_init(const char *address, int local_mode, const char *node_ip,
 bool ray_is_initialized(void);
 
 /// Shutdown Ray runtime.
+///
+/// In local mode, waits for every task submitted through `ray_task_call_with_options`
+/// and `ray_task_call_python` during the current runtime to become ready before
+/// closing the reference-count gate and calling `ray::Shutdown()`. Once shutdown
+/// begins, new local-mode task submissions are rejected with an error, and they
+/// keep being rejected after the shutdown has finished until a new `ray_init`
+/// establishes a runtime; `ray_init` itself reports -1 until the shutdown has
+/// finished. If waiting fails, prints
+/// the reason to `stderr` and aborts the process, because this `extern "C"` entry
+/// has no error channel and letting the runtime be destroyed while tasks are
+/// still running causes use-after-free on `object_store_`.
+/// Concurrent calls perform the shutdown once: the first call takes the snapshot
+/// and waits, every later call finds the shutdown in progress and returns
+/// immediately without waiting or touching Ray. Cluster mode does not wait for
+/// submitted tasks.
 void ray_shutdown(void);
 
 // ─── Object Store ─────────────────────────────────────────────
