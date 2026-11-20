@@ -67,6 +67,8 @@ static_assert(alignof(RayIntentionalSystemExitException) == alignof(RayException
 // string so the Rust side can retrieve it via ray_last_error().
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -680,6 +682,46 @@ static std::string saved_init_namespace() {
 
 static void reopen_ref_count_gate(void);
 
+namespace {
+
+/// 本地模式提交过的任务结果 id。线程池在 `~LocalModeTaskSubmitter` 里 join，而
+/// `object_store_` 先于 `task_submitter_` 析构（cpp/src/ray/runtime/abstract_ray_runtime.h:122-124），
+/// 在途任务会往已释放的 store 写结果。`ray_shutdown` 因此要等这些 id 全部就绪。
+struct LocalTaskBookkeeping {
+    std::mutex mutex;
+    std::vector<std::string> ids;
+    /// 关闭已经开始，从取快照一直到 `ray::Shutdown()` 返回：拒绝新的本地任务提交，
+    /// 拒绝排空期间的 `ray_init`，拒绝第二个并发的 `ray_shutdown`。
+    bool shutting_down = false;
+};
+
+LocalTaskBookkeeping &local_tasks() {
+    static LocalTaskBookkeeping bookkeeping;
+    return bookkeeping;
+}
+
+/// id 列表的裁剪阈值：长跑的本地驱动每提交一个任务就增加 28 字节，达到这个大小时先丢掉已就绪的。
+constexpr size_t kLocalTaskPruneThreshold = 1024;
+
+/// 持 `local_tasks().mutex` 调用。用一次零期限的 `Wait` 取就绪快照，把已经就绪的 id 删掉。
+/// 本地模式下 `Wait` 的 `MemoryStore::Wait` 会忽略 TimedOut 并把找到的都报回来
+/// （src/ray/core_worker/store_provider/memory_store/memory_store.cc:450-486）。
+void prune_ready_local_tasks(ray::internal::RayRuntime &runtime,
+                             std::vector<std::string> &ids) {
+    if (ids.empty()) return;
+    auto ready = runtime.Wait(ids, static_cast<int>(ids.size()), 0);
+    std::vector<std::string> remaining;
+    remaining.reserve(ids.size());
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (i >= ready.size() || !ready[i]) {
+            remaining.push_back(std::move(ids[i]));
+        }
+    }
+    ids.swap(remaining);
+}
+
+}  // namespace
+
 int ray_init(const char *address, int local_mode, const char *node_ip,
              const char *code_search_path,
              const char *runtime_env_json,
@@ -753,8 +795,20 @@ int ray_init(const char *address, int local_mode, const char *node_ip,
     }
 
     try {
+        std::lock_guard<std::mutex> lock(local_tasks().mutex);
+        if (local_tasks().shutting_down) {
+            set_last_error("a ray_shutdown is still in progress");
+            return -1;
+        }
+        // 上游 `ray::Init` 在已经初始化时什么都不做（raysrc/cpp/src/ray/api.cc:25-30）：
+        // 运行时没有换，登记必须保留，否则在途任务不会被排空。
+        const bool already_initialized = ray::IsInitialized();
         ray::Init(config, argc, const_cast<char**>(arg_ptrs.data()));
         reopen_ref_count_gate();
+        if (!already_initialized) {
+            local_tasks().ids.clear();
+            local_tasks().shutting_down = false;
+        }
         return 0;
     } catch (const std::exception &e) {
         set_last_error_exception(e);
@@ -848,9 +902,82 @@ struct RefCountTicket {
     bool entered;
 };
 
+namespace {
+
+/// 提交普通任务；本地模式持锁检查关闭标志、按阈值裁剪并记录返回的 object id。
+/// 集群模式直接提交，不加锁、不记录。
+ray_bytes_t submit_task_and_record(
+    ray::internal::RayRuntime &runtime,
+    const ray::internal::RemoteFunctionHolder &holder,
+    std::vector<ray::internal::TaskArg> &task_args,
+    const ray::internal::CallOptions &options) {
+    if (!runtime.IsLocalMode()) {
+        std::string id = runtime.Call(holder, task_args, options);
+        return dup_bytes(id);
+    }
+    // 提交与 `ray_shutdown` 的排空用同一把锁互斥：排空取走快照之后不会再有 id 进来，
+    // 关闭开始之后提交的本地任务直接被拒。
+    std::string id;
+    {
+        std::lock_guard<std::mutex> lock(local_tasks().mutex);
+        // 关闭已经开始；或者调用方取到 `runtime` 之后已经发生了关闭（关闭已结束，
+        // 或关闭之后又建了另一个运行时）。两种情况都不能再用这条运行时：它的线程池
+        // 已经 join 过，再投递任务会让进程在退出析构时崩溃。
+        if (local_tasks().shutting_down || !ray::IsInitialized() ||
+            ray::internal::GetRayRuntime().get() != &runtime) {
+            set_last_error("Ray runtime is shutting down; refusing new local-mode task");
+            return ray_bytes_t{nullptr, 0};
+        }
+        auto &ids = local_tasks().ids;
+        if (ids.size() >= kLocalTaskPruneThreshold) {
+            prune_ready_local_tasks(runtime, ids);
+        }
+        id = runtime.Call(holder, task_args, options);
+        if (!id.empty()) {
+            ids.push_back(id);
+        }
+    }
+    return dup_bytes(id);
+}
+
+}  // namespace
+
 void ray_shutdown(void) {
-    close_ref_count_gate();
-    ray::Shutdown();
+    std::shared_ptr<ray::internal::RayRuntime> runtime;
+    std::vector<std::string> pending;
+    {
+        std::lock_guard<std::mutex> lock(local_tasks().mutex);
+        // 另一个线程已经在关闭：这一次直接返回，由那一次把运行时关掉。
+        if (local_tasks().shutting_down) return;
+        local_tasks().shutting_down = true;
+        pending.swap(local_tasks().ids);
+        // 与快照同一把锁：排空的 id 一定属于这个运行时；这条引用也让它在排空期间活下来。
+        runtime = ray::internal::GetRayRuntime();
+    }
+    if (runtime && runtime->IsLocalMode() && !pending.empty()) {
+        try {
+            runtime->Wait(pending, static_cast<int>(pending.size()), -1);
+        } catch (const std::exception &e) {
+            // `ray_shutdown` 是 extern "C" 且没有错误通道；排空失败时任务可能仍在运行，
+            // 让运行时消失会导致悬垂访问，就地终止并打印原因。
+            fprintf(stderr,
+                    "ray_shutdown: waiting for submitted local-mode tasks failed: %s\n",
+                    e.what());
+            std::abort();
+        } catch (...) {
+            fprintf(stderr,
+                    "ray_shutdown: waiting for submitted local-mode tasks failed: unknown exception\n");
+            std::abort();
+        }
+    }
+    {
+        // 关闭完成之前一直持锁：`ray_init` 也取这把锁，于是「初始化」与「关闭」互斥。
+        std::lock_guard<std::mutex> lock(local_tasks().mutex);
+        runtime.reset();
+        close_ref_count_gate();
+        ray::Shutdown();
+        local_tasks().shutting_down = false;
+    }
 }
 
 // ─── Object Store ─────────────────────────────────────────────
@@ -1173,8 +1300,7 @@ ray_bytes_t ray_task_call_with_options(const char *func_name,
         options.bundle_index = -1;
         parse_call_options(options_json, options);
         apply_default_task_cpu(options);
-        std::string id = runtime->Call(holder, task_args, options);
-        return dup_bytes(id);
+        return submit_task_and_record(*runtime, holder, task_args, options);
     } RAY_CATCH
     return ray_bytes_t{nullptr, 0};
 }
@@ -1223,8 +1349,7 @@ ray_bytes_t ray_task_call_python(const char *module_name,
 
         ray::internal::CallOptions options;
         apply_default_task_cpu(options);
-        std::string id = runtime->Call(holder, task_args, options);
-        return dup_bytes(id);
+        return submit_task_and_record(*runtime, holder, task_args, options);
     } catch (const std::exception &e) {
         set_last_error_exception(e);
         return ray_bytes_t{nullptr, 0};

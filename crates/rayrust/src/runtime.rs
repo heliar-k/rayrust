@@ -4,6 +4,7 @@
 //! We store them as `Vec<u8>` internally, not as Rust `String`.
 
 use std::os::raw::c_int;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use rayrust_sys::{self, build_args_array, to_cstring, CBytesGuard, ErrorKind, RayBytes};
@@ -161,6 +162,27 @@ impl RayConfig {
 /// it is what checks the config against the live runtime. Share one handle by
 /// passing `&Ray`.
 ///
+/// # Local-mode shutdown
+///
+/// In local mode, dropping the last [`Ray`] handle waits for every task
+/// submitted through the current runtime to finish (including its result
+/// becoming ready in the local object store) before shutting Ray down. Cluster
+/// mode does not wait for submitted tasks on drop. A local-mode task that never
+/// returns causes dropping the last handle to wait indefinitely. The same applies
+/// to dropping the last handle from inside a local-mode task body: the drain
+/// waits for that task's own result, which cannot become ready while the task
+/// is inside the drop. A Rust `panic!` inside a local-mode task crosses an
+/// `extern "C"` callback boundary and aborts the process immediately, so it
+/// does not leave shutdown waiting forever.
+/// Skipping `Drop` (for example with `std::mem::forget` or
+/// `std::process::exit` while a handle is still alive) bypasses this drain.
+///
+/// While the last handle is being dropped, which in local mode lasts until the
+/// submitted tasks have finished, [`Ray::connect`] returns [`RayError::Runtime`]
+/// instead of waiting for the shutdown to finish; a call from inside a task body
+/// (for example `Ray::local()`) gets the same error. That is what lets the drain
+/// make progress when a task tries to obtain a handle of its own.
+///
 /// # Example
 /// ```no_run
 /// use rayrust::prelude::*;
@@ -184,9 +206,15 @@ pub(crate) struct RayInner {
 
 impl Drop for RayInner {
     fn drop(&mut self) {
-        // 锁必须活到 `shutdown()` 返回：否则新 `connect` 会在关闭过程中重新初始化。
-        let mut live = LIVE.lock().expect("live runtime registry poisoned");
-        *live = None;
+        // 先置位，再动登记：`Ray::connect` 的第二道检查依赖这个顺序。
+        SHUTTING_DOWN.store(true, Ordering::SeqCst);
+        {
+            let mut live = LIVE.lock().expect("live runtime registry poisoned");
+            *live = None;
+            // 早一点唤醒：正在等旧运行时消失的 `connect` 会拿到「正在关闭」的错误，
+            // 而不是继续等一个可能正在等它自己的排空。
+            LIVE_CHANGED.notify_all();
+        }
         // 关闭之前先撤掉活着的代次：从这一刻起这个运行时的引用全部过期。
         // 代次守卫只负责提前跳过；引用计数调用与 C++ 侧关闭之间的互斥在 C 包装层
         // （`crates/rayrust-sys/wrapper/ray_c.cc` 的引用计数闸门）：关闭开始时闸门
@@ -197,8 +225,18 @@ impl Drop for RayInner {
         // 登记表跟着运行时清空：旧运行时的 handle 在新运行时里查不到，几个调用入口
         // 会因此在进 SDK 之前把它们拒掉。
         actor_registry::clear();
+        // 本地模式下 `ray_shutdown` 会在关闭引用计数闸门与 `ray::Shutdown()` 之前
+        // 等待本次运行时提交的所有任务就绪。排空可能在等一个任务，而本地模式的任务体
+        // 在驱动进程里执行、任务体里可能调用 `Ray::local()`，所以这里不能持有 `LIVE`。
         shutdown();
-        // 登记表已经清空、C++ 侧已经关掉，等着的 `connect` 可以初始化新运行时了。
+        // 关闭完成之后重新拿锁：只清掉已经失效的登记，别把之后建出来的运行时抹掉。
+        let mut live = LIVE.lock().expect("live runtime registry poisoned");
+        if let Some(handle) = live.as_ref() {
+            if handle.upgrade().is_none() {
+                *live = None;
+            }
+        }
+        SHUTTING_DOWN.store(false, Ordering::SeqCst);
         LIVE_CHANGED.notify_all();
     }
 }
@@ -209,20 +247,54 @@ static LIVE: Mutex<Option<Weak<RayInner>>> = Mutex::new(None);
 /// 登记表清空时唤醒正在等它的 `connect`。
 static LIVE_CHANGED: Condvar = Condvar::new();
 
+/// 最后一个句柄正在关闭。`Drop` 在碰 `LIVE` 之前置位，在 `shutdown()` 返回并重新
+/// 拿到 `LIVE` 之后复位。`connect` 看到它就直接返回错误：关闭期间的排空可能在等
+/// 一个任务，而任务体里可能调用 `Ray::local()`，让任务体去等 `LIVE` 会让两边互等。
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+fn shutting_down() -> bool {
+    SHUTTING_DOWN.load(Ordering::SeqCst)
+}
+
+/// 关闭期间请求运行时统一用的错误。
+fn shutting_down_error() -> RayError {
+    RayError::Runtime(
+        "the last Ray handle is being dropped; a new runtime cannot be initialized until the \
+         shutdown finishes"
+            .to_string(),
+    )
+}
+
 impl Ray {
     /// Connect to a Ray cluster with the given config.
     ///
     /// A second call with the same config returns a handle to the runtime that
     /// is already live. A config that differs returns [`RayError::Runtime`]
-    /// listing the fields that differ.
+    /// listing the fields that differ. While the last handle is being dropped,
+    /// every call returns [`RayError::Runtime`] without waiting for the shutdown
+    /// to finish, including a call made from inside a local-mode task.
     pub fn connect(config: &RayConfig) -> Result<Self, RayError> {
-        // 初始化与登记期间持有同一把锁：`Drop for RayInner` 不能在这中间
-        // 执行 `shutdown()`，新运行时就不会被旧运行时的关闭动作带走。
+        // 取锁之前先看一眼：关闭线程在排空期间不持有 LIVE（见 `Drop for RayInner`），
+        // 这一眼让任务体在绝大多数情况下连锁都不用碰。
+        if shutting_down() {
+            return Err(shutting_down_error());
+        }
         let mut live = LIVE.lock().expect("live runtime registry poisoned");
+        // 拿到锁之后再确认一次：`Drop` 先置位再清空登记，所以看到「没有登记」时这一眼
+        // 必然为真。
+        if shutting_down() {
+            return Err(shutting_down_error());
+        }
         let existing = loop {
             match live.as_ref() {
                 // 没有登记运行时，下面初始化。
-                None => break None,
+                None => {
+                    // 等到唤醒之后关闭可能已经开始（`Drop` 先置位、再清登记、再唤醒）。
+                    if shutting_down() {
+                        return Err(shutting_down_error());
+                    }
+                    break None;
+                }
                 Some(handle) => match handle.upgrade() {
                     Some(inner) => break Some(inner),
                     // 强引用计数归零时就升级不到，而那时 `Drop for RayInner`
