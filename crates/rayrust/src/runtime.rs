@@ -306,6 +306,19 @@ impl Ray {
     /// `RayError::Ffi`。每个 id 必须正好 28 字节，其他长度（包括 0 字节）同样返回
     /// `RayError::Ffi`，进程存活：这种 id 进入 `ObjectID::FromBinary` 会触发
     /// RAY_CHECK 终止进程，而 0 字节会变成永不就绪的 nil id。
+    ///
+    /// `num_objects` 必须在 `1..=object_refs.len()`，且 `object_refs` 里的 id 必须
+    /// 两两不同。集群模式的 `CoreWorker::Wait` 不看对象是否就绪，两类参数一律拒绝
+    /// （`src/ray/core_worker/core_worker.cc:1475-1483`）；`ray_wait` 在碰 runtime 之前按同样
+    /// 的规则拒掉，返回 `RayError::Ffi`，两种模式给出同一句话。本地模式没有 core worker，
+    /// 它的 `Wait` 把 id 收进集合去重却把原数量传下去
+    /// （`cpp/src/ray/runtime/object/local_mode_object_store.cc:82-97`）：数量大于去重后的
+    /// 集合大小、且还有 id 没进本地存储时，构造出的 `GetRequest` 撞上
+    /// `src/ray/core_worker/store_provider/memory_store/memory_store.cc:89` 的 RAY_CHECK，
+    /// 整个进程终止；全部 id 已经在本地存储里时它在构造 `GetRequest` 之前就返回
+    /// `Status::OK`，同一个输入得到的是 `Ok`。
+    /// 返回的 `ready` 最多 `num_objects` 个：两个引用都
+    /// 已就绪而 `num_objects` 为 1 时，另一个在 `unready` 里。
     pub fn wait<T>(
         &self,
         object_refs: &[ObjectRef<T>],
@@ -319,7 +332,9 @@ impl Ray {
     ///
     /// 一次 `ray_wait` 跑在 tokio blocking pool 上，等待的 tokio 工作线程不被占用。
     /// `timeout` 限制整次等待。每个 id 必须正好 28 字节，其他长度（包括 0 字节）
-    /// 返回 `RayError::Ffi`。
+    /// 返回 `RayError::Ffi`。`num_objects` 必须在 `1..=object_refs.len()`，id 必须
+    /// 两两不同，违反时同样返回 `RayError::Ffi`；这两种拒绝由同一次 `ray_wait` 做出，
+    /// 与 [`Ray::wait`] 相同，两种模式一致。
     pub async fn wait_async<T>(
         &self,
         object_refs: &[ObjectRef<T>],
@@ -1168,10 +1183,23 @@ pub(crate) fn duration_to_ms(timeout: std::time::Duration) -> i32 {
 /// Wait for objects to be locally available.
 ///
 /// # Arguments
-/// * `object_refs` - References to wait for.
-/// * `num_objects` - Minimum number of objects to wait for.
+/// * `object_refs` - References to wait for. Their ids must be pairwise distinct.
+/// * `num_objects` - Minimum number of objects to wait for. Must be in
+///   `1..=object_refs.len()`: Ray's own `CoreWorker::Wait` requires it whether or
+///   not the objects are ready (src/ray/core_worker/core_worker.cc:1475-1483). In
+///   local mode the ids are deduplicated while the count is passed on unchanged, so
+///   when the count is above the deduplicated set size and at least one deduplicated
+///   id is not in the local store yet, the request built there hits the RAY_CHECK in
+///   src/ray/core_worker/store_provider/memory_store/memory_store.cc:89 and ends the
+///   process; with every id already there, the store returns OK before building that
+///   request and the same input answers Ok. Either way the wrapper rejects it first,
+///   matching the cluster mode rule.
 /// * `timeout_ms` - Timeout in milliseconds. -1 for infinite, other negative
 ///   values are rejected with `RayError::Ffi`.
+///
+/// Both the count and the duplicate-id check happen in `ray_wait` before the
+/// runtime is touched, so local mode and cluster mode report the same sentence
+/// and the process survives.
 ///
 /// # Returns
 /// A tuple of (ready, unready) object references.
@@ -1193,14 +1221,7 @@ pub(crate) fn wait<T>(
         })
         .collect();
 
-    let result = unsafe {
-        rayrust_sys::ray_wait(
-            ids.as_ptr(),
-            ids.len(),
-            num_objects as c_int,
-            timeout_ms,
-        )
-    };
+    let result = unsafe { rayrust_sys::ray_wait(ids.as_ptr(), ids.len(), num_objects, timeout_ms) };
 
     if result.is_null() {
         return Err(ffi_error("ray_wait"));
@@ -3384,5 +3405,78 @@ mod tests {
             ),
             other => panic!("没有 runtime 时返回了 {:?}", other),
         }
+    }
+
+    /// 手工拼 28 字节的 id 直接调 C 入口。这些用例不 connect，进程里没有 runtime，
+    /// 所以只要前面几条参数检查放过去，错误就一定是 runtime 判空那条。
+    fn wait_with_hand_built_ids(ids: &[[u8; 28]], num_objects: usize) -> String {
+        let bytes: Vec<rayrust_sys::RayBytes> = ids
+            .iter()
+            .map(|id| rayrust_sys::RayBytes {
+                data: id.as_ptr() as *const std::os::raw::c_char,
+                len: id.len(),
+            })
+            .collect();
+        rayrust_sys::clear_error();
+        let result = unsafe { rayrust_sys::ray_wait(bytes.as_ptr(), bytes.len(), num_objects, 20) };
+        assert!(
+            result.is_null(),
+            "{} 个 id、num_objects = {} 时 ray_wait 没有返回空指针",
+            ids.len(),
+            num_objects
+        );
+        rayrust_sys::last_error().expect("C 入口没有记录错误")
+    }
+
+    #[test]
+    fn wait_rejects_a_count_above_the_id_count() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let message = wait_with_hand_built_ids(&[[0x11u8; 28]], 2);
+        assert!(
+            message
+                .contains("Number of objects to wait for must be between 1 and the number of ids."),
+            "错误文本不是数量那一句: {}",
+            message
+        );
+    }
+
+    #[test]
+    fn wait_rejects_a_zero_count() {
+        let message = wait_with_hand_built_ids(&[[0x12u8; 28]], 0);
+        assert!(
+            message
+                .contains("Number of objects to wait for must be between 1 and the number of ids."),
+            "错误文本不是数量那一句: {}",
+            message
+        );
+    }
+
+    #[test]
+    fn wait_rejects_duplicate_ids() {
+        let id = [0x13u8; 28];
+        let message = wait_with_hand_built_ids(&[id, id], 2);
+        assert!(
+            message.contains("Duplicate object IDs not supported in wait."),
+            "错误文本不是重复 id 那一句: {}",
+            message
+        );
+    }
+
+    #[test]
+    fn wait_lets_a_valid_count_and_distinct_ids_through_to_the_runtime_check() {
+        // 对照：参数合法时前面几条不拦，错误来自 runtime 判空。
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let message = wait_with_hand_built_ids(&[[0x14u8; 28], [0x15u8; 28]], 2);
+        assert!(
+            message.contains("Ray runtime is not initialized"),
+            "参数合法时错误不是 runtime 判空那条: {}",
+            message
+        );
     }
 }

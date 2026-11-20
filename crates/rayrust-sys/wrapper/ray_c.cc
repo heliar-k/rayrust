@@ -184,6 +184,7 @@ namespace ray::core {
 #include <new>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // ─── Function Registration ────────────────────────────────────
@@ -945,7 +946,7 @@ int ray_remove_local_reference(const char *id_data, size_t id_len) {
     return -1;
 }
 
-bool *ray_wait(const ray_bytes_t *ids, size_t count, int num_objects, int timeout_ms) {
+bool *ray_wait(const ray_bytes_t *ids, size_t count, size_t num_objects, int timeout_ms) {
     ray_clear_error();
     try {
         if (count > 0 && !ids) {
@@ -954,6 +955,31 @@ bool *ray_wait(const ray_bytes_t *ids, size_t count, int num_objects, int timeou
         }
         for (size_t i = 0; i < count; i++) {
             if (check_object_id(ids[i].data, ids[i].len) != 0) return nullptr;
+        }
+        // 数量与重复 id 这两条是 Ray 自己的规则（src/ray/core_worker/core_worker.cc:1475-1483）：
+        // 集群模式的 core worker 不看对象是否就绪，两类参数一律拒绝；本地模式没有 core
+        // worker，永远走不到那里，同一个输入在那里要么给出错误答案、要么终止进程。
+        // 终止那一路要两条同时成立：数量大于去重后的集合大小，且去重后的 id 里还有没进
+        // 本地存储的。本地模式把 id 收进 flat_hash_set 去重之后仍把原数量传给 memory_store
+        // （local_mode_object_store.cc:82-97），这时 GetImpl 构造的 GetRequest 数量大于它
+        // 持有的 id 个数，memory_store.cc:89 的 RAY_CHECK 终止整个进程，RAY_CATCH 抓不到；
+        // 全部 id 都已经在本地存储里时 GetImpl 在构造 GetRequest 之前就返回 Status::OK，
+        // 同一个输入得到的是 Ok。两种情形都要在碰 runtime 之前拒掉，才能与集群模式一致。
+        //
+        // 上界同时挡住超过 int 的值：SDK 的 `Wait` 只收 int，下面的 static_cast 因此安全。
+        if (num_objects < 1 || num_objects > count ||
+            num_objects > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            set_last_error(
+                "Number of objects to wait for must be between 1 and the number of ids.");
+            return nullptr;
+        }
+        // 28 字节的 id 没有额外信息，直接按字节比较。
+        std::unordered_set<std::string> seen_ids;
+        for (size_t i = 0; i < count; i++) {
+            if (!seen_ids.emplace(ids[i].data, ids[i].len).second) {
+                set_last_error("Duplicate object IDs not supported in wait.");
+                return nullptr;
+            }
         }
         auto runtime = ray::internal::GetRayRuntime();
         if (!runtime) {
@@ -967,7 +993,7 @@ bool *ray_wait(const ray_bytes_t *ids, size_t count, int num_objects, int timeou
             id_vec.emplace_back(ids[i].data, ids[i].len);
         }
 
-        auto results = runtime->Wait(id_vec, num_objects, timeout_ms);
+        auto results = runtime->Wait(id_vec, static_cast<int>(num_objects), timeout_ms);
 
         bool *out = static_cast<bool *>(std::malloc(count * sizeof(bool)));
         if (!out) return nullptr;
