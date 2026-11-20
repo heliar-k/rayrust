@@ -64,9 +64,41 @@ pub enum ActorLifetime {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RayConfig {
     /// Address of the head node, e.g. "192.168.42.141:6379".
-    /// If empty, uses local mode.
+    ///
+    /// The run mode comes from [`RayConfig::local_mode`] alone; an empty address
+    /// does not select local mode.
+    ///
+    /// Local mode ignores this field: nothing of it reaches the SDK and nothing of
+    /// it is validated. It still takes part in the config comparison of
+    /// [`Ray::connect`], so two local-mode configs whose addresses differ are
+    /// reported as different configs even though neither address was used.
+    ///
+    /// Cluster mode with a non-empty address requires `host:port`: a bracketed
+    /// IPv6 host, a non-empty host, and a port of decimal digits in
+    /// `0..=65535`. The port is read as the whole string, so a suffix the SDK
+    /// would silently drop (`"host:6379\n"`) is refused too. Anything else makes
+    /// the first [`Ray::connect`] return [`RayError::Ffi`] naming this field,
+    /// before the SDK is entered.
+    ///
+    /// What upstream did with each shape this entry refuses, measured on Ray
+    /// 2.51.1: a shape `ParseAddress` cannot split (no `:`, an IPv6 host without
+    /// brackets) stopped the driver in `ConfigInternal::SetBootstrapAddress`
+    /// (cpp/src/ray/config_internal.cc:255); an empty port, or one that does not
+    /// start with decimal digits, stopped it at `:261`; a port above `65535`, and
+    /// a port whose suffix `std::from_chars` drops, reached the GCS and stopped it
+    /// about 35 seconds later (cpp/src/ray/util/process_helper.cc:110); a negative
+    /// port stopped it in `GetNodeIpAddress` (cpp/src/ray/util/util.cc:42); an
+    /// empty host made upstream take the bootstrap address as unset and start a
+    /// head node instead (cpp/src/ray/util/process_helper.cc:84-92).
+    ///
+    /// Cluster mode with an empty address leaves the bootstrap address unset: the
+    /// SDK reads `RAY_ADDRESS` (cpp/src/ray/config_internal.cc:207-215) and, when
+    /// that is unset too, starts a head node itself
+    /// (cpp/src/ray/util/process_helper.cc:80-92).
     pub address: String,
     /// Run in local mode (single process, no cluster).
+    /// This is the field that decides the run mode; `address` is ignored while it
+    /// is true.
     pub local_mode: bool,
     /// Code search path for dynamic libraries (worker side).
     pub code_search_path: Vec<String>,
@@ -87,6 +119,10 @@ pub struct RayConfig {
 
 impl RayConfig {
     /// Create a new config pointing to a remote cluster.
+    ///
+    /// `address` must be `host:port`; a malformed one is rejected by the first
+    /// [`Ray::connect`] with [`RayError::Ffi`]. Use [`RayConfig::local`] for a
+    /// single process.
     pub fn new(address: impl Into<String>) -> Self {
         RayConfig {
             address: address.into(),
@@ -273,6 +309,24 @@ impl Ray {
     /// listing the fields that differ. While the last handle is being dropped,
     /// every call returns [`RayError::Runtime`] without waiting for the shutdown
     /// to finish, including a call made from inside a local-mode task.
+    ///
+    /// # Address validation
+    ///
+    /// Cluster mode requires [`RayConfig::address`] to be `host:port` when it is
+    /// non-empty, and `RAY_ADDRESS` to be `host:port` when the address is empty
+    /// and the variable is set (an empty value counts as set, and is refused the
+    /// same way). Either one that does not match returns [`RayError::Ffi`] naming
+    /// which one, before Ray is initialized. An empty address with no
+    /// `RAY_ADDRESS` is accepted: it means no bootstrap address is configured.
+    ///
+    /// A well-formed address that leads nowhere stays outside what this crate
+    /// rejects, and it terminates the process. With `node_ip` unset and a host
+    /// that does not resolve, it stops in `GetNodeIpAddress`
+    /// (cpp/src/ray/util/util.cc:42, `RAY_LOG(FATAL)`); with `node_ip` set the
+    /// resolution is skipped and the address joins a GCS that does not answer, so
+    /// the driver stops about 35 seconds later at
+    /// cpp/src/ray/util/process_helper.cc:110 (`RAY_CHECK_OK` on its
+    /// `GetNodeToConnectForDriver`).
     pub fn connect(config: &RayConfig) -> Result<Self, RayError> {
         // 取锁之前先看一眼：关闭线程在排空期间不持有 LIVE（见 `Drop for RayInner`），
         // 这一眼让任务体在绝大多数情况下连锁都不用碰。
@@ -1176,7 +1230,7 @@ fn check_cpp_sdk() {
             eprintln!("\n⚠️  WARNING: Ray C++ SDK not found on this node (missing {}).", default_worker.display());
             eprintln!("   Rust actors require 'pip install ray[cpp]' on ALL worker nodes.");
             eprintln!("   Without it, actor_create() succeeds but actor_call() hangs (NODE_DIED).");
-            eprintln!("   Use local mode (RAY_ADDRESS=local) if C++ SDK is unavailable.\n");
+            eprintln!("   Use local mode (RayConfig::local()) if C++ SDK is unavailable.\n");
         } else {
             // SDK exists on driver node — remind user to check worker nodes too
             eprintln!("ℹ️  Note: Rust actors in cluster mode require 'pip install ray[cpp]' on ALL worker nodes,");
@@ -3549,6 +3603,121 @@ mod tests {
             message.contains("Ray runtime is not initialized"),
             "参数合法时错误不是 runtime 判空那条: {}",
             message
+        );
+    }
+
+    /// 直调 C 入口提交一个地址，其余字段全不传。被拒的调用在进 SDK 之前就返回，
+    /// 进程里不会建出运行时。
+    fn ray_init_with_address(address: &str, local_mode: bool) -> i32 {
+        let address_c = to_cstring(address);
+        rayrust_sys::clear_error();
+        unsafe {
+            rayrust_sys::ray_init(
+                address_c.as_ptr(),
+                local_mode as i32,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+            )
+        }
+    }
+
+    /// 集群模式下不合规的地址在进 SDK 之前被拒：返回 -1，消息点名 `address` 与该形态的
+    /// 判别子串。这些形状在上游的结局不同：`ParseAddress` 拆不出来的停在
+    /// `config_internal.cc:255`，端口为空或不是十进制数字的停在 `:261`，端口超出 65535
+    /// 或带尾缀被 `from_chars` 截断的约 35 秒后停在 `process_helper.cc:110`，负端口停在
+    /// `util.cc:42`，空 host 让上游把 bootstrap 地址当成没设置、转头去起 head 节点。
+    #[test]
+    fn ray_init_rejects_an_address_that_is_not_host_port() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let cases: &[(&str, &str)] = &[
+            ("local", "no ':' separator"),
+            ("127.0.0.1", "no ':' separator"),
+            ("::1", "an IPv6 host must be bracketed"),
+            ("[::1", "an IPv6 host must be bracketed"),
+            ("[::1]", "an IPv6 host must be bracketed"),
+            ("[::1]junk:6379", "an IPv6 host must be bracketed"),
+            (":6399", "the host is empty"),
+            ("127.0.0.1:", "the port is empty"),
+            ("127.0.0.1:abc", "the port must be decimal digits"),
+            ("127.0.0.1:-1", "the port must be decimal digits"),
+            ("127.0.0.1:+6379", "the port must be decimal digits"),
+            ("127.0.0.1:6399abc", "the port must be decimal digits"),
+            ("127.0.0.1:  6399", "the port must be decimal digits"),
+            ("127.0.0.1:65536", "the port must be 0..=65535"),
+            ("127.0.0.1:65536000", "the port must be 0..=65535"),
+        ];
+        for (address, sentence) in cases {
+            let ret = ray_init_with_address(address, false);
+            assert_eq!(ret, -1, "集群模式下的地址 {:?} 没有被拒", address);
+            let message = rayrust_sys::last_error().expect("C 入口没有记录错误");
+            assert!(
+                message.contains("address \""),
+                "地址 {:?} 的错误消息没有点名 address: {}",
+                address,
+                message
+            );
+            assert!(
+                message.contains(sentence),
+                "地址 {:?} 的错误消息不是那一句: {}",
+                address,
+                message
+            );
+        }
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "被拒的调用建出了运行时"
+        );
+    }
+
+    /// 地址为空时 `RAY_ADDRESS` 被设置（包括空串）就按同一规则校验，消息点名
+    /// `RAY_ADDRESS`。上游在 config_internal.cc:207-215 读这个变量，空串同样走
+    /// `ParseAddress` 并在 :255 终止进程。
+    #[test]
+    fn ray_init_rejects_an_invalid_ray_address_when_the_address_is_empty() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let cases: &[(&str, &str)] = &[
+            ("local", "no ':' separator"),
+            ("", "no ':' separator"),
+            ("127.0.0.1", "no ':' separator"),
+            ("127.0.0.1:abc", "the port must be decimal digits"),
+            (":6379", "the host is empty"),
+        ];
+        for (env_value, sentence) in cases {
+            std::env::set_var("RAY_ADDRESS", env_value);
+            let ret = ray_init_with_address("", false);
+            std::env::remove_var("RAY_ADDRESS");
+            assert_eq!(ret, -1, "RAY_ADDRESS={:?} 没有被拒", env_value);
+            let message = rayrust_sys::last_error().expect("C 入口没有记录错误");
+            assert!(
+                message.contains("RAY_ADDRESS \""),
+                "RAY_ADDRESS={:?} 的错误消息没有点名这个变量: {}",
+                env_value,
+                message
+            );
+            assert!(
+                message.contains(sentence),
+                "RAY_ADDRESS={:?} 的错误消息不是那一句: {}",
+                env_value,
+                message
+            );
+        }
+        assert!(
+            std::env::var_os("RAY_ADDRESS").is_none(),
+            "用例跑完 RAY_ADDRESS 还在环境里"
+        );
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "被拒的调用建出了运行时"
         );
     }
 }
