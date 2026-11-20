@@ -3626,7 +3626,7 @@ mod tests {
     }
 
     /// 集群模式下不合规的地址在进 SDK 之前被拒：返回 -1，消息点名 `address` 与该形态的
-    /// 判别子串。这些形状在上游的结局不同：`ParseAddress` 拆不出来的停在
+    /// 判别子串。这些形状在上游的结局不同：`ParseAddress` 解析不出来的停在
     /// `config_internal.cc:255`，端口为空或不是十进制数字的停在 `:261`，端口超出 65535
     /// 或带尾缀被 `from_chars` 截断的约 35 秒后停在 `process_helper.cc:110`，负端口停在
     /// `util.cc:42`，空 host 让上游把 bootstrap 地址当成没设置、转头去起 head 节点。

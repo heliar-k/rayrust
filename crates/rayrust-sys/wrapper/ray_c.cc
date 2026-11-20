@@ -454,10 +454,10 @@ static int check_actor_id(const char *id_data, size_t id_len) {
 
 /// 校验 `host:port`，`field` 只用于错误消息（`"address"` 或 `"RAY_ADDRESS"`）。
 ///
-/// 拆分方式与上游 `ParseAddress`（src/ray/util/network_util.cc:53-73）一致：按最后一个
-/// `:` 拆，host 含 `:` 时必须是 `[` 开头 `]` 结尾再剥掉方括号。剩下的每条都必须自己判，
+/// 分段方式与上游 `ParseAddress`（src/ray/util/network_util.cc:53-73）一致：按最后一个
+/// `:` 分成 host 与 port，host 含 `:` 时必须是 `[` 开头 `]` 结尾再把方括号去掉。剩下的每条都必须自己判，
 /// 因为下游 `ConfigInternal::SetBootstrapAddress`
-/// （cpp/src/ray/config_internal.cc:253-262）对拆不出来的地址 RAY_CHECK 终止进程，
+/// （cpp/src/ray/config_internal.cc:253-262）对解析不出来的地址 RAY_CHECK 终止进程，
 /// `std::from_chars` 只吃前缀且不查范围：`"127.0.0.1:6399abc"` 静默变成端口 6399，
 /// `"127.0.0.1:65536"` 交给后续连接，`RAY_CATCH` 拦不住这两条。
 ///
@@ -788,7 +788,7 @@ int ray_init(const char *address, int local_mode, const char *node_ip,
     // 建的是 `LocalModeRayRuntime`（cpp/src/ray/runtime/abstract_ray_runtime.cc:48-51），
     // 本地模式没有 bootstrap 地址可用。
     //
-    // 交给 SDK 的不合规地址在上游分四种结局：`ParseAddress` 拆不出来的停在
+    // 交给 SDK 的不合规地址在上游分四种结局：`ParseAddress` 解析不出来的停在
     // `config_internal.cc:255`，端口为空或不是十进制数字的停在 `:261`，端口超出 65535
     // 或带尾缀被 `std::from_chars` 截断的交给后续连接、约 35 秒后停在
     // `process_helper.cc:110`，负端口停在 `util.cc:42`；空 host 让上游把 bootstrap 地址
@@ -803,7 +803,7 @@ int ray_init(const char *address, int local_mode, const char *node_ip,
     config.local_mode = local;
     // 空地址时下游会读 `RAY_ADDRESS`（cpp/src/ray/config_internal.cc:207-215）并走
     // 同一个 `SetBootstrapAddress`，所以环境变量按同一规则校验；被设置时（包括空串）
-    // 都要判，空串在那里同样是拆不出地址的输入。
+    // 都要判，空串在那里同样是解析不出地址的输入。
     if (!local && config.address.empty()) {
         const char *env = std::getenv("RAY_ADDRESS");
         if (env && check_bootstrap_address("RAY_ADDRESS", env) != 0) return -1;

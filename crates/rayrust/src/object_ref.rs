@@ -66,7 +66,7 @@
 //!
 //! 嵌套引用（返回的对象里装着别的对象引用）在 Rust 侧不可见：Ray 的
 //! `RayObject::GetNestedRefs()` 不在 wheel 附带的头文件里，`RayRuntime::Get`
-//! 也只交回载荷本身。Python 返回这样的值时，引用落在 pickle5 段里，Rust 解不开
+//! 也只交回载荷本身。Python 返回这样的值时，引用位于 pickle5 段里，Rust 解不开
 //! （`RayError::Serialization`）；它们既不会因为这个句柄而保持存活，也没有公开
 //! 途径读到那份列表（#19）。
 //!

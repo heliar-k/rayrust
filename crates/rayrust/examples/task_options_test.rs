@@ -147,7 +147,7 @@ fn scan_driver_log(needle: &str) -> Option<String> {
     None
 }
 
-/// 等日志落盘：每 50ms 扫一次，最多 2 秒。
+/// 等日志写完：每 50ms 扫一次，最多 2 秒。
 ///
 /// cancel 之后 core worker 写日志与进程读文件之间有延迟，读一次就断言会偶然失败。
 async fn wait_driver_log_line(needle: &str) -> Option<String> {
