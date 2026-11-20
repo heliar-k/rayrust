@@ -20,6 +20,7 @@
 //! ```
 
 pub mod actor_exit;
+pub(crate) mod actor_registry;
 pub mod async_runtime;
 pub mod error;
 pub mod object_ref;

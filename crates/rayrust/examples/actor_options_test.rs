@@ -61,9 +61,24 @@
 //! 9. 只有手写 options JSON 才能到达的 C 侧分支：`bundle_index` 没有组、
 //!    `bundle_index` 不是 JSON 整数、`placement_group_id` 不是 JSON 字符串，三条都是
 //!    `Ffi` + `Generic` 类别 + 进程存活。
+//! 10. actor 的语言判定（#71）：一个 16 字节未登记 id 的 `actor_call` → `Ffi` 且消息含
+//!    "is not registered in this process"（两种模式都跑：登记表在两种模式下都查）。
+//!    集群模式另外六条：用 `actor_create` 建出来的 C++ actor 调 `actor_call_python` →
+//!    `Ffi` 且消息含 "is a C++ actor"；用 Python `Counter` 调 `actor_call` → `Ffi` 且
+//!    消息含 "is a Python actor"；同一个 Python actor 的 `actor_call_python` 照常返回数值
+//!    （对照，证明拒绝只针对语言不匹配）；两次拒绝之后 C++ actor 的普通调用仍完成
+//!    （进程与运行时存活）。最后三条用原始 C ABI 建两个带名字的 actor（C++ 一个、Python
+//!    `Counter` 一个），它们的 id 不在登记表里、`actor_call` 先报未登记，再用
+//!    `get_actor` 取回：取回的 C++ handle 调 `actor_call_python` → "is a C++ actor"、
+//!    调 `actor_call` 读到值；取回的 Python handle 调 `actor_call` → "is a Python actor"、
+//!    调 `actor_call_python` 读到值。这两条证明 `get_actor` 集群路径从
+//!    `SerializeActorHandle` 字节里读出的语言与创建描述符类型是对的（改成恒报 CPP，
+//!    Python 那条会在 `actor_call` 的断言上失败）。
 //!
-//! 本地模式（`local`）跳过第 4、7 项并打印原因：第 4 项要查组，本地模式在查组之前
-//! 就报错；第 7 项要真组与 bundle 资源。第 3、9 项的拒绝都发生在查组之前，两种模式都跑。
+//! 本地模式（`local`）跳过第 4、7 项与第 10 项的集群部分并打印原因：第 4 项要查组，
+//! 本地模式在查组之前就报错；第 7 项要真组与 bundle 资源；第 10 项的集群部分要真的
+//! Python actor，本地模式建不出来（`actor_create_python` 拒绝本地模式）。第 3、9 项的
+//! 拒绝都发生在查组之前，两种模式都跑。
 
 use std::time::{Duration, Instant};
 
@@ -199,6 +214,32 @@ fn create_actor_with_raw_options(options_json: &str) -> Result<Vec<u8>, RayError
             options_json,
             kind
         );
+        let message = rayrust::sys::last_error().unwrap_or_else(|| "没有留下错误".to_string());
+        return Err(RayError::Ffi(message));
+    }
+    let id = unsafe { std::slice::from_raw_parts(bytes.data as *const u8, bytes.len) }.to_vec();
+    unsafe { rayrust::sys::ray_free_bytes(&mut bytes) };
+    Ok(id)
+}
+
+/// 直接调用 C ABI 的 `ray_actor_create_python_with_options`。
+///
+/// 第 10 项用它建一个带名字的 Python actor：这个入口同样不经过 crate 的登记表，
+/// `get_actor` 因此是首次登记，读出的语言与创建描述符类型才能被断言。
+fn create_python_actor_with_raw_options(options_json: &str) -> Result<Vec<u8>, RayError> {
+    let module = std::ffi::CString::new("rayrust_test").expect("module 名不含 NUL");
+    let class = std::ffi::CString::new("Counter").expect("class 名不含 NUL");
+    let options = std::ffi::CString::new(options_json).expect("options JSON 不含 NUL");
+    let mut bytes = unsafe {
+        rayrust::sys::ray_actor_create_python_with_options(
+            module.as_ptr(),
+            class.as_ptr(),
+            std::ptr::null(),
+            0,
+            options.as_ptr(),
+        )
+    };
+    if bytes.data.is_null() {
         let message = rayrust::sys::last_error().unwrap_or_else(|| "没有留下错误".to_string());
         return Err(RayError::Ffi(message));
     }
@@ -639,6 +680,149 @@ fn raw_decode_branches_check() {
     println!("  三条都在进 SDK 之前拒绝，进程存活（类别都是 Generic）");
 }
 
+/// 10. actor 的语言判定：入口要求的语言与 handle 登记的语言必须一致。
+async fn actor_language_checks(ray: &Ray, cluster: bool) {
+    println!("\n--- 10. actor 的语言判定 ---");
+
+    // 两种模式都跑：16 字节未登记的 id 在 crate 侧被拒，两种模式都要求登记。
+    let unknown = [0x11u8; 16];
+    expect_ffi_containing(
+        "actor_call(16 字节未登记 id)",
+        ray.actor_call(&unknown, "increment", &[], &[]),
+        "is not registered in this process",
+    );
+
+    if !cluster {
+        println!(
+            "  本地模式到此为止：本地模式没有 Python actor 可建（actor_create_python 拒绝），"
+        );
+        println!("  actor_call 在本地模式不做语言判定（见 Ray::actor_call 的文档）。");
+        return;
+    }
+
+    // C++ actor（`actor_create` 建出来的就是 C++ 语言）：Python 入口必须拒。
+    let cpp = counter_actor_create(ray, &ActorOptions::new(), 31i64).expect("创建 C++ actor");
+    expect_ffi_containing(
+        "actor_call_python(C++ actor)",
+        ray.actor_call_python(cpp.id(), "get", &[], &[]),
+        "is a C++ actor",
+    );
+
+    // Python actor：C++ 入口必须拒，Python 入口照常。
+    let python = create_counter_python(ray, &ActorOptions::new()).expect("创建 Python Counter");
+    expect_ffi_containing(
+        "actor_call(Python actor)",
+        ray.actor_call(python.id(), "increment", &[], &[]),
+        "is a Python actor",
+    );
+
+    // 对照：被拒的只是语言不匹配，同一个 Python actor 的 Python 入口照常返回数值。
+    let increment_arg = serialize(&2i64).expect("serialize the increment argument");
+    let call = ray
+        .actor_call_python(python.id(), "increment", &[&increment_arg[..]], &[])
+        .expect("submit increment on the Python actor");
+    let value: i64 = call
+        .cast()
+        .get_timeout(ACTOR_START_TIMEOUT_MS)
+        .expect("read increment");
+    assert_eq!(value, 2, "Python actor 的 increment 读到 {}", value);
+    println!(
+        "  对照：同一个 Python actor 的 actor_call_python → increment(2) = {}",
+        value
+    );
+
+    // 两次拒绝之后进程与运行时都还在：C++ actor 的普通调用仍然完成。
+    let value: i64 = counter_get(ray, &cpp)
+        .await
+        .expect("submit get")
+        .get_timeout(GET_TIMEOUT_MS)
+        .expect("read get");
+    assert_eq!(value, 31, "拒绝之后 C++ actor 的 get() 读到 {}", value);
+    println!(
+        "  拒绝之后 C++ actor 的 get() = {}（进程与运行时都存活）",
+        value
+    );
+
+    // `get_actor` 的集群路径：语言与创建描述符类型都从 SerializeActorHandle 的字节里
+    // 读。两个 actor 都走原始 C ABI 建，所以它们的 id 不在 crate 的登记表里，`get_actor`
+    // 拿到的是首次登记：把 `ray_get_actor` 读出的语言改坏（例如恒报 CPP），下面两条对
+    // 每种语言的断言都会失败。
+    let cpp_name = "__rayrust_named_cpp_actor";
+    let cpp_raw_id = create_actor_with_raw_options(&format!(r#"{{"name":"{}"}}"#, cpp_name))
+        .expect("原始 ABI 建带名字的 C++ actor");
+    expect_ffi_containing(
+        "原始 C ABI 建出来的 actor 的 actor_call",
+        ray.actor_call(&cpp_raw_id, &format!("{}::get", COUNTER_FACTORY), &[], &[]),
+        "is not registered in this process",
+    );
+    let cpp_named = ray
+        .get_actor(cpp_name, "")
+        .expect("get_actor(C++ 名字)")
+        .expect("找不到刚建的带名字 C++ actor");
+    assert_eq!(
+        cpp_named.id(),
+        &cpp_raw_id[..],
+        "get_actor 拿到的 C++ actor id 与创建时不同"
+    );
+    expect_ffi_containing(
+        "get_actor 取回的 C++ actor → actor_call_python",
+        ray.actor_call_python(cpp_named.id(), "get", &[], &[]),
+        "is a C++ actor",
+    );
+    let value: i64 = counter_get(ray, &cpp_named)
+        .await
+        .expect("提交 get")
+        .get_timeout(ACTOR_START_TIMEOUT_MS)
+        .expect("读 get");
+    assert_eq!(
+        value, 1,
+        "get_actor 取回的 C++ actor 的 get() 读到 {}",
+        value
+    );
+    println!("  对照：get_actor 取回的 C++ actor → get() = {}", value);
+
+    let python_name = "__rayrust_named_python_actor";
+    let python_raw_id =
+        create_python_actor_with_raw_options(&format!(r#"{{"name":"{}"}}"#, python_name))
+            .expect("原始 ABI 建带名字的 Python actor");
+    expect_ffi_containing(
+        "原始 C ABI 建出来的 Python actor 的 actor_call",
+        ray.actor_call(&python_raw_id, "increment", &[], &[]),
+        "is not registered in this process",
+    );
+    let python_named = ray
+        .get_actor(python_name, "")
+        .expect("get_actor(Python 名字)")
+        .expect("找不到刚建的带名字 Python actor");
+    assert_eq!(
+        python_named.id(),
+        &python_raw_id[..],
+        "get_actor 拿到的 Python actor id 与创建时不同"
+    );
+    expect_ffi_containing(
+        "get_actor 取回的 Python actor → actor_call",
+        ray.actor_call(python_named.id(), "increment", &[], &[]),
+        "is a Python actor",
+    );
+    let increment_arg = serialize(&4i64).expect("serialize the increment argument");
+    let call = ray
+        .actor_call_python(python_named.id(), "increment", &[&increment_arg[..]], &[])
+        .expect("提交 get_actor 取回的 Python actor 的 increment");
+    let value: i64 = call
+        .cast()
+        .get_timeout(ACTOR_START_TIMEOUT_MS)
+        .expect("读 increment");
+    assert_eq!(
+        value, 4,
+        "get_actor 取回的 Python actor 的 increment(4) 读到 {}",
+        value
+    );
+    println!(
+        "  对照：get_actor 取回的 Python actor → increment(4) = {}",
+        value
+    );
+}
+
 #[tokio::main]
 async fn main() {
     let mode = std::env::args()
@@ -662,6 +846,7 @@ async fn main() {
     default_bundle_index_not_pinned_check(&ray, cluster).await;
     local_mode_check(&ray, cluster).await;
     raw_decode_branches_check();
+    actor_language_checks(&ray, cluster).await;
 
     // 让 tokio 的 blocking pool 里的 FFI 调用有机会收尾，避免退出竞态。
     tokio::time::sleep(Duration::from_millis(200)).await;
