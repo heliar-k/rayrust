@@ -67,8 +67,33 @@ typedef struct {
 // ─── Lifecycle ────────────────────────────────────────────────
 
 /// Initialize Ray runtime.
-/// `address` is "ip:port" of the head node (e.g. "192.168.42.141:6379").
-/// Pass NULL or empty string for local mode.
+/// `local_mode` alone decides the run mode: non-zero builds `LocalModeRayRuntime`
+///   (cpp/src/ray/runtime/abstract_ray_runtime.cc:48-51), zero joins a cluster.
+///   `address` never selects the mode.
+/// `address` is the "host:port" of the head node (e.g. "192.168.42.141:6379").
+/// In local mode it is ignored entirely: it is not handed to the SDK and not
+///   validated, whatever the string is.
+/// In cluster mode an empty or NULL address means no bootstrap address is set,
+///   so the SDK looks at the `RAY_ADDRESS` environment variable and, if that is
+///   unset too, starts a head node itself
+///   (cpp/src/ray/config_internal.cc:207-215, cpp/src/ray/util/process_helper.cc:80-92).
+/// In cluster mode a non-empty address must be `host:port`: a bracketed IPv6
+///   host, a non-empty host, and a decimal port in 0..=65535. An address that does
+///   not match, and a `RAY_ADDRESS` that does not match while `address` is empty
+///   (an empty value counts as set, and is refused the same way), both return -1
+///   with the reason in ray_last_error() before the SDK is entered.
+/// What upstream did with each shape this entry refuses: the ones `ParseAddress`
+///   cannot split (no `:`, an IPv6 host without brackets) and the ones whose port
+///   is empty or does not start with decimal digits stopped the process in the
+///   RAY_CHECK of `ConfigInternal::SetBootstrapAddress`
+///   (cpp/src/ray/config_internal.cc:255, :261), which RAY_CATCH cannot catch; a
+///   port above 0..=65535 and a port whose suffix `std::from_chars` drops went on
+///   to the GCS and stopped it about 35 seconds later at
+///   cpp/src/ray/util/process_helper.cc:110; a negative port stopped it at
+///   cpp/src/ray/util/util.cc:42; and an empty host is not an empty address: it
+///   made upstream take the bootstrap address as unset and start a head node with
+///   the port it split off (cpp/src/ray/util/process_helper.cc:84-92), which is why
+///   this entry refuses it.
 /// `node_ip` is the IP address of this node as seen by the cluster.
 ///   Pass NULL to auto-detect.
 /// `code_search_path` is a colon-separated list of directories or .so files
@@ -81,12 +106,17 @@ typedef struct {
 /// `namespace` is the job-level namespace for named actors.
 ///   Pass NULL or empty string for default (no namespace).
 /// Returns 0 on success, -1 on failure.
+/// The address checks run before the shutdown check: when an address is refused,
+/// ray_last_error() carries that message and not
+/// `a ray_shutdown is still in progress`.
 /// A local-mode shutdown that is still running reports -1 with
 /// `a ray_shutdown is still in progress` in ray_last_error(), and
 /// leaves the runtime and the bookkeeping of the running shutdown untouched.
 /// A call while Ray is already initialized is a no-op that keeps the pending
 /// local-mode task list: the runtime does not change, so the tasks still have to
-/// be waited for on shutdown.
+/// be waited for on shutdown. The address checks still run first, so a malformed
+/// address returns -1 there even though `ray::Init` itself does nothing at that
+/// point (cpp/src/ray/api.cc:25-31).
 int ray_init(const char *address, int local_mode, const char *node_ip,
              const char *code_search_path,
              const char *runtime_env_json,
