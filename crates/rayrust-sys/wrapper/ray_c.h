@@ -136,11 +136,27 @@ int ray_remove_local_reference(const char *id_data, size_t id_len);
 /// without touching Ray for the same reasons as ray_get; an empty id would
 /// become the nil id and wait as an object that never becomes ready.
 /// `count` is the number of IDs.
-/// `num_objects` is the minimum number to wait for.
+/// `num_objects` is the minimum number to wait for. It must be between 1 and
+/// `count`, and no larger than INT_MAX: Ray's `Wait` takes an `int`, so values
+/// above INT_MAX could not be handed on. Anything else is rejected without
+/// touching Ray.
+/// The IDs must be pairwise distinct. Ray's own `CoreWorker::Wait` rejects a
+/// count outside 1..=count and repeated ids whether or not the objects are ready
+/// (src/ray/core_worker/core_worker.cc:1475-1483); the wrapper applies the same
+/// rules in both modes, so local mode and cluster mode report the same text. In
+/// local mode the ids are deduplicated while `num_objects` is passed on unchanged
+/// (cpp/src/ray/runtime/object/local_mode_object_store.cc:82-97); a count above the
+/// deduplicated set size ends the process in the RAY_CHECK of
+/// src/ray/core_worker/store_provider/memory_store/memory_store.cc:89 only when at
+/// least one deduplicated id is not in the local store yet. With every id already
+/// there, the store returns Status::OK() before it builds a GetRequest, so the same
+/// input answers Ok instead of ending the process.
+/// Both rejections carry the sentence Ray's own `CoreWorker::Wait` produces
+/// (src/ray/core_worker/core_worker.cc:1475-1483).
 /// `timeout_ms` is -1 for infinite wait.
 /// Returns a heap-allocated bool array (one per input ID).
 /// Caller must free with ray_free_bools.
-bool *ray_wait(const ray_bytes_t *ids, size_t count, int num_objects, int timeout_ms);
+bool *ray_wait(const ray_bytes_t *ids, size_t count, size_t num_objects, int timeout_ms);
 
 // ─── Task ─────────────────────────────────────────────────────
 

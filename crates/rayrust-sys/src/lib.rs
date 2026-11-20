@@ -67,7 +67,7 @@ extern "C" {
     pub fn ray_wait(
         ids: *const RayBytes,
         count: usize,
-        num_objects: c_int,
+        num_objects: usize,
         timeout_ms: c_int,
     ) -> *mut bool;
 
