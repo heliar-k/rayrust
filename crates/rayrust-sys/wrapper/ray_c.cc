@@ -702,9 +702,39 @@ static void parse_call_options(const char *options_json,
 /// `--num-cpus` 限不住并发。
 ///
 /// `emplace` 不覆盖已有的键：显式写 `"CPU":0` 的调用方保留 0。本地模式的
-/// `LocalModeTaskSubmitter` 丢弃整个 options，这一步在本地模式没有效果。
+/// `LocalModeTaskSubmitter::SubmitTask` 丢掉整个 `CallOptions`
+/// （`local_mode_task_submitter.cc:138-140` 调 `Submit(invocation, {})`，任务规格里的资源表是
+/// 空的），这一步在本地模式没有效果。
 static void apply_default_task_cpu(ray::internal::CallOptions &options) {
     options.resources.emplace("CPU", 1.0);
+}
+
+/// 补上 actor 的默认 CPU：Python 的 `@ray.remote` 在 `resources` 里出现除
+/// `"memory"` 与 `"object_store_memory"` 之外的键时，给 actor 的 lifetime 加 1 个 CPU
+/// （`ray/actor.py:1660` 用 `not set(resources.keys()).difference({"memory",
+/// "object_store_memory"})` 分成两支，`else` 那支取常量
+/// `DEFAULT_ACTOR_CREATION_CPU_SPECIFIED = 1`，见 `ray/_private/ray_constants.py:179`）。
+/// 内存键进得了这张表却不算资源：
+/// `ray/_common/utils.py:136-140` 不允许在 `resources=` 里写 `memory` 与
+/// `object_store_memory`，它们只能经 `memory=` 与 `object_store_memory=` 写进同一张表
+/// （同文件 `:157-160`），所以「只有内存键」这一支在本绑定里对应写了 `memory` 而没写别的
+/// 资源的 `resources`。C++ SDK 的 `ActorCreationOptions` 没有这个默认
+/// （`cpp/include/ray/api/task_options.h:104-112`，`resources` 就在这几行），少了这一步
+/// actor 只占它自己写的资源，`--num-cpus` 限不住它。
+///
+/// `emplace` 不覆盖已有的键：显式写 `"CPU":0` 是退出这一默认的方式，显式写
+/// `"CPU":2` 保留 2。本地模式的提交器给 actor 的任务规格传的是空资源表
+/// （`local_mode_task_submitter.cc:42-43`、`:66-67`），资源字段在本地模式没有效果；
+/// `name`、`max_restarts`、`max_concurrency` 仍然会读（同文件 `:146-149`、`:81`、`:84`）。
+static void apply_default_actor_cpu(ray::internal::ActorCreationOptions &options) {
+    bool names_other_resources = false;
+    for (const auto &entry : options.resources) {
+        if (entry.first != "memory" && entry.first != "object_store_memory") {
+            names_other_resources = true;
+            break;
+        }
+    }
+    if (names_other_resources) options.resources.emplace("CPU", 1.0);
 }
 
 // ─── Lifecycle ────────────────────────────────────────────────
@@ -1540,6 +1570,7 @@ ray_bytes_t ray_actor_create_with_options(const char *func_name,
         ray::internal::ActorCreationOptions options;
         options.bundle_index = -1;
         parse_actor_options(options_json, options);
+        apply_default_actor_cpu(options);
         std::string id = runtime->CreateActor(holder, task_args, options);
         return dup_bytes(id);
     } RAY_CATCH
@@ -1639,6 +1670,7 @@ ray_bytes_t ray_actor_create_python_with_options(const char *module_name,
         ray::internal::ActorCreationOptions options;
         options.bundle_index = -1;
         parse_actor_options(options_json, options);
+        apply_default_actor_cpu(options);
         std::string id = runtime->CreateActor(holder, task_args, options);
         return dup_bytes(id);
     } catch (const std::exception &e) {

@@ -252,9 +252,10 @@ bool *ray_wait(const ray_bytes_t *ids, size_t count, size_t num_objects, int tim
 /// tasks run at once. An explicit `"CPU":0` is the only way to ask for zero CPU;
 /// a map with other resources and no `CPU` still gets 1.0 merged in.
 /// Local mode rejects `placement_group_id` outright (the SDK has no placement
-/// group lookup there) and drops the other three fields: LocalModeTaskSubmitter
-/// calls `Submit(invocation, {})`, so name, resources and runtime_env have no
-/// effect.
+/// group lookup there) and drops the other three fields:
+/// `LocalModeTaskSubmitter::SubmitTask` calls `Submit(invocation, {})`
+/// (`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:138-140`), so name,
+/// resources and runtime_env have no effect.
 /// Pass NULL or empty string for no options (all defaults).
 /// Returns a ray_bytes_t containing the binary object ID of the result.
 /// On error, returns ray_bytes_t with data=NULL.
@@ -342,6 +343,28 @@ ray_bytes_t ray_task_call_python(const char *module_name,
 ///     "bundle_index": 0                // bundle index within the placement group
 ///   }
 /// Pass NULL or empty string for no options (all defaults).
+/// `resources` gets an actor default the C++ SDK does not apply: when it names any
+/// resource other than `memory` and `object_store_memory` and does not name `CPU`,
+/// 1.0 CPU is added for the actor's lifetime. That is the branch Python's
+/// `@ray.remote` takes when
+/// `set(resources.keys()).difference({"memory", "object_store_memory"})` is
+/// non-empty (`ray/actor.py:1660-1672`), and `DEFAULT_ACTOR_CREATION_CPU_SPECIFIED`
+/// is 1 (`ray/_private/ray_constants.py:179`). An existing `CPU` key is never
+/// overwritten, so `"CPU":0` opts out and `"CPU":2` stays 2. Naming only the
+/// memory keys, or naming nothing, adds no CPU, and that actor holds no CPU for its
+/// lifetime (`DEFAULT_ACTOR_CREATION_CPU_SIMPLE` is 0, same file `:175`); Python
+/// pairs that branch with a 1 CPU requirement per method
+/// (`DEFAULT_ACTOR_METHOD_CPU_SIMPLE`), and the C++ SDK's `ActorCreationOptions`
+/// has no method-CPU field (`cpp/include/ray/api/task_options.h:104-112`), so here
+/// such an actor holds no CPU at all.
+/// The memory keys reach the same table from the `memory=` and
+/// `object_store_memory=` options and never from `resources=`, which rejects them
+/// (`ray/_common/utils.py:136-140`, `:157-160`); an actor with a `resources` table
+/// that holds nothing but them is the only-memory case above.
+/// Local mode builds the actor's task spec with an empty resource table
+/// (`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:42-43`, `:66-67`), so this
+/// default has no effect there; the name and the two actor limits are still read
+/// (`:146-149`, `:81`, `:84`).
 /// `runtime_env` is the user-shaped document Python's `runtime_env=` takes, the
 /// same one `ray_task_call_with_options` accepts: `{"env_vars":{...}}`,
 /// `{"pip":[...]}`. Its value is a JSON string holding that document, so the
