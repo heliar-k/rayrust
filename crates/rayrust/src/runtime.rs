@@ -2040,7 +2040,8 @@ fn check_task_options(opts: &TaskOptions) -> Result<(), RayError> {
 /// - `resources` — CPU/GPU requirements
 /// - `max_restarts` — restart on failure (default 0 = no restart)
 /// - `max_concurrency` — max concurrent method calls (default 1)
-/// - `serialized_runtime_env_info` — runtime environment info string
+/// - `runtime_env` — user-shaped runtime env document, the same shape as
+///   [`TaskOptions::runtime_env`]
 /// - `placement_group` — bind actor to a placement group bundle
 ///
 /// `resources` carries no task-like default here: an actor reserves exactly what
@@ -2083,8 +2084,28 @@ pub struct ActorOptions {
     pub max_restarts: i32,
     /// Maximum number of concurrent method calls. 1 = serial (default).
     pub max_concurrency: i32,
-    /// Serialized runtime environment info string.
-    pub serialized_runtime_env_info: String,
+    /// User-shaped runtime env document, the same shape as
+    /// [`TaskOptions::runtime_env`]: `{"env_vars":{"FOO":"bar"}}`,
+    /// `{"pip":["requests"]}`. Empty = no runtime env. Text that is not JSON, a
+    /// JSON array and a JSON scalar return [`RayError::Ffi`] before the actor is
+    /// created, because the core worker parses the string it receives with
+    /// `RAY_CHECK(JsonStringToMessage(...).ok())`
+    /// (`src/ray/core_worker/core_worker.cc:1792-1796`) and would terminate the
+    /// driver. The C entry converts the document with
+    /// `ray::RuntimeEnv::Deserialize(...).SerializeToRuntimeEnvInfo()`
+    /// (`cpp/src/ray/runtime/runtime_env.cc:57-76`), so the core worker always
+    /// receives valid proto-JSON. `{}` is submitted as a document that exists and
+    /// holds nothing, which is what [`TaskOptions::runtime_env`] does with it too.
+    /// In local mode a C++ actor can still be created and the document is still
+    /// validated (a malformed one returns [`RayError::Ffi`]), but it has no effect:
+    /// `LocalModeTaskSubmitter::Submit` calls `SetCommonTaskSpec` without the
+    /// optional `runtime_env_info` argument (`task_util.h:153`, `:184-186`), so the
+    /// task spec carries no runtime env and the submitter never reads this field
+    /// (`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:52-72`); it does
+    /// still read `name` (`CreateActor`, same file `:146-149`) and `max_restarts`
+    /// and `max_concurrency` (`:81`, `:84`). The Python creation entry rejects local
+    /// mode before options are parsed (#68).
+    pub runtime_env: String,
     /// Binary placement group ID, exactly 18 bytes when non-empty.
     /// Empty = do not bind to a placement group.
     pub placement_group_id: Vec<u8>,
@@ -2112,7 +2133,7 @@ impl Default for ActorOptions {
             resources: Vec::new(),
             max_restarts: 0,
             max_concurrency: 1,
-            serialized_runtime_env_info: String::new(),
+            runtime_env: String::new(),
             placement_group_id: Vec::new(),
             bundle_index: -1,
         }
@@ -2161,9 +2182,11 @@ impl ActorOptions {
         self
     }
 
-    /// Set the serialized runtime environment info string.
-    pub fn runtime_env_info(mut self, info: impl Into<String>) -> Self {
-        self.serialized_runtime_env_info = info.into();
+    /// Set the user-shaped runtime env document, e.g.
+    /// `{"env_vars":{"FOO":"bar"}}`. The accepted shape and the errors are
+    /// described on the `runtime_env` field.
+    pub fn runtime_env(mut self, json: impl Into<String>) -> Self {
+        self.runtime_env = json.into();
         self
     }
 
@@ -2186,6 +2209,8 @@ impl ActorOptions {
 
     /// Serialize to a JSON string for the C ABI `options_json` parameter.
     /// Returns empty string if no options are set (all defaults).
+    /// `runtime_env` is embedded as a JSON string value holding the document text,
+    /// so the document can never splice keys into the outer JSON.
     fn to_json(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
 
@@ -2205,10 +2230,10 @@ impl ActorOptions {
         if self.max_concurrency != 1 {
             parts.push(format!("\"max_concurrency\":{}", self.max_concurrency));
         }
-        if !self.serialized_runtime_env_info.is_empty() {
+        if !self.runtime_env.is_empty() {
             parts.push(format!(
-                "\"serialized_runtime_env_info\":\"{}\"",
-                json_escape(&self.serialized_runtime_env_info)
+                "\"runtime_env\":\"{}\"",
+                json_escape(&self.runtime_env)
             ));
         }
         if !self.placement_group_id.is_empty() {
@@ -3445,6 +3470,36 @@ mod tests {
         assert_eq!(opts.to_json(), "");
         let opts = ActorOptions::new().max_restarts(3).max_concurrency(10);
         assert_eq!(opts.to_json(), r#"{"max_restarts":3,"max_concurrency":10}"#);
+    }
+
+    #[test]
+    fn actor_options_to_json_runtime_env_is_a_string_value() {
+        let opts = ActorOptions::new().runtime_env(r#"{"env_vars":{"FOO":"bar"}}"#);
+        assert_eq!(
+            opts.to_json(),
+            r#"{"runtime_env":"{\"env_vars\":{\"FOO\":\"bar\"}}"}"#
+        );
+        // 注入串只能留在 runtime_env 的字符串值里，外层不会多出第二个 name 键。
+        let opts = ActorOptions::new()
+            .name("intended")
+            .runtime_env(r#"{"env_vars":{}},"name":"hijack""#);
+        assert_eq!(
+            opts.to_json(),
+            "{\"name\":\"intended\",\"runtime_env\":\"{\\\"env_vars\\\":{}},\\\"name\\\":\\\"hijack\\\"\"}"
+        );
+    }
+
+    #[test]
+    fn actor_options_runtime_env_builder_sets_the_field() {
+        let opts = ActorOptions::new().runtime_env(r#"{"pip":["requests"]}"#);
+        assert_eq!(opts.runtime_env, r#"{"pip":["requests"]}"#);
+        assert_eq!(
+            opts.to_json(),
+            "{\"runtime_env\":\"{\\\"pip\\\":[\\\"requests\\\"]}\"}"
+        );
+        // 空串表示没有 runtime env：这个键不出现，整份 options 也就为空。
+        assert_eq!(ActorOptions::new().runtime_env("").to_json(), "");
+        assert_eq!(ActorOptions::default().to_json(), "");
     }
 
     // ── placement group 查询结果的解码 ───────────────────

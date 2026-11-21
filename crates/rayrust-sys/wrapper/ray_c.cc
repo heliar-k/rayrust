@@ -608,6 +608,35 @@ static void parse_placement_group_fields(const nlohmann::json &j,
     group = found;
 }
 
+/// 把 options JSON 里的 `runtime_env` 转成 SDK 的 runtime env info。
+///
+/// Rust 侧把这个字段当成 JSON 字符串值放进外层 options，所以外层文档没有拼接机会，
+/// 标量也不会被当成对象。内容必须是 JSON 对象：转换走
+/// `ray::RuntimeEnv::Deserialize(...).SerializeToRuntimeEnvInfo()`
+/// （cpp/src/ray/runtime/runtime_env.cc:57-76），它把用户文档的 `dump()` 放进
+/// `serialized_runtime_env`，再用 `MessageToJsonString` 生成 proto-JSON，交给 core
+/// worker 的永远是合法 proto-JSON。core worker 自己用
+/// `RAY_CHECK(JsonStringToMessage(...).ok())` 解析这个字段
+/// （src/ray/core_worker/core_worker.cc:1792-1796），原文不是 proto-JSON 时 RAY_CHECK
+/// 直接终止驱动进程，RAY_CATCH 拦不住，所以校验必须在这里做完（抛异常由调用侧的
+/// catch 转成 `RayError::Ffi`）。任务与 actor 两个入口共用这一份判定。
+static void apply_runtime_env(const nlohmann::json &j, std::string &out) {
+    if (!j.contains("runtime_env")) return;
+    if (!j["runtime_env"].is_string()) {
+        throw std::runtime_error(
+            "runtime_env must be a JSON string holding a runtime env object, "
+            "got " + j["runtime_env"].dump());
+    }
+    std::string runtime_env_json = j["runtime_env"].get<std::string>();
+    auto runtime_env = nlohmann::json::parse(runtime_env_json);
+    if (!runtime_env.is_object()) {
+        throw std::runtime_error(
+            "runtime_env must be a JSON object, got " + runtime_env.dump());
+    }
+    out = ray::RuntimeEnv::Deserialize(runtime_env_json)
+              .SerializeToRuntimeEnvInfo();
+}
+
 /// 解析 options JSON 并填充 ActorCreationOptions。`options_json` 可以为 NULL 或
 /// 空串（全部取默认值）。
 static void parse_actor_options(const char *options_json,
@@ -631,20 +660,16 @@ static void parse_actor_options(const char *options_json,
     if (j.contains("max_concurrency")) {
         options.max_concurrency = j["max_concurrency"].get<int>();
     }
-    if (j.contains("serialized_runtime_env_info")) {
-        options.serialized_runtime_env_info =
-            j["serialized_runtime_env_info"].get<std::string>();
-    }
     parse_placement_group_fields(j, options.group, options.bundle_index);
+    apply_runtime_env(j, options.serialized_runtime_env_info);
 }
 
 /// Parse an options JSON string and fill a CallOptions struct.
 /// `options_json` may be NULL or empty (returns default options).
 ///
-/// The placement group fields go through `parse_placement_group_fields`, which
-/// throws instead of letting the task run outside the group the caller asked
-/// for or letting an SDK RAY_CHECK abort the driver. `runtime_env` keeps its own
-/// check below because the actor path has no such field.
+/// The placement group fields go through `parse_placement_group_fields` and the
+/// runtime env through `apply_runtime_env`; both throw instead of letting the SDK
+/// terminate the driver or run the task somewhere the caller did not ask for.
 static void parse_call_options(const char *options_json,
                                ray::internal::CallOptions &options) {
     if (!options_json || options_json[0] == '\0') return;
@@ -665,25 +690,7 @@ static void parse_call_options(const char *options_json,
         }
     }
     parse_placement_group_fields(j, options.group, options.bundle_index);
-    if (j.contains("runtime_env")) {
-        // The Rust side sends the runtime env as a JSON string value, so the
-        // outer document has no splicing opportunity and a scalar never looks
-        // like an object.
-        if (!j["runtime_env"].is_string()) {
-            throw std::runtime_error(
-                "runtime_env must be a JSON string holding a runtime env object, "
-                "got " + j["runtime_env"].dump());
-        }
-        std::string runtime_env_json = j["runtime_env"].get<std::string>();
-        auto runtime_env = nlohmann::json::parse(runtime_env_json);
-        if (!runtime_env.is_object()) {
-            throw std::runtime_error(
-                "runtime_env must be a JSON object, got " + runtime_env.dump());
-        }
-        options.serialized_runtime_env_info =
-            ray::RuntimeEnv::Deserialize(runtime_env_json)
-                .SerializeToRuntimeEnvInfo();
-    }
+    apply_runtime_env(j, options.serialized_runtime_env_info);
 }
 
 /// 补上任务的默认 CPU：Python 的 `@ray.remote` 给每个任务要 1 个 CPU

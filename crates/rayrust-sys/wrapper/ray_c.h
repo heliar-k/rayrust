@@ -337,11 +337,24 @@ ray_bytes_t ray_task_call_python(const char *module_name,
 ///     "resources": {"CPU":1,"GPU":1},  // resource requirements
 ///     "max_restarts": 3,               // restart on failure (default 0)
 ///     "max_concurrency": 10,           // max concurrent method calls (default 1)
-///     "serialized_runtime_env_info": "...",  // runtime env info string
+///     "runtime_env": "{\"env_vars\":{\"FOO\":\"bar\"}}",  // runtime env document
 ///     "placement_group_id": "a1b2c3...", // hex-encoded binary placement group ID
 ///     "bundle_index": 0                // bundle index within the placement group
 ///   }
 /// Pass NULL or empty string for no options (all defaults).
+/// `runtime_env` is the user-shaped document Python's `runtime_env=` takes, the
+/// same one `ray_task_call_with_options` accepts: `{"env_vars":{...}}`,
+/// `{"pip":[...]}`. Its value is a JSON string holding that document, so the
+/// document cannot splice keys into the options JSON. The document must be a JSON
+/// object: a non-string value, text that is not JSON, a JSON array or scalar
+/// returns an error with RAY_ERROR_KIND_GENERIC before the actor is created.
+/// Converting the document into the info string the core worker wants is
+/// `ray::RuntimeEnv::Deserialize(...).SerializeToRuntimeEnvInfo()`
+/// (`cpp/src/ray/runtime/runtime_env.cc:57-76`); the core worker parses the
+/// string it receives with `RAY_CHECK(JsonStringToMessage(...).ok())`
+/// (`src/ray/core_worker/core_worker.cc:1792-1796`), which terminates the driver.
+/// An absent key means no runtime env, and so does a `NULL` or empty
+/// `options_json`.
 /// The placement group fields are validated before they reach the SDK: a
 /// `placement_group_id` that is empty, not hex, or not exactly 18 bytes, a
 /// `bundle_index` outside -1 .. 2147483647 (including values that do not fit in
