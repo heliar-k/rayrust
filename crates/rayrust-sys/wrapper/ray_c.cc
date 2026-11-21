@@ -1390,6 +1390,35 @@ ray_bytes_t ray_task_call_python(const char *module_name,
                                   const bool *is_ref) {
     ray_clear_error();
     try {
+        // 次序按参数次序：module 是第一个参数，它的两条检查先报。这两条检查都排在取
+        // 运行时之前，被拒的调用不建运行时、不建 holder、不提交任务、不碰 SDK，也能在
+        // 没有运行时的进程里测；它们还排在下面对本地模式的判定之前，所以本地模式 +
+        // 空 module 名报名字错误，本地模式 + 注册过同名 Rust 函数的名字报的还是那条本地
+        // 模式冲突错误。空 module 名永远跑不通：importlib 对空名字无条件抛 ValueError
+        // （详见 ray_c.h），任务必然在 worker 里失败并且 worker 退出。function 名不在这里
+        // 判定：空 function 名查到的是 module 对象本身，那个对象可以可调用，这种情况下
+        // 任务真能跑，拒它就会拒掉能跑通的调用。只拦空指针（std::string(nullptr) 是未定义
+        // 行为）。带内部 NUL 的名字经 to_cstring 变成空串
+        // （crates/rayrust-sys/src/lib.rs:253-255），所以带 NUL 的 module 名归到空名字那条
+        // 检查上，带 NUL 的 function 名就是一个空 function 名，照原样提交。
+        if (!module_name) {
+            set_last_error("module_name is null");
+            return ray_bytes_t{nullptr, 0};
+        }
+        if (module_name[0] == '\0') {
+            set_last_error(
+                "the module name is empty: the worker imports the module by name "
+                "(python/ray/_private/function_manager.py:138, importlib.import_module) "
+                "and importlib raises ValueError: Empty module name for an empty "
+                "string, so the task fails inside the worker and the worker exits with "
+                "SYSTEM_ERROR; the caller reads only an unknown FFI error. This entry "
+                "refuses the name before submission instead.");
+            return ray_bytes_t{nullptr, 0};
+        }
+        if (!function_name) {
+            set_last_error("function_name is null");
+            return ray_bytes_t{nullptr, 0};
+        }
         auto runtime = ray::internal::GetRayRuntime();
         if (!runtime) {
             set_last_error("Ray runtime is not initialized");
