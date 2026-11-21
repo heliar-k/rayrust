@@ -8,22 +8,31 @@
 //! declared length is smaller than the remaining bytes. Rust cannot decode
 //! that section; such a value must come back as `RayError::Serialization`.
 //!
-//! The cluster mode (argv[1] = "cluster") runs six checks:
+//! The cluster mode (argv[1] = "cluster") runs seven checks:
 //!   1. return_list → a msgpack array with the expected elements
 //!   2. return_custom_object(7) → Err(RayError::Serialization)
 //!   3. return_list_with_custom_object(3) → Err(RayError::Serialization)
 //!   4. the raw bytes of that ref split into msgpack part + a tail > 0
 //!   5. Rust put/get and put_xlang/get_value still round-trip
 //!   6. a normal Python call still works after the rejections
+//!   7. options reach a Python task: with the single CPU held by one Python task,
+//!      a call through `task_call_python` waits (Err(RayError::Timeout)) while the
+//!      same call with `.resource("CPU", 0.0)` finishes, and the waiting call
+//!      finishes once the CPU is released
 //!
 //! The local mode (argv[1] = "local") runs the Rust round-trip of check 5 plus
 //! one check of its own: a C++/Rust driver's local mode runs tasks in-process
 //! through a C++ function descriptor (`local_mode_task_submitter.cc`), so
 //! Python functions cannot run there and `task_call_python` returns the
 //! in-process `nil + [3, "unknown function: ..."]` error instead of a
-//! cross-language payload. Checks 1-4 and 6 need the cluster mode.
+//! cross-language payload. Checks 1-4 and 6 need the cluster mode, and check 7
+//! runs there only: it needs a cluster with one CPU (`--num-cpus=1`) whose single
+//! CPU is taken, which local mode has no equivalent of.
 //!
-//! Environment for the cluster mode: RAY_ADDRESS, RAY_NODE_IP, RAY_WORKER_SO.
+//! Environment for the cluster mode: RAY_ADDRESS, RAY_NODE_IP, RAY_WORKER_SO, and
+//! a cluster started with `--num-cpus=1`.
+
+use std::time::Duration;
 
 use rayrust::prelude::*;
 
@@ -365,6 +374,80 @@ fn check_after_rejections(ray: &Ray) {
     assert_eq!(a.as_i64(), Some(1), "return_dict()[\"a\"] is {:?}", a);
 }
 
+/// Check 7: options reach a Python task.
+///
+/// The cluster must have one CPU (`--num-cpus=1`). One Python task holds that CPU
+/// for 60 s. A second call through `task_call_python` keeps the default one CPU
+/// and cannot start, so it waits; the same call through
+/// `task_call_python_with_options` with `("CPU", 0.0)` runs anyway. Cancelling the
+/// holding task frees the CPU and the waiting call finishes with its value.
+///
+/// The 60 s are what makes the zero-CPU call able to fail: 4 s of waiting for the
+/// holder to take the CPU, the 15 s window of the default call and the 20 s window
+/// of the zero-CPU call add up to 39 s, so an implementation that ignores the
+/// options still finds the CPU taken when the zero-CPU call gives up.
+fn check_python_task_options(ray: &Ray) {
+    println!("\n--- 7. options reach a Python task ---");
+    let seconds = serialize(&60.0f64).expect("serialize 60.0");
+    let holder = ray
+        .task_call_python(PYTHON_MODULE, "sleep_for", &[&seconds], &[])
+        .expect("submit the CPU-holding Python task");
+    println!("  ray.{}.sleep_for(60.0) → {}", PYTHON_MODULE, holder.id_hex());
+    // 等它真的拿到那个唯一的 CPU。
+    std::thread::sleep(Duration::from_secs(4));
+
+    let arg_a = serialize(&2i64).expect("serialize the first argument");
+    let arg_b = serialize(&40i64).expect("serialize the second argument");
+
+    // 对照项：默认 options 要 1 个 CPU，CPU 被占住时它排不上队。
+    let queued = ray
+        .task_call_python(PYTHON_MODULE, "add", &[&arg_a, &arg_b], &[])
+        .expect("submit add(2, 40) with the default options");
+    match queued.get_timeout(15000) {
+        Err(RayError::Timeout(_)) => {
+            println!("  add(2, 40) with no options → Err(RayError::Timeout) ✓")
+        }
+        Ok(()) => panic!(
+            "add(2, 40) with no options finished while the only CPU is held by sleep_for(60.0)"
+        ),
+        Err(other) => panic!(
+            "add(2, 40) with no options returned {:?}, expected RayError::Timeout",
+            other
+        ),
+    }
+
+    // 判别项：显式的 CPU 0 让同一个调用在 CPU 被占住时也跑得起来。
+    let zero_cpu = TaskOptions::new().resource("CPU", 0.0);
+    let no_cpu = ray
+        .task_call_python_with_options(PYTHON_MODULE, "add", &[&arg_a, &arg_b], &[], &zero_cpu)
+        .expect("submit add(2, 40) with CPU 0");
+    let value: i64 = no_cpu
+        .cast()
+        .get_timeout(20000)
+        .expect("get_timeout of the zero-CPU add(2, 40)");
+    assert_eq!(value, 42, "the zero-CPU add(2, 40) returned {}", value);
+    println!("  add(2, 40) with .resource(\"CPU\", 0.0) → {} ✓", value);
+
+    // 这里 cancel 的是 Python 任务，执行它的 Python worker 走 `on_cancel_callback` 的
+    // force_kill 分支（src/ray/core_worker/core_worker.cc:3902-3912），以
+    // INTENDED_USER_EXIT 立即退出（"…has received a force ray.cancel request."，经
+    // ray::QuickExit 到 _Exit(1)，src/ray/util/process.cc:845-848），CPU 随之释放；
+    // force_kill=false 对正在运行的任务只调 kill_main（同文件 :3946-3948），
+    // sleep_for 不会提前结束，会一直占着 CPU。
+    ray.cancel(holder.id(), true, true)
+        .expect("cancel the CPU-holding task");
+    std::thread::sleep(Duration::from_secs(3));
+    let value: i64 = queued
+        .cast()
+        .get_timeout(15000)
+        .expect("get_timeout of the queued add(2, 40)");
+    assert_eq!(value, 42, "the queued add(2, 40) returned {}", value);
+    println!(
+        "  the queued add(2, 40) finished after the CPU was released → {} ✓",
+        value
+    );
+}
+
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "local".to_string());
     println!("=== Ray Cross-Language Decode ===");
@@ -382,6 +465,7 @@ fn main() {
         check_list_with_custom_object(&ray);
         check_rust_roundtrip(&ray);
         check_after_rejections(&ray);
+        check_python_task_options(&ray);
     }
 
     println!("\n--- Shutdown ---");

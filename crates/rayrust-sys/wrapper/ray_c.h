@@ -129,9 +129,10 @@ bool ray_is_initialized(void);
 
 /// Shutdown Ray runtime.
 ///
-/// In local mode, waits for every task submitted through `ray_task_call_with_options`
-/// and `ray_task_call_python` during the current runtime to become ready before
-/// closing the reference-count gate and calling `ray::Shutdown()`. Once shutdown
+/// In local mode, waits for every task submitted through the three task entries
+/// (`ray_task_call_with_options`, `ray_task_call_python`,
+/// `ray_task_call_python_with_options`) during the current runtime to become ready
+/// before closing the reference-count gate and calling `ray::Shutdown()`. Once shutdown
 /// begins, new local-mode task submissions are rejected with an error, and they
 /// keep being rejected after the shutdown has finished until a new `ray_init`
 /// establishes a runtime; `ray_init` itself reports -1 until the shutdown has
@@ -266,11 +267,10 @@ ray_bytes_t ray_task_call_with_options(const char *func_name,
                                          const char *options_json);
 
 /// Call a Python remote function.
-/// This entry point takes no options JSON: a Python task submitted here cannot be
-/// named, cannot request resources, cannot be bound to a placement group bundle
-/// and cannot be given a runtime env.
-/// The task requests one CPU: with no options there is no way to opt out of the
-/// default 1.0 that `ray_task_call_with_options` applies.
+/// This entry point takes no options JSON: the submitted task keeps Ray's default
+/// of one CPU and cannot be named, cannot request resources, cannot be bound to a
+/// placement group bundle and cannot be given a runtime env. Use
+/// `ray_task_call_python_with_options` for any of those.
 /// `module_name` and `function_name` are null-terminated C strings.
 /// `args` are msgpack-serialized arguments (will be wrapped with xlang header).
 /// `is_ref[i] = true` means args[i] is an ObjectRef ID (pass by reference).
@@ -327,6 +327,54 @@ ray_bytes_t ray_task_call_python(const char *module_name,
                                   const ray_bytes_t *args,
                                   size_t arg_count,
                                   const bool *is_ref);
+
+/// Call a Python remote function with full CallOptions.
+/// `options_json` is a JSON string with any subset of the fields
+/// `ray_task_call_with_options` takes:
+///   {
+///     "name": "my_task",                  // task name
+///     "resources": {"CPU":1,"GPU":0.5},  // resource requirements
+///     "placement_group_id": "a1b2c3...",  // hex-encoded binary placement group ID
+///     "bundle_index": 0,                  // bundle index (default -1 = any bundle)
+///     "runtime_env": "{\"env_vars\":{...}}"  // runtime env object JSON, as a
+///                                             // JSON string value
+///   }
+/// The field set, the validation and the error kinds are the ones
+/// `ray_task_call_with_options` documents above: a bad field value returns an
+/// error (data=NULL) instead of letting the task run with default scheduling.
+/// - `placement_group_id` must decode to exactly 18 bytes and name an existing
+///   group.
+/// - `bundle_index` must be -1 or between 0 and 2147483647, and it requires
+///   `placement_group_id`.
+/// - `runtime_env` must be a JSON string holding a single JSON object.
+/// `resources` carries the same task default: when the map has no `CPU` key, 1.0 is
+/// added (the Python `@ray.remote` default), so `--num-cpus` limits how many
+/// tasks run at once. An explicit `"CPU":0` is the only way to ask for zero CPU,
+/// which is what `ray_task_call_python` cannot do; a map with other resources and
+/// no `CPU` still gets 1.0 merged in.
+/// Local mode rejects `placement_group_id` outright and drops the other three
+/// fields, the same way `ray_task_call_with_options` does
+/// (`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:138-140`).
+/// The name checks and the reference-argument requirements are the ones
+/// `ray_task_call_python` documents above, because both entries share the same
+/// submission path: `module_name` must be non-empty (an empty one, or one with an
+/// interior NUL byte, is refused with RAY_ERROR_KIND_GENERIC before the runtime is
+/// looked up and before any task is submitted), and `function_name` is not checked
+/// (an empty one resolves to the module object, which can be callable). A
+/// reference argument must be a 28-byte id this process holds, whose owner Ray
+/// knows, and it must come from a Python worker.
+/// Local mode returns an error instead of submitting when a `#[rayrust::remote]`
+/// function is registered under `function_name`, for the reason
+/// `ray_task_call_python` documents.
+/// Pass NULL or empty string for no options (all defaults).
+/// Returns a ray_bytes_t containing the binary object ID of the result.
+/// On error, returns ray_bytes_t with data=NULL.
+ray_bytes_t ray_task_call_python_with_options(const char *module_name,
+                                              const char *function_name,
+                                              const ray_bytes_t *args,
+                                              size_t arg_count,
+                                              const bool *is_ref,
+                                              const char *options_json);
 
 // ─── Actor ────────────────────────────────────────────────────
 

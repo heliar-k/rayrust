@@ -616,11 +616,11 @@ impl Ray {
 
     /// Call a Python remote function.
     ///
-    /// This entry point takes no [`TaskOptions`]: a Python task submitted here
-    /// cannot be named, cannot request resources, cannot be bound to a placement
-    /// group bundle and cannot be given a runtime env.
-    /// The task requests one CPU, Ray's default for a task; with no options there
-    /// is no way to opt out of it. Local mode drops the requirement.
+    /// This entry point takes no [`TaskOptions`]: the task keeps Ray's default of
+    /// one CPU and cannot be named, cannot request resources, cannot be bound to a
+    /// placement group bundle and cannot be given a runtime env. Use
+    /// [`Ray::task_call_python_with_options`] for any of those; this entry keeps the
+    /// default one-CPU requirement. Local mode drops the requirement.
     ///
     /// `module` must be non-empty. An empty one — and a name with an interior NUL
     /// byte, which reaches the C entry as an empty C string — returns
@@ -682,7 +682,47 @@ impl Ray {
         args: &[&[u8]],
         is_ref: &[bool],
     ) -> Result<ObjectRef<()>, RayError> {
-        let id = task_call_python_inner(module, function, args, is_ref)?;
+        let id = task_call_python_json_inner(module, function, args, is_ref, "")?;
+        Ok(ObjectRef::from_call_xlang(id))
+    }
+
+    /// Call a Python remote function with full [`TaskOptions`].
+    ///
+    /// The four fields of [`TaskOptions`] mean the same here as in
+    /// [`Ray::task_call`]: the task name, the resource requirements, the placement
+    /// group binding and the runtime env. Without options the task keeps Ray's
+    /// default of one CPU, the default Python's `@ray.remote` applies to every task
+    /// (`ray/_common/ray_option_utils.py:179`, filled into `_num_cpus` at
+    /// `ray/remote_function.py:125-126`). The C entry adds that 1.0 because the C++
+    /// SDK's `CallOptions` has no such default, so in cluster mode `--num-cpus`
+    /// limits how many tasks run at once. `.resource("CPU", 0.0)` is how a Python
+    /// task asks for zero CPU, which [`Ray::task_call_python`] cannot express; that
+    /// explicit 0 survives because the default is merged with `emplace`, which
+    /// never overwrites an existing key. A list with other resources and no `CPU`
+    /// key still gets 1.0 merged in, so naming `CPU` is the only way to opt out.
+    ///
+    /// Local mode drops the whole `CallOptions`: `LocalModeTaskSubmitter::SubmitTask`
+    /// calls `Submit(invocation, {})`
+    /// (`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:138-140`), so the
+    /// name, the resources and the runtime env have no effect there. A placement
+    /// group id is refused with [`RayError::Ffi`] instead, because local mode has no
+    /// group lookup.
+    ///
+    /// The name checks, the reference-argument requirements and the local mode
+    /// refusal are the ones [`Ray::task_call_python`] documents: `module` must be
+    /// non-empty, `function` is not checked, and in local mode a name that a
+    /// `#[rayrust::remote]` function registered returns [`RayError::Ffi`] instead of
+    /// running that Rust function in place of the Python one.
+    pub fn task_call_python_with_options(
+        &self,
+        module: &str,
+        function: &str,
+        args: &[&[u8]],
+        is_ref: &[bool],
+        opts: &TaskOptions,
+    ) -> Result<ObjectRef<()>, RayError> {
+        check_task_options(opts)?;
+        let id = task_call_python_json_inner(module, function, args, is_ref, &opts.to_json())?;
         Ok(ObjectRef::from_call_xlang(id))
     }
 
@@ -1634,20 +1674,22 @@ pub(crate) async fn task_call_inner_async(
     .map_err(|e| RayError::Runtime(format!("task_call join error: {}", e)))?
 }
 
-/// Call a Python remote function.
-/// `module` is the Python module name, `function` is the function name.
-/// `is_ref[i] = true` means args[i] is a binary ObjectRef ID (pass by reference).
-/// Returns an ObjectRef with is_xlang=true (results need xlang header stripping).
-pub(crate) fn task_call_python_inner(
+/// 提交 Python 任务的主体：`module` 是 Python module 名，`function` 是函数名，
+/// `is_ref[i] = true` 表示 `args[i]` 是二进制 ObjectRef id（按引用传参）。
+/// `options_json` 已由调用方算好，空串与 NULL 等价：不设任何选项，任务取默认的
+/// 1 个 CPU。返回的是 xlang 载荷的对象 id 字节。
+pub(crate) fn task_call_python_json_inner(
     module: &str,
     function: &str,
     args: &[&[u8]],
     is_ref: &[bool],
+    options_json: &str,
 ) -> Result<Vec<u8>, RayError> {
     check_is_ref_len(args.len(), is_ref)?;
     let module_c = to_cstring(module);
     let func_c = to_cstring(function);
     let args_arr = build_args_array(args);
+    let options_c = to_cstring(options_json);
     let is_ref_ptr = if is_ref.is_empty() {
         std::ptr::null()
     } else {
@@ -1655,12 +1697,17 @@ pub(crate) fn task_call_python_inner(
     };
 
     let bytes = unsafe {
-        rayrust_sys::ray_task_call_python(
+        rayrust_sys::ray_task_call_python_with_options(
             module_c.as_ptr(),
             func_c.as_ptr(),
             args_arr.as_ptr(),
             args_arr.len(),
             is_ref_ptr,
+            if options_c.as_bytes().is_empty() {
+                std::ptr::null()
+            } else {
+                options_c.as_ptr()
+            },
         )
     };
 
@@ -3084,8 +3131,8 @@ mod tests {
             actor_call_inner(&cpp_actor, "counter::increment", &args, &flags),
         );
         assert_len_rejected(
-            "task_call_python_inner",
-            task_call_python_inner("m", "f", &args, &flags),
+            "task_call_python_json_inner",
+            task_call_python_json_inner("m", "f", &args, &flags, ""),
         );
         assert_len_rejected(
             "actor_call_python_inner",
@@ -4190,7 +4237,7 @@ mod tests {
                     label
                 );
             }
-            match task_call_python_inner(module, function, &[], &[]) {
+            match task_call_python_json_inner(module, function, &[], &[], "") {
                 Err(RayError::Ffi(message)) => assert!(
                     message.contains("the module name is empty"),
                     "{} 的错误消息里没有 module 名那条: {}",
@@ -4208,7 +4255,7 @@ mod tests {
         }
 
         // 两个名字都空时报的是 module 那条：function 名根本不检查。
-        match task_call_python_inner("", "", &[], &[]) {
+        match task_call_python_json_inner("", "", &[], &[], "") {
             Err(RayError::Ffi(message)) => assert!(
                 message.contains("the module name is empty"),
                 "两个名字都空时没有报 module 名那条: {}",
@@ -4241,7 +4288,7 @@ mod tests {
                     label
                 );
             }
-            match task_call_python_inner("rayrust_test", function, &[], &[]) {
+            match task_call_python_json_inner("rayrust_test", function, &[], &[], "") {
                 Err(RayError::Ffi(message)) => assert!(
                     message.contains("Ray runtime is not initialized"),
                     "{} 没有走到运行时检查: {}",
@@ -4267,7 +4314,7 @@ mod tests {
             (" ", "add", "只有空白字符的 module 名 \" \""),
         ];
         for (module, function, label) in cases {
-            match task_call_python_inner(module, function, &[], &[]) {
+            match task_call_python_json_inner(module, function, &[], &[], "") {
                 Err(RayError::Ffi(message)) => assert!(
                     message.contains("Ray runtime is not initialized"),
                     "{} 没有走到运行时检查: {}",
