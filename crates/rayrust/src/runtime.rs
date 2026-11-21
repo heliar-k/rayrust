@@ -622,6 +622,36 @@ impl Ray {
     /// The task requests one CPU, Ray's default for a task; with no options there
     /// is no way to opt out of it. Local mode drops the requirement.
     ///
+    /// `module` must be non-empty. An empty one — and a name with an interior NUL
+    /// byte, which reaches the C entry as an empty C string — returns
+    /// [`RayError::Ffi`] before any task is submitted. That check comes before the
+    /// runtime lookup and before the local mode refusal below, so an empty module
+    /// name reports the name error in both modes and without a runtime.
+    /// An empty module name can never run. The worker imports the module by name
+    /// (`python/ray/_private/function_manager.py:138`, `importlib.import_module`)
+    /// and importlib raises `ValueError: Empty module name` for an empty string —
+    /// it raises before any lookup, so a module planted in `sys.modules` under the
+    /// empty name does not change that — and the worker exits with `SYSTEM_ERROR`.
+    /// The first read answers only an unknown FFI error and the worker pool starts
+    /// a replacement worker.
+    /// `function` is not checked. The loader splits it on dots and throws the empty
+    /// pieces away (`function_manager.py:139`), so an empty name resolves to the
+    /// module object itself, which the loader registers as the task's function
+    /// (`:391-395`). An ordinary module is not callable, so the task then fails
+    /// with `TypeError: 'module' object is not callable`: an ordinary task failure,
+    /// where the worker stays alive and the first read answers only an unknown FFI
+    /// error. A module object can be callable, though — a `types.ModuleType`
+    /// subclass with `__call__` assigned to the module's `__class__`, or any
+    /// callable placed in `sys.modules` under that name — and then the task runs
+    /// and returns that object's result (measured on 2.51.1: such a module
+    /// returned 3 for a call with an empty function name). Refusing the name would
+    /// reject that call, so the entry submits it. An interior NUL byte makes it an
+    /// empty function name as well, and the submission goes through the same way.
+    /// A non-empty name nobody registered keeps Ray's asynchronous semantics: the
+    /// driver holds no function table, so the submission returns an `ObjectRef` and
+    /// the first read waits until it times out. A whitespace-only name such as
+    /// `" "` is not trimmed and is submitted as it is.
+    ///
     /// `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID (pass by
     /// reference). Three requirements apply to such an id:
     /// - it must be exactly 28 bytes; any other length returns [`RayError::Ffi`]
@@ -4073,5 +4103,116 @@ mod tests {
             "非空方法名没有走到运行时检查: {}",
             message
         );
+    }
+
+    /// 空 module 名在 C 入口被拒，进程里没有运行时也能测：这条检查排在取运行时之前。
+    /// `to_cstring` 把带内部 NUL 的 module 名（`"a\0b"`）折成空串（#27），所以那条
+    /// 用例拿到的 C 串也是空的。
+    #[test]
+    fn task_call_python_rejects_an_empty_module_name() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let cases: [(&str, &str, &str); 2] = [
+            ("", "add", "空 module 名"),
+            ("a\0b", "add", "带内部 NUL 的 module 名 \"a\\0b\""),
+        ];
+        for (module, function, label) in cases {
+            if module.contains('\0') {
+                assert!(
+                    to_cstring(module).as_bytes().is_empty(),
+                    "{} 经过 to_cstring 不是空串",
+                    label
+                );
+            }
+            match task_call_python_inner(module, function, &[], &[]) {
+                Err(RayError::Ffi(message)) => assert!(
+                    message.contains("the module name is empty"),
+                    "{} 的错误消息里没有 module 名那条: {}",
+                    label,
+                    message
+                ),
+                Err(other) => panic!("{} 返回了别的错误变体: {}", label, other),
+                Ok(_) => panic!("{} 被接受了", label),
+            }
+            assert!(
+                !unsafe { rayrust_sys::ray_is_initialized() },
+                "{} 被拒之后建出了运行时",
+                label
+            );
+        }
+
+        // 两个名字都空时报的是 module 那条：function 名根本不检查。
+        match task_call_python_inner("", "", &[], &[]) {
+            Err(RayError::Ffi(message)) => assert!(
+                message.contains("the module name is empty"),
+                "两个名字都空时没有报 module 名那条: {}",
+                message
+            ),
+            Err(other) => panic!("两个名字都空时返回了别的错误变体: {}", other),
+            Ok(_) => panic!("两个名字都空时被接受了"),
+        }
+    }
+
+    /// 空 function 名不被拒绝，与空 module 名不同：加载器把它解析成 module 对象
+    /// 本身（`function_manager.py:139`），而 module 对象可以可调用，所以这个输入能
+    /// 跑通（`ray_c.h` 里有实测）。`to_cstring` 把带内部 NUL 的 function 名（`"a\0b"`）
+    /// 折成空串（#27），两条用例都走到运行时检查。
+    #[test]
+    fn task_call_python_lets_an_empty_function_name_through_to_the_runtime_check() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let cases: [(&str, &str); 2] = [
+            ("", "空 function 名"),
+            ("a\0b", "带内部 NUL 的 function 名 \"a\\0b\""),
+        ];
+        for (function, label) in cases {
+            if function.contains('\0') {
+                assert!(
+                    to_cstring(function).as_bytes().is_empty(),
+                    "{} 经过 to_cstring 不是空串",
+                    label
+                );
+            }
+            match task_call_python_inner("rayrust_test", function, &[], &[]) {
+                Err(RayError::Ffi(message)) => assert!(
+                    message.contains("Ray runtime is not initialized"),
+                    "{} 没有走到运行时检查: {}",
+                    label,
+                    message
+                ),
+                Err(other) => panic!("{} 返回了别的错误变体: {}", label, other),
+                Ok(_) => panic!("{} 在没有运行时的进程里被提交了", label),
+            }
+        }
+    }
+
+    /// 非空名字不被前置检查拦住：守卫排在取运行时之前，所以这里停在「运行时没有
+    /// 初始化」那一条。只有空白字符的名字不 trim，同样走到运行时检查。
+    #[test]
+    fn task_call_python_lets_non_empty_names_through_to_the_runtime_check() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let cases: [(&str, &str, &str); 2] = [
+            ("rayrust_test", "add", "正常的 module 名与 function 名"),
+            (" ", "add", "只有空白字符的 module 名 \" \""),
+        ];
+        for (module, function, label) in cases {
+            match task_call_python_inner(module, function, &[], &[]) {
+                Err(RayError::Ffi(message)) => assert!(
+                    message.contains("Ray runtime is not initialized"),
+                    "{} 没有走到运行时检查: {}",
+                    label,
+                    message
+                ),
+                Err(other) => panic!("{} 返回了别的错误变体: {}", label, other),
+                Ok(_) => panic!("{} 在没有运行时的进程里被提交了", label),
+            }
+        }
     }
 }

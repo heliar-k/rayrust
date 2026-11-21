@@ -289,6 +289,38 @@ ray_bytes_t ray_task_call_with_options(const char *func_name,
 /// other name — including a method of a `#[rayrust::actor]` type, which registers
 /// in the member function map — is submitted as a C++ task and fails at the C++
 /// function lookup.
+/// `module_name` must be non-empty. An empty one — and a name with an interior NUL
+/// byte, which reaches this entry as an empty C string — is refused here with
+/// RAY_ERROR_KIND_GENERIC before the runtime is looked up and before any task is
+/// submitted. That check also comes before the runtime-not-initialized check and
+/// before the local mode refusal above, so an empty module name reports the name
+/// error in both modes and without a runtime.
+/// An empty module name can never run. The worker imports the module by name
+/// (`python/ray/_private/function_manager.py:138`, `importlib.import_module`) and
+/// importlib raises `ValueError: Empty module name` for an empty string — it
+/// raises before any lookup, so a module planted in `sys.modules` under the empty
+/// name does not change that. The exception escapes `task_execution_handler`, the
+/// worker exits with `SYSTEM_ERROR`, the caller's first read answers only an
+/// unknown FFI error, and the worker pool starts a replacement worker afterwards.
+/// `function_name` is not checked. The loader splits it on dots and throws the
+/// empty pieces away (`function_manager.py:139`), so an empty name resolves to the
+/// module object itself, which `_load_function_from_local` registers as the task's
+/// function (`:391-395`). An ordinary module is not callable, so the task then
+/// fails with `TypeError: 'module' object is not callable`: an ordinary task
+/// failure, where the worker stays alive and the caller reads only an unknown FFI
+/// error. A module object can be callable, though — a `types.ModuleType` subclass
+/// with `__call__` assigned to the module's `__class__`, or any callable placed in
+/// `sys.modules` under that name — and then the task runs and returns that
+/// object's result (measured on 2.51.1: such a module returned 3 for a call with
+/// an empty function name). Refusing the name would reject that call, so the entry
+/// submits it. An interior NUL byte makes it an empty function name as well, and
+/// the submission goes through the same way.
+/// A non-empty name nobody registered keeps Ray's asynchronous semantics: the
+/// driver holds no function table and cannot tell a valid name from an invalid
+/// one, so the submission returns an `ObjectRef` and the first read waits until it
+/// times out. A whitespace-only name such as `" "` is not trimmed and is submitted
+/// as it is; names such as `"rayrust_test"` and `"add"` reach the submission
+/// unchanged.
 ray_bytes_t ray_task_call_python(const char *module_name,
                                   const char *function_name,
                                   const ray_bytes_t *args,
