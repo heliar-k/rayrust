@@ -701,11 +701,33 @@ impl Ray {
     ///
     /// Pass `&ActorOptions::new()` for defaults (no name, no restarts, etc.).
     ///
+    /// `module` and `class` must be non-empty, and either one empty returns
+    /// [`RayError::Ffi`] before any task is submitted. A Python actor is named by
+    /// both and the worker resolves them in Python, so an empty name hands out an
+    /// actor that never runs: the driver only submits the creation task and the
+    /// caller gets `Ok` with a 16-byte id whose first read answers only
+    /// `Actor error ... unknown FFI error`. An empty module name fails in
+    /// `python/ray/_private/function_manager.py:531` (`load_actor_class`) → `:589`
+    /// (`_load_actor_class_from_local`) → `:138`
+    /// (`load_function_or_class_from_local`), where
+    /// `importlib.import_module(module_name)` raises `ValueError: Empty module name`;
+    /// an empty class name fails at `python/ray/_raylet.pyx:2253`, which raises
+    /// `TypeError: module.__new__(X): X is not a type object (module)` before
+    /// `load_actor_class` is reached (the measured traceback holds only
+    /// `_raylet.pyx:2432` and `:2253`). In both cases the worker exits with
+    /// `SYSTEM_ERROR`. A name with an interior NUL byte reaches the C entry as an
+    /// empty C string, the same as in [`Ray::get_actor`], and is refused with it
+    /// (#27).
+    ///
+    /// The two name checks run before the local mode refusal below, so an empty
+    /// name reports the name error in local mode too.
+    ///
     /// Cluster mode creates the actor as usual.
     ///
-    /// Local mode returns [`RayError::Ffi`]. The refusal runs before the options and
-    /// the arguments are looked at, so in local mode this entry rejects every call
-    /// whatever they are. The reason is the local submitter:
+    /// Local mode returns [`RayError::Ffi`] when both names are non-empty. That
+    /// refusal runs before the options and the arguments are looked at, so in local
+    /// mode this entry rejects every call with non-empty names whatever the options
+    /// and the arguments are. The reason is the local submitter:
     /// `LocalModeTaskSubmitter::Submit` ignores the language and the module and
     /// builds every task as a C++ descriptor from the function name alone
     /// (`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:39-40`), and the
@@ -737,8 +759,9 @@ impl Ray {
     /// `args` hold msgpack-serialized values. There is no `is_ref` here: constructor
     /// arguments cannot be passed by reference.
     ///
-    /// `module` and `class` are read in cluster mode only, because local mode refuses
-    /// the call before the holder is built.
+    /// `module` and `class` are put into the holder in cluster mode only, because
+    /// local mode refuses a non-empty pair before the holder is built; the name
+    /// checks above read them in both modes.
     pub fn actor_create_python(
         &self,
         module: &str,
@@ -3815,6 +3838,113 @@ mod tests {
         assert!(
             message.contains("Ray runtime is not initialized"),
             "非空函数名没有走到运行时检查: {}",
+            message
+        );
+    }
+
+    /// 空 module 名与空 class 名在 C 入口被拒，进程里没有运行时也能测：两条名字检查
+    /// 都排在取运行时之前。`to_cstring` 把带内部 NUL 的名字（`"a\0b"`）折成空串
+    /// （#27），所以那两条用例拿到的 C 串都是空的。
+    #[test]
+    fn actor_create_python_rejects_an_empty_module_or_class_name() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let cases: [(&str, &str, &str, &str); 5] = [
+            ("", "Counter", "the module name is empty", "空 module 名"),
+            (
+                "",
+                "",
+                "the module name is empty",
+                "两个都空（module 先报）",
+            ),
+            (
+                "a\0b",
+                "Counter",
+                "the module name is empty",
+                "带内部 NUL 的 module 名 \"a\\0b\"",
+            ),
+            ("rayrust_test", "", "the class name is empty", "空 class 名"),
+            (
+                "rayrust_test",
+                "a\0b",
+                "the class name is empty",
+                "带内部 NUL 的 class 名 \"a\\0b\"",
+            ),
+        ];
+        for (module, class, needle, label) in cases {
+            let module_c = to_cstring(module);
+            let class_c = to_cstring(class);
+            if module.contains('\0') {
+                assert!(
+                    module_c.as_bytes().is_empty(),
+                    "{} 经过 to_cstring 不是空串",
+                    label
+                );
+            }
+            if class.contains('\0') {
+                assert!(
+                    class_c.as_bytes().is_empty(),
+                    "{} 经过 to_cstring 不是空串",
+                    label
+                );
+            }
+            let bytes = unsafe {
+                rayrust_sys::ray_actor_create_python_with_options(
+                    module_c.as_ptr(),
+                    class_c.as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            assert!(
+                bytes.data.is_null(),
+                "{} 被接受了（返回 {:#p}）",
+                label,
+                bytes.data
+            );
+            let message = rayrust_sys::last_error().expect("C 入口没有记录错误");
+            assert!(
+                message.contains(needle),
+                "{} 的错误消息不是 {:?}: {}",
+                label,
+                needle,
+                message
+            );
+            assert!(
+                !unsafe { rayrust_sys::ray_is_initialized() },
+                "{} 被拒之后建出了运行时",
+                label
+            );
+        }
+    }
+
+    /// 合法名字不被这两条检查拦住：守卫排在运行时检查之前，所以这里停在「运行时没有
+    /// 初始化」那一条。
+    #[test]
+    fn actor_create_python_lets_valid_names_through_to_the_runtime_check() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let module = to_cstring("rayrust_test");
+        let class = to_cstring("Counter");
+        let bytes = unsafe {
+            rayrust_sys::ray_actor_create_python_with_options(
+                module.as_ptr(),
+                class.as_ptr(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert!(bytes.data.is_null(), "没有运行时却交回了 id");
+        let message = rayrust_sys::last_error().expect("C 入口没有记录错误");
+        assert!(
+            message.contains("Ray runtime is not initialized"),
+            "合法名字没有走到运行时检查: {}",
             message
         );
     }
