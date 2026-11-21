@@ -86,6 +86,14 @@ extern "C" {
         arg_count: usize,
         is_ref: *const bool,
     ) -> RayBytes;
+    pub fn ray_task_call_python_with_options(
+        module_name: *const c_char,
+        function_name: *const c_char,
+        args: *const RayBytes,
+        arg_count: usize,
+        is_ref: *const bool,
+        options_json: *const c_char,
+    ) -> RayBytes;
 
     // Actor
     pub fn ray_actor_create_with_options(

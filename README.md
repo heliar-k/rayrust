@@ -208,9 +208,11 @@ Python's `@ray.remote` applies, so `--num-cpus` limits how many tasks run at
 once. To ask for zero CPU (a task that only waits or only does I/O and should not
 hold a CPU slot), say `.resource("CPU", 0.0)` explicitly. Giving another
 resource without a `CPU` key still leaves the task at one CPU: the default 1.0 is
-merged in. This covers both `Ray::task_call` and `Ray::task_call_python`; the
-latter takes no options and so always requests one CPU. Local mode drops
-resource requirements entirely, so none of this applies there.
+merged in. This covers both Rust task entries: `Ray::task_call` and
+`Ray::task_call_python_with_options` take a `TaskOptions`, so either can ask for
+zero CPU here. `Ray::task_call_python` is the entry without options; it keeps the
+one-CPU default. Local mode drops resource requirements entirely, so none of this
+applies there.
 
 An actor follows Ray's two presets as far as the C++ SDK allows. Without
 `resources` it reserves no CPU for its lifetime, like Python's no-options actor,

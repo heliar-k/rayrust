@@ -1417,14 +1417,14 @@ ray_bytes_t ray_task_call_with_options(const char *func_name,
     return ray_bytes_t{nullptr, 0};
 }
 
-/// Call a Python remote function.
-/// `module_name` and `function_name` are null-terminated C strings.
-/// `args` are msgpack-serialized arguments (will be wrapped with xlang header).
-ray_bytes_t ray_task_call_python(const char *module_name,
-                                  const char *function_name,
-                                  const ray_bytes_t *args,
-                                  size_t arg_count,
-                                  const bool *is_ref) {
+/// 提交 Python 任务的共同实现：名字检查、本地模式判定、参数构造与提交都在这里，
+/// 两个入口只差一个 options JSON。`options_json` 可以是 NULL 或空串（不设任何选项）。
+static ray_bytes_t submit_python_task(const char *module_name,
+                                      const char *function_name,
+                                      const ray_bytes_t *args,
+                                      size_t arg_count,
+                                      const bool *is_ref,
+                                      const char *options_json) {
     ray_clear_error();
     try {
         // 次序按参数次序：module 是第一个参数，它的两条检查先报。这两条检查都排在取
@@ -1488,13 +1488,48 @@ ray_bytes_t ray_task_call_python(const char *module_name,
 
         auto task_args = build_task_args_python(args, arg_count, is_ref);
 
+        // 与 ray_task_call_with_options 同一顺序：SDK 把 CallOptions 的 bundle_index
+        // 留成未初始化，先置 -1（group 内任意 bundle）再解析 options。
+        //
+        // 调用方没写 CPU 时补 1.0，Python 的 `@ray.remote` 就是这个默认值
+        // （来历与上游行号见 apply_default_task_cpu 的说明）；显式的 `"CPU":0` 经
+        // emplace 保留 0，是退出这一默认的唯一方式。不收 options 的入口传 NULL，所以
+        // 它提交的任务照样要 1 个 CPU。
         ray::internal::CallOptions options;
+        options.bundle_index = -1;
+        parse_call_options(options_json, options);
         apply_default_task_cpu(options);
         return submit_task_and_record(*runtime, holder, task_args, options);
     } catch (const std::exception &e) {
         set_last_error_exception(e);
         return ray_bytes_t{nullptr, 0};
     }
+}
+
+/// Call a Python remote function.
+/// `module_name` and `function_name` are null-terminated C strings.
+/// `args` are msgpack-serialized arguments (will be wrapped with xlang header).
+/// 这个入口不收 options，提交的任务保持默认的 1 个 CPU；要 options 用
+/// ray_task_call_python_with_options。
+ray_bytes_t ray_task_call_python(const char *module_name,
+                                  const char *function_name,
+                                  const ray_bytes_t *args,
+                                  size_t arg_count,
+                                  const bool *is_ref) {
+    return submit_python_task(module_name, function_name, args, arg_count, is_ref,
+                              nullptr);
+}
+
+/// Call a Python remote function with full CallOptions.
+/// `options_json` is a JSON object string; see ray_c.h for the field set.
+ray_bytes_t ray_task_call_python_with_options(const char *module_name,
+                                              const char *function_name,
+                                              const ray_bytes_t *args,
+                                              size_t arg_count,
+                                              const bool *is_ref,
+                                              const char *options_json) {
+    return submit_python_task(module_name, function_name, args, arg_count, is_ref,
+                              options_json);
 }
 
 // ─── Actor ────────────────────────────────────────────────────
