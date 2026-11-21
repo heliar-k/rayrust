@@ -1511,12 +1511,62 @@ ray_bytes_t ray_actor_create_with_options(const char *func_name,
 }
 
 /// Create a Python actor with full ActorCreationOptions via options JSON.
+///
+/// 两个名字的前置检查放在取运行时之前：参数错误先于状态错误，与同文件的
+/// `ray_actor_create_with_options`、`ray_get_actor`、`wait` 一致，被拒的调用不建运行时、
+/// 不碰 SDK，而且不需要运行时就能测。集群模式下空 module 名与空 class 名都交出一个跑不
+/// 起来的 actor（名字由 worker 的 Python 侧解析，见两条错误文本里的行号）；本地模式根本
+/// 建不出 Python actor，这个入口在那里直接返回错误，所以那两条检查在本地模式只决定报哪
+/// 一条错误。检查排在下面的本地模式拒绝之前，因此空名字在两种模式下报的都是名字错误。
 ray_bytes_t ray_actor_create_python_with_options(const char *module_name,
                                                    const char *class_name,
                                                    const ray_bytes_t *args,
                                                    size_t arg_count,
                                                    const char *options_json) {
     ray_clear_error();
+    if (!module_name) {
+        set_last_error("module_name is null");
+        return ray_bytes_t{nullptr, 0};
+    }
+    if (module_name[0] == '\0') {
+        set_last_error(
+            "the module name is empty: a Python actor is named by its module and its "
+            "class, neither of which may be empty. The driver only submits the "
+            "creation task, and the worker resolves the name in Python: "
+            "python/ray/_private/function_manager.py:531 (load_actor_class) calls "
+            ":589 (_load_actor_class_from_local), which calls :138 "
+            "(load_function_or_class_from_local), where "
+            "importlib.import_module(module_name) raises \"ValueError: Empty module "
+            "name\"; the worker exits with SYSTEM_ERROR and the 16-byte id the caller "
+            "already got answers its first read only with \"Actor error ... unknown "
+            "FFI error\". Either empty name is refused here. Local mode refuses "
+            "every Python actor creation, and these checks run before that refusal, "
+            "so an empty name reports this error in both modes. A name with an "
+            "interior NUL byte arrives here as an empty C "
+            "string as well (crates/rayrust-sys/src/lib.rs:253-255, #27).");
+        return ray_bytes_t{nullptr, 0};
+    }
+    if (!class_name) {
+        set_last_error("class_name is null");
+        return ray_bytes_t{nullptr, 0};
+    }
+    if (class_name[0] == '\0') {
+        set_last_error(
+            "the class name is empty: a Python actor is named by its module and its "
+            "class, neither of which may be empty. With a module that imports, the "
+            "empty class name reaches python/ray/_raylet.pyx:2253, which raises "
+            "\"TypeError: module.__new__(X): X is not a type object (module)\" before "
+            "load_actor_class is reached (the measured traceback holds only "
+            "_raylet.pyx:2432 and :2253); the worker exits with SYSTEM_ERROR and the "
+            "16-byte id the caller already got answers its first read only with "
+            "\"Actor error ... unknown FFI error\". Either empty name is refused "
+            "here. Local mode refuses every Python actor creation, and these checks "
+            "run before that refusal, so an empty name reports this error in both "
+            "modes. A name with an interior NUL byte "
+            "arrives here as an empty C string as well "
+            "(crates/rayrust-sys/src/lib.rs:253-255, #27).");
+        return ray_bytes_t{nullptr, 0};
+    }
     try {
         auto runtime = ray::internal::GetRayRuntime();
         if (!runtime) {

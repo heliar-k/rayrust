@@ -349,11 +349,30 @@ ray_bytes_t ray_actor_create_with_options(const char *func_name,
 /// Create a Python actor with full ActorCreationOptions.
 /// `options_json` has the same format as ray_actor_create_with_options.
 /// Constructor arguments are always values: there is no `is_ref` here.
+/// `module_name` and `class_name` must be non-empty. A Python actor is named by
+/// both, and the worker resolves them in Python, so either one empty hands out
+/// an actor that never runs: the driver only submits the creation task and the
+/// caller gets `Ok` with a 16-byte id whose first read answers only
+/// `Actor error ... unknown FFI error`. An empty module name fails in
+/// `python/ray/_private/function_manager.py:531` (`load_actor_class`) → `:589`
+/// (`_load_actor_class_from_local`) → `:138`
+/// (`load_function_or_class_from_local`), where
+/// `importlib.import_module(module_name)` raises `ValueError: Empty module name`;
+/// an empty class name fails at `python/ray/_raylet.pyx:2253`, which raises
+/// `TypeError: module.__new__(X): X is not a type object (module)` before
+/// `load_actor_class` is reached (the measured traceback holds only
+/// `_raylet.pyx:2432` and `:2253`). In both cases the worker exits with
+/// `SYSTEM_ERROR`. A name with an interior NUL byte reaches this entry as an
+/// empty C string as well (`crates/rayrust-sys/src/lib.rs:253-255`, #27).
+/// The two name checks run right after `ray_clear_error()` and before the runtime
+/// lookup, so a refused call builds no runtime and submits nothing, and they run
+/// before the local mode rejection below, so local mode with an empty name
+/// reports the name error instead.
 /// Local mode returns an error instead of creating the actor, and it does so
 /// before the options JSON is parsed and before the arguments are built, so in
-/// local mode this entry rejects the call whatever the options and the arguments
-/// are. `ray_actor_create_with_options` (a C++ actor) keeps its option
-/// diagnostics in local mode.
+/// local mode this entry rejects every call with non-empty names whatever the
+/// options and the arguments are. `ray_actor_create_with_options` (a C++ actor)
+/// keeps its option diagnostics in local mode.
 /// The reason is the local submitter itself: local mode starts no core worker
 /// process and has no Python executor, and `LocalModeTaskSubmitter::Submit`
 /// ignores the language and the module and builds every task as a C++ descriptor
