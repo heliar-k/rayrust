@@ -2044,22 +2044,28 @@ fn check_task_options(opts: &TaskOptions) -> Result<(), RayError> {
 ///   [`TaskOptions::runtime_env`]
 /// - `placement_group` — bind actor to a placement group bundle
 ///
-/// `resources` carries no task-like default here: an actor reserves exactly what
-/// this list names, so an actor without resources reserves no CPU.
+/// `resources` gets the same actor default Python's driver applies
+/// (`ray/actor.py:1660-1672`, `ray/_private/ray_constants.py:175,179`): when it
+/// names any resource other than `memory` and `object_store_memory` and does not
+/// name `CPU`, 1 CPU is added for the actor's lifetime; naming only the memory
+/// keys, or naming nothing, adds none, so such an actor holds no CPU. An explicit
+/// `"CPU":0` opts out and `"CPU":2` stays 2, because the C entry only inserts the
+/// key when it is absent. The memory keys are excluded because Python's driver can
+/// only put them into this table through the `memory=` and `object_store_memory=`
+/// options: it rejects them inside `resources=` (`ray/_common/utils.py:136-140`)
+/// and fills them at `:157-160`. An actor whose table holds nothing besides
+/// `memory` is therefore the only-memory case, and it keeps zero CPU. Local mode
+/// builds the actor's task spec with an empty resource table
+/// (`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:42-43`, `:66-67`), so this
+/// default has no effect there.
 ///
-/// Ray's Python driver chooses between two actor presets (`ray/actor.py:1660-1674`,
-/// `ray/_private/ray_constants.py:174-179`): with no resource options the actor
-/// reserves 0 CPU for its lifetime and its method requirement is set to 1 CPU
-/// (`DEFAULT_ACTOR_METHOD_CPU_SIMPLE`) instead of reserving anything; with any
-/// other resource named, the actor reserves its resources plus 1 CPU for its
-/// lifetime (`DEFAULT_ACTOR_CREATION_CPU_SPECIFIED`). Measured in 2.51.1, a
-/// default Python actor's method still ran in 0.01 s while a task held the only
-/// CPU for 20 s, so the per-method figure does not make methods wait. The C++
-/// SDK's `ActorCreationOptions` has no method-CPU field
-/// (`include/ray/api/task_options.h:104-112`), so the first preset can only be
-/// approximated by reserving nothing; the second is expressible here but is not
-/// applied, which means an actor that names e.g. a GPU reserves no CPU where
-/// Python reserves one (#55).
+/// With no other resource named, Python assigns a 1 CPU requirement to each method
+/// (`DEFAULT_ACTOR_METHOD_CPU_SIMPLE`) and reserves nothing for the actor's
+/// lifetime. Measured in 2.51.1, a default Python actor's method still ran in
+/// 0.01 s while a task held the only CPU for 20 s, so the per-method figure does
+/// not make methods wait. The C++ SDK's `ActorCreationOptions` has no method-CPU
+/// field (`cpp/include/ray/api/task_options.h:104-112`), so that half can only be
+/// approximated by reserving nothing, which is what this builder does.
 ///
 /// # Example
 /// ```no_run
@@ -2078,7 +2084,10 @@ pub struct ActorOptions {
     /// Ignored in local mode, where actors are registered and looked up by name
     /// only.
     pub ray_namespace: String,
-    /// Resource requirements, e.g. `[("CPU", 1.0), ("GPU", 0.5)]`.
+    /// Resource requirements, e.g. `[("CPU", 1.0), ("GPU", 0.5)]`. Naming any
+    /// resource other than `memory` and `object_store_memory` without naming `CPU`
+    /// adds 1 CPU, and an explicit `("CPU", 0.0)` keeps the actor off the CPU
+    /// entirely; see [`ActorOptions`] for the full rule.
     pub resources: Vec<(String, f64)>,
     /// Maximum number of restarts on failure. 0 = no restart (default).
     pub max_restarts: i32,

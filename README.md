@@ -212,10 +212,13 @@ merged in. This covers both `Ray::task_call` and `Ray::task_call_python`; the
 latter takes no options and so always requests one CPU. Local mode drops
 resource requirements entirely, so none of this applies there.
 
-An actor is different: `ActorOptions` has no default, so an actor without
-`resources` reserves no CPU for its lifetime. That matches Python's no-options
-actor; an actor that names some other resource reserves no CPU here, while
-Python additionally reserves one (#55).
+An actor follows Ray's two presets as far as the C++ SDK allows. Without
+`resources` it reserves no CPU for its lifetime, like Python's no-options actor,
+whose methods each cost one CPU; `ActorCreationOptions` has no method-CPU field, so
+method calls here request no CPU. Naming any resource other than `memory` and
+`object_store_memory` reserves one CPU for the actor's lifetime as well, which is
+Python's rule for an actor that names resources; `.resource("CPU", 0.0)` opts out,
+and an actor that names only the memory keys stays at zero.
 
 ### Object Store
 

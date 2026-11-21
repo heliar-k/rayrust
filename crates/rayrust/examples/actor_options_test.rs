@@ -10,12 +10,14 @@
 //!
 //! # 环境前提
 //!
-//! - 集群必须是 **2 个 CPU**：第 7 项要用一个两 bundle（各 `CPU 1`）的组——长任务占住
-//!   bundle 0，默认 `bundle_index = -1` 的 actor 只能在 bundle 1 上跑；1 CPU 集群上两个
-//!   bundle 都建不出来。
-//! - 同一集群上别的 job 正在占着 CPU 时会干扰第 7 项（依赖「组内只剩 bundle 1 空着」）。
-//!   非 detached 的 placement group 随创建它的 job 结束而销毁，本示例自己上一轮留下的
-//!   组不需要手动清理。
+//! - 集群必须是 **2 个 CPU**，并带自定义资源 `Custom` 8 个：启动参数
+//!   `--num-cpus=2 --resources='{"Custom":8}'`。第 7 项要用一个两 bundle（各 `CPU 1`）的
+//!   组——长任务占住 bundle 0，默认 `bundle_index = -1` 的 actor 只能在 bundle 1 上跑；
+//!   1 CPU 集群上两个 bundle 都建不出来。第 11 项同时活着 5 个 actor，其中 3 个各要 1 个
+//!   `Custom`。
+//! - 同一集群上别的 job 正在占着 CPU 时会干扰第 7 项（依赖「组内只剩 bundle 1 空着」）与
+//!   第 11 项（要先把两个 CPU 全占住）。非 detached 的 placement group 随创建它的 job 结束
+//!   而销毁，本示例自己上一轮留下的组不需要手动清理。
 //! - 示例启动时清掉自己的日志目录 `actor_options_test_logs/`，结束时再清一次，不在
 //!   工作树里留痕迹。
 //!
@@ -74,9 +76,18 @@
 //!    调 `actor_call_python` 读到值。这两条证明 `get_actor` 集群路径从
 //!    `SerializeActorHandle` 字节里读出的语言与创建描述符类型是对的（改成恒报 CPP，
 //!    Python 那条会在 `actor_call` 的断言上失败）。
+//! 11. actor 的默认 CPU（#55）：两个默认 CPU 的任务占住两个 CPU 之后，
+//!    `resources = [("Custom",1.0)]` 的 actor 第一次调用必须在 `BLOCKED_TIMEOUT_MS` 内
+//!    超时（本缺陷的判别项），对照是 `[("Custom",1.0), ("CPU",1.0)]` 的 actor 同样超时
+//!    （证明 CPU 真的被占住）；`[("Custom",1.0), ("CPU",0.0)]`、不写 `resources`、只写
+//!    `[("memory",1.0)]` 三个 actor 的第一次调用都要完成并读到构造参数（显式退出、没写
+//!    资源、只有内存键都不补 CPU）；cancel 两个占 CPU 的任务之后，前面那两条排队的调用都
+//!    要完成并读到构造参数（前面的超时来自 CPU 被占住）。这一项结尾把它建的 actor 全部
+//!    kill。
 //!
-//! 本地模式（`local`）跳过第 4、7 项与第 10 项的集群部分并打印原因：第 4 项要查组，
-//! 本地模式在查组之前就报错；第 7 项要真组与 bundle 资源；第 10 项的集群部分要真的
+//! 本地模式（`local`）跳过第 4、7、11 项与第 10 项的集群部分并打印原因：第 4 项要查组，
+//! 本地模式在查组之前就报错；第 7 项要真组与 bundle 资源；第 11 项要真资源账本，本地模式
+//! 给任务规格传的是空资源表，资源不参与调度；第 10 项的集群部分要真的
 //! Python actor，本地模式建不出来（`actor_create_python` 拒绝本地模式）。第 3、9 项的
 //! 拒绝都发生在查组之前，两种模式都跑。
 
@@ -111,6 +122,16 @@ const SHORT_SLEEP_S: f64 = 1.0;
 
 /// 第 7 项里占住 bundle 0 的长任务时长（秒）。
 const LONG_SLEEP_S: f64 = 30.0;
+
+/// 第 11 项里占住两个 CPU 的任务时长（秒）：两条 `BLOCKED_TIMEOUT_MS` 与三条
+/// `ACTOR_START_TIMEOUT_MS` 最坏加起来是 90 s，占住 CPU 的任务必须活得更久。
+const CPU_HOLD_S: f64 = 180.0;
+
+/// 第 11 项里等两个占 CPU 的任务真的跑起来的时间（秒）。
+const CPU_HOLD_SETTLE_S: u64 = 5;
+
+/// 第 11 项里 cancel 之后等 raylet 把两个 CPU 还给调度器的时间（秒）。
+const CPU_RELEASE_SETTLE_S: u64 = 3;
 
 /// 与 worker .so 的 `Counter` 同名同实现：集群模式下由工人执行，本地模式下由这个
 /// 进程执行。
@@ -823,6 +844,143 @@ async fn actor_language_checks(ray: &Ray, cluster: bool) {
     );
 }
 
+/// 11. actor 写了别的资源时要预留 1 个 CPU（#55）。
+async fn default_actor_cpu_check(ray: &Ray, cluster: bool) {
+    println!("\n--- 11. actor 的默认 CPU ---");
+    if !cluster {
+        println!("  本地模式跳过：本地模式给任务规格传的是空资源表，资源不参与调度，");
+        println!("  两个 CPU 占不占住都是同一个结果。");
+        return;
+    }
+
+    // a) 两个默认 CPU 的任务（`Ray::task_call` 默认要 1.0）占住两个 CPU。
+    let first = sleep_for_remote_with_options(ray, &TaskOptions::new(), CPU_HOLD_S)
+        .expect("submit the first CPU-holding task");
+    let second = sleep_for_remote_with_options(ray, &TaskOptions::new(), CPU_HOLD_S)
+        .expect("submit the second CPU-holding task");
+    println!(
+        "  两个默认 CPU 的任务已提交（sleep_for({}s)），等 {} s 让它们各占一个 CPU",
+        CPU_HOLD_S, CPU_HOLD_SETTLE_S
+    );
+    tokio::time::sleep(Duration::from_secs(CPU_HOLD_SETTLE_S)).await;
+
+    let mut actors: Vec<ActorHandle> = Vec::new();
+    // 排队的调用：名、结果、构造参数（释放 CPU 后应当读到它）。
+    let mut queued: Vec<(&str, ObjectRef<i64>, i64)> = Vec::new();
+
+    // b) 对照：显式写 CPU 1 的 actor 拿不到 CPU，第一次调用超时。
+    let explicit_opts = ActorOptions::new()
+        .resource("Custom", 1.0)
+        .resource("CPU", 1.0);
+    let explicit =
+        counter_actor_create(ray, &explicit_opts, 41i64).expect("创建显式 CPU 1 的 actor");
+    actors.push(explicit.clone());
+    let call = counter_get_sync(ray, &explicit).expect("submit get on the CPU 1 actor");
+    let started = Instant::now();
+    match call.get_timeout(BLOCKED_TIMEOUT_MS) {
+        Err(RayError::Timeout(msg)) => println!(
+            "  显式 Custom 1 + CPU 1 的 actor → Timeout（{:?}）：对照成立，两个 CPU 都被占住（{}）",
+            started.elapsed(),
+            msg
+        ),
+        Err(other) => panic!("显式 CPU 1 的 actor 返回了别的错误变体: {}", other),
+        Ok(value) => panic!(
+            "显式 CPU 1 的 actor 在两个 CPU 都被占住时完成了（{}）——占 CPU 的对照不成立",
+            value
+        ),
+    }
+    queued.push(("显式 CPU 1", call, 41i64));
+
+    // c) 本缺陷的判别项：只写 Custom 1 的 actor 要被补上 1 个 CPU。
+    let custom_only = ActorOptions::new().resource("Custom", 1.0);
+    let custom =
+        counter_actor_create(ray, &custom_only, 42i64).expect("创建只有 Custom 1 的 actor");
+    actors.push(custom.clone());
+    let call = counter_get_sync(ray, &custom).expect("submit get on the Custom 1 actor");
+    let started = Instant::now();
+    match call.get_timeout(BLOCKED_TIMEOUT_MS) {
+        Err(RayError::Timeout(msg)) => println!(
+            "  只有 Custom 1 的 actor → Timeout（{:?}）：补上的 1 个 CPU 拿不到（{}）",
+            started.elapsed(),
+            msg
+        ),
+        Err(other) => panic!("只有 Custom 1 的 actor 返回了别的错误变体: {}", other),
+        Ok(value) => panic!(
+            "只有 Custom 1 的 actor 在两个 CPU 都被占住时完成了（{}）——它没有被补上 CPU",
+            value
+        ),
+    }
+    queued.push(("只有 Custom 1", call, 42i64));
+
+    // d) 显式 CPU 0 退出这一默认：不占 CPU，两个核被占住也照样完成。
+    let cpu_zero_opts = ActorOptions::new()
+        .resource("Custom", 1.0)
+        .resource("CPU", 0.0);
+    let cpu_zero =
+        counter_actor_create(ray, &cpu_zero_opts, 43i64).expect("创建显式 CPU 0 的 actor");
+    actors.push(cpu_zero.clone());
+    let value: i64 = counter_get_sync(ray, &cpu_zero)
+        .expect("submit get on the CPU 0 actor")
+        .get_timeout(ACTOR_START_TIMEOUT_MS)
+        .expect("显式 CPU 0 的 actor 不占 CPU，第一次调用必须在期限内完成");
+    assert_eq!(value, 43, "显式 CPU 0 的 actor 读到 {}", value);
+    println!(
+        "  显式 Custom 1 + CPU 0 的 actor → get() = {}（不占 CPU）",
+        value
+    );
+
+    // e) 不写 resources：不占 CPU，照样完成。
+    let plain = counter_actor_create(ray, &ActorOptions::new(), 44i64)
+        .expect("创建不写 resources 的 actor");
+    actors.push(plain.clone());
+    let value: i64 = counter_get_sync(ray, &plain)
+        .expect("submit get on the actor without resources")
+        .get_timeout(ACTOR_START_TIMEOUT_MS)
+        .expect("不写 resources 的 actor 不占 CPU，第一次调用必须在期限内完成");
+    assert_eq!(value, 44, "不写 resources 的 actor 读到 {}", value);
+    println!("  不写 resources 的 actor → get() = {}（不占 CPU）", value);
+
+    // f) 只有内存键：不补 CPU，照样完成。
+    let memory_only_opts = ActorOptions::new().resource("memory", 1.0);
+    let memory_only = counter_actor_create(ray, &memory_only_opts, 45i64)
+        .expect("创建只有 memory 1 的 actor");
+    actors.push(memory_only.clone());
+    let value: i64 = counter_get_sync(ray, &memory_only)
+        .expect("submit get on the memory-only actor")
+        .get_timeout(ACTOR_START_TIMEOUT_MS)
+        .expect("只有 memory 的 actor 不补 CPU，第一次调用必须在期限内完成");
+    assert_eq!(value, 45, "只有 memory 的 actor 读到 {}", value);
+    println!("  只有 memory 1 的 actor → get() = {}（不补 CPU）", value);
+
+    // g) 把两个 CPU 还回去，前面两条排队的调用都要完成。
+    ray.cancel(first.id(), false, true)
+        .expect("cancel the first CPU-holding task with its handle alive");
+    ray.cancel(second.id(), false, true)
+        .expect("cancel the second CPU-holding task with its handle alive");
+    println!(
+        "  两个占 CPU 的任务已 cancel，等 {} s",
+        CPU_RELEASE_SETTLE_S
+    );
+    tokio::time::sleep(Duration::from_secs(CPU_RELEASE_SETTLE_S)).await;
+    for (label, call, expected) in queued {
+        let value: i64 = call.get_timeout(ACTOR_START_TIMEOUT_MS).unwrap_or_else(|error| {
+            panic!("释放 CPU 之后 {} 的 actor 调用仍没完成: {}", label, error)
+        });
+        assert_eq!(value, expected, "{} 的 actor 读到 {}", label, value);
+        println!(
+            "  释放 CPU 之后 {} 的 actor → get() = {}（前面的超时来自 CPU 被占住）",
+            label, value
+        );
+    }
+
+    // h) 收尾：这一项建的 actor 全 kill，不给下一项留下活 actor。
+    for handle in &actors {
+        ray.kill_actor(handle, false)
+            .unwrap_or_else(|error| panic!("kill_actor 失败: {}", error));
+    }
+    println!("  第 11 项建的 {} 个 actor 已 kill", actors.len());
+}
+
 #[tokio::main]
 async fn main() {
     let mode = std::env::args()
@@ -847,6 +1005,7 @@ async fn main() {
     local_mode_check(&ray, cluster).await;
     raw_decode_branches_check();
     actor_language_checks(&ray, cluster).await;
+    default_actor_cpu_check(&ray, cluster).await;
 
     // 让 tokio 的 blocking pool 里的 FFI 调用有机会收尾，避免退出竞态。
     tokio::time::sleep(Duration::from_millis(200)).await;
