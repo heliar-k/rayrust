@@ -896,6 +896,35 @@ impl Ray {
     /// because that path reads the descriptor as a `PythonFunctionDescriptor`
     /// whatever the handle holds.
     ///
+    /// `method_name` must be a method the Python actor really has; an empty one is
+    /// refused before submission and a non-empty unknown one still ends the actor's
+    /// worker.
+    ///
+    /// An empty `method_name` returns [`RayError::Ffi`] with a message starting
+    /// `the method name is empty`, before the runtime lookup and before the local
+    /// mode rejection below, so local mode with an empty method name reports that
+    /// error while local mode with a non-empty one still reports the local mode
+    /// error. An empty name is not always fatal: a Python instance can carry an
+    /// attribute named with the empty string (`setattr(Class, "", method)`), and a
+    /// cross-language call with that name reaches it (measured on Ray 2.51.1: the
+    /// call read 42 and the actor kept answering). This process cannot tell such an
+    /// actor apart from one without that attribute, and there the call ends the
+    /// actor's worker: it exits with `SYSTEM_ERROR` (`Worker exits unexpectedly`) and
+    /// a traceback holding `python/ray/_raylet.pyx:2432` (`task_execution_handler`),
+    /// `:2291` (which calls `execute_task`) and `:1873`, where `execute_task` runs
+    /// `function_name = execution_info.function_name` and raises
+    /// `AttributeError: 'dict' object has no attribute 'function_name'`; the first
+    /// read answers only `Actor error ... unknown FFI error` and that actor cannot be
+    /// called again. The empty name is refused in both cases, including the one where
+    /// the method exists. A method name with an interior NUL byte is refused by the
+    /// same check, because `to_cstring` (`crates/rayrust-sys/src/lib.rs:253-255`,
+    /// #27) turns it into an empty C string.
+    ///
+    /// A non-empty method name the actor does not have cannot be told apart from a
+    /// valid one here: this process holds no method table for the actor. Measured on
+    /// 2.51.1, such a name ends the actor's worker with the same traceback as an
+    /// empty one, so a caller must pass a method name that exists.
+    ///
     /// `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID (pass by
     /// reference). Three requirements apply to such an id:
     /// - it must be exactly 28 bytes; any other length returns [`RayError::Ffi`]
@@ -3945,6 +3974,103 @@ mod tests {
         assert!(
             message.contains("Ray runtime is not initialized"),
             "合法名字没有走到运行时检查: {}",
+            message
+        );
+    }
+
+    /// 空方法名在 C 入口被拒，进程里没有运行时也能测：两条方法名检查都排在取运行时
+    /// 之前。`to_cstring` 把带内部 NUL 的方法名（`"in\0crement"`）折成空串（#27），
+    /// 所以那条用例拿到的 C 串也是空的。id 宽度检查排在方法名前面，15 字节 id + 空
+    /// 方法名报的是宽度错误。
+    #[test]
+    fn actor_call_python_rejects_an_empty_method_name() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let full_id = [0u8; 16];
+        let short_id = [0u8; 15];
+        let cases: [(&[u8], &str, &str, &str); 3] = [
+            (&full_id, "", "the method name is empty", "空方法名"),
+            (
+                &full_id,
+                "in\0crement",
+                "the method name is empty",
+                "带内部 NUL 的方法名 \"in\\0crement\"",
+            ),
+            (
+                &short_id,
+                "",
+                "actor id must be 16 bytes",
+                "15 字节 id + 空方法名",
+            ),
+        ];
+        for (id, method_name, needle, label) in cases {
+            let method_c = to_cstring(method_name);
+            if method_name.contains('\0') {
+                assert!(
+                    method_c.as_bytes().is_empty(),
+                    "{} 经过 to_cstring 不是空串",
+                    label
+                );
+            }
+            let bytes = unsafe {
+                rayrust_sys::ray_actor_call_python(
+                    id.as_ptr() as *const std::os::raw::c_char,
+                    id.len(),
+                    method_c.as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            assert!(
+                bytes.data.is_null(),
+                "{} 被接受了（返回 {:#p}）",
+                label,
+                bytes.data
+            );
+            let message = rayrust_sys::last_error().expect("C 入口没有记录错误");
+            assert!(
+                message.contains(needle),
+                "{} 的错误消息不是 {:?}: {}",
+                label,
+                needle,
+                message
+            );
+            assert!(
+                !unsafe { rayrust_sys::ray_is_initialized() },
+                "{} 被拒之后建出了运行时",
+                label
+            );
+        }
+    }
+
+    /// 非空方法名不被这两条检查拦住：守卫排在取运行时之前，所以这里停在「运行时没有
+    /// 初始化」那一条。
+    #[test]
+    fn actor_call_python_lets_a_non_empty_method_name_through_to_the_runtime_check() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let id = [0u8; 16];
+        let method_c = to_cstring("get");
+        let bytes = unsafe {
+            rayrust_sys::ray_actor_call_python(
+                id.as_ptr() as *const std::os::raw::c_char,
+                id.len(),
+                method_c.as_ptr(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert!(bytes.data.is_null(), "没有运行时却交回了调用结果");
+        let message = rayrust_sys::last_error().expect("C 入口没有记录错误");
+        assert!(
+            message.contains("Ray runtime is not initialized"),
+            "非空方法名没有走到运行时检查: {}",
             message
         );
     }

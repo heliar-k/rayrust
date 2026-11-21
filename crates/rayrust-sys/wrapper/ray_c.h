@@ -437,7 +437,32 @@ ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
 /// then ends at `RAY_CHECK(ray_function.GetLanguage() == ray::Language::CPP)`
 /// (`cpp/src/ray/runtime/task/task_executor.cc:145`). `rayrust` refuses a
 /// non-Python id before this entry.
-/// `method_name` is the Python method name (without `self`).
+/// `method_name` is the Python method name (without `self`). It must be non-empty.
+/// An empty name is not always fatal: a Python instance can carry an attribute named
+/// with the empty string (`setattr(Class, "", method)` puts one into the class
+/// namespace), and a cross-language call with that name reaches it (measured on Ray
+/// 2.51.1: the call read 42 and the actor kept answering). The driver cannot tell such
+/// an actor apart from one without that attribute, and there the call ends the actor's
+/// worker: it exits with `SYSTEM_ERROR` (`Worker exits unexpectedly`) and a traceback
+/// holding `python/ray/_raylet.pyx:2432` (`task_execution_handler`), `:2291` (which
+/// calls `execute_task`) and `:1873`, where `execute_task` runs
+/// `function_name = execution_info.function_name` and raises
+/// `AttributeError: 'dict' object has no attribute 'function_name'`; the caller's
+/// first read then answers only `Actor error ... unknown FFI error` and that actor
+/// cannot be called again. This entry refuses the empty name in both cases, including
+/// the one where the method exists. The C++ entry `ray_actor_call` refuses an
+/// empty name in the driver as well: its single-argument `RemoteFunctionHolder`
+/// constructor throws `Function not found. Please use RAY_REMOTE to register this
+/// function.` (`cpp/include/ray/api/ray_runtime.h:41-45`) before any task is
+/// submitted, so its actor keeps running. A name with an interior NUL byte reaches
+/// this entry as an empty C string as well (`crates/rayrust-sys/src/lib.rs:253-255`,
+/// #27). The null and empty checks run after the actor id width check and before the
+/// runtime lookup, so local mode with an empty method name reports `the method name is
+/// empty` while local mode with a non-empty one still reports the local mode error.
+/// A non-empty method name the actor does not have is not rejected here: the driver
+/// holds no method table and cannot tell a valid name from an invalid one. Measured
+/// on 2.51.1 such a name ends the actor's worker with the same traceback as an empty
+/// one, so the caller must pass a method name that really exists.
 /// `is_ref[i] = true` means args[i] is an ObjectRef ID (pass by reference).
 ///   Such an id must be exactly 28 bytes, the same requirement and the same
 ///   rejection as ray_task_call_with_options.
