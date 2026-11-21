@@ -1655,8 +1655,47 @@ ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len
                                     const bool *is_ref) {
     ray_clear_error();
     try {
+        // 次序按参数次序：actor id 是第一个参数，宽度检查先报；id 合法之后才轮到方法
+        // 名。两条方法名检查都排在取运行时之前，被拒的调用不建运行时、不碰 SDK，也能
+        // 在没有运行时的进程里测；它们还排在下面的本地模式拒绝之前，所以本地模式 +
+        // 空方法名报名字错误，本地模式 + 合法方法名报的还是那条本地模式错误。
         if (check_actor_id(actor_id_data, actor_id_len) != 0)
             return ray_bytes_t{nullptr, 0};
+        if (!method_name) {
+            set_last_error("method_name is null");
+            return ray_bytes_t{nullptr, 0};
+        }
+        if (method_name[0] == '\0') {
+            set_last_error(
+                "the method name is empty: this entry refuses it, although an empty "
+                "name is not always fatal. A Python instance can carry an attribute "
+                "named with the empty string (setattr(Class, \"\", method) puts one "
+                "into the class namespace), and a cross-language call with that name "
+                "reaches it: measured on Ray 2.51.1, that call read 42 and the actor "
+                "kept answering. The driver cannot tell such an actor apart from one "
+                "without that attribute, and there the call ends the actor's worker: "
+                "it exits with SYSTEM_ERROR (\"Worker exits unexpectedly\"), the "
+                "traceback holds python/ray/_raylet.pyx:2432 (task_execution_handler "
+                "calls execute_task_with_cancellation_handler), :2291 (which calls "
+                "execute_task) and :1873, where execute_task runs "
+                "function_name = execution_info.function_name and raises "
+                "\"AttributeError: 'dict' object has no attribute "
+                "'function_name'\"; the caller's first read then answers only "
+                "\"Actor error ... unknown FFI error\" and that actor cannot be "
+                "called again. The C++ entry ray_actor_call refuses an empty name in "
+                "the driver as well: its single-argument RemoteFunctionHolder "
+                "constructor throws \"Function not found. Please use RAY_REMOTE to "
+                "register this function.\" "
+                "(cpp/include/ray/api/ray_runtime.h:41-45) before any task is "
+                "submitted, so its actor keeps running. A name with an interior NUL "
+                "byte arrives here as an empty C string as well "
+                "(crates/rayrust-sys/src/lib.rs:253-255, #27). A non-empty method "
+                "name the actor does not have is not refused here: the driver holds "
+                "no method table and cannot tell a valid name from an invalid one, "
+                "and measured on 2.51.1 such a name also ends the actor's worker with "
+                "the same traceback, so callers must pass a method name that exists.");
+            return ray_bytes_t{nullptr, 0};
+        }
         auto runtime = ray::internal::GetRayRuntime();
         if (!runtime) {
             set_last_error("Ray runtime is not initialized");
