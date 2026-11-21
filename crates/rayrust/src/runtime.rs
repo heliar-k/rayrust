@@ -661,6 +661,33 @@ impl Ray {
     /// Create an actor with full creation options.
     ///
     /// Pass `&ActorOptions::new()` for defaults (no name, no restarts, etc.).
+    ///
+    /// `func_name` is the name a `#[rayrust::actor]` type registered: the
+    /// constructor as `__rayrust_actor_factory_<type>`, a method as
+    /// `__rayrust_actor_factory_<type>::<method>`. Both are non-empty, and an empty
+    /// name returns [`RayError::Ffi`] before any task is submitted, because it can
+    /// never run. Local mode constructs only a driver
+    /// (`cpp/src/ray/runtime/local_mode_ray_runtime.cc:30-34`), runs the creation task
+    /// in the calling thread before `CreateActor` returns
+    /// (`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:115-121`, `:143-151`)
+    /// and throws `Task function name is empty` before any lookup
+    /// (`cpp/src/ray/runtime/task/task_executor.cc:32-34`); the error text goes into
+    /// the creation task's return value and no actor context is registered (same
+    /// file, `:336-339`, so the branch at `:327-331` is skipped), and the first call
+    /// throws a bare `_Map_base::at` from `actor_contexts_.at`
+    /// (`local_mode_task_submitter.cc:110-112`). Cluster mode returns as soon as the
+    /// creation task is submitted, and the worker fails it with `RayFunctionNotFound`
+    /// (`cpp/src/ray/util/function_helper.cc:163-168`, caught at
+    /// `task_executor.cc:101-111`): the actor worker stops at
+    /// `src/ray/core_worker/core_worker_shutdown_executor.cc:40` and the driver reads
+    /// only `Actor error ... unknown FFI error`. A name with an interior NUL byte
+    /// reaches the C entry as an empty C string, the same as in [`Ray::get_actor`],
+    /// and is refused with it.
+    ///
+    /// A non-empty name that nobody registered keeps Ray's asynchronous semantics:
+    /// the driver has no way to learn which names are registered, so the creation
+    /// returns `Ok` and the failure surfaces on the first call or when its value is
+    /// read. A whitespace-only name is not trimmed and is submitted as it is.
     pub fn actor_create(
         &self,
         func_name: &str,
@@ -3718,6 +3745,77 @@ mod tests {
         assert!(
             !unsafe { rayrust_sys::ray_is_initialized() },
             "被拒的调用建出了运行时"
+        );
+    }
+
+    /// 空函数名在 C 入口被拒，进程里没有运行时也能测：参数检查排在取运行时之前。
+    /// `to_cstring` 把带内部 NUL 的名字（`"a\0b"`）折成空串（#27），所以两条用例
+    /// 拿到的 C 串都是空的。
+    #[test]
+    fn actor_create_rejects_an_empty_function_name() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        for (raw, label) in [("", "空串"), ("a\0b", "带内部 NUL 的 \"a\\0b\"")] {
+            let name = to_cstring(raw);
+            assert!(
+                name.as_bytes().is_empty(),
+                "{} 经过 to_cstring 不是空串：这一条被拒的理由是它到 C 侧成了空串",
+                label
+            );
+            let bytes = unsafe {
+                rayrust_sys::ray_actor_create_with_options(
+                    name.as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            assert!(
+                bytes.data.is_null(),
+                "{} 的函数名被接受了（返回 {:#p}）",
+                label,
+                bytes.data
+            );
+            let message = rayrust_sys::last_error().expect("C 入口没有记录错误");
+            assert!(
+                message.contains("the function name is empty"),
+                "{} 的错误消息不是空函数名那一句: {}",
+                label,
+                message
+            );
+            assert!(
+                !unsafe { rayrust_sys::ray_is_initialized() },
+                "{} 被拒之后建出了运行时",
+                label
+            );
+        }
+    }
+
+    /// 非空函数名不被这条检查拦住：守卫排在运行时检查之前，所以这里停在「运行时没有
+    /// 初始化」那一条。
+    #[test]
+    fn actor_create_lets_a_non_empty_function_name_through_to_the_runtime_check() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let name = to_cstring("no_such_function");
+        let bytes = unsafe {
+            rayrust_sys::ray_actor_create_with_options(
+                name.as_ptr(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert!(bytes.data.is_null(), "没有运行时却交回了 id");
+        let message = rayrust_sys::last_error().expect("C 入口没有记录错误");
+        assert!(
+            message.contains("Ray runtime is not initialized"),
+            "非空函数名没有走到运行时检查: {}",
+            message
         );
     }
 }
