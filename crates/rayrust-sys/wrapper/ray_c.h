@@ -319,6 +319,28 @@ ray_bytes_t ray_task_call_python(const char *module_name,
 /// terminate the process. A group without a `bundle_index` key means -1 (any
 /// bundle).
 /// Constructor arguments are always values: there is no `is_ref` here.
+/// `func_name` must be a non-empty name. An empty name — and a name with an
+/// interior NUL byte, which reaches this entry as an empty C string — is refused
+/// here with RAY_ERROR_KIND_GENERIC before the runtime is looked up and before any
+/// task is submitted: every name a `#[rayrust::actor]` type registers is non-empty,
+/// and an empty one can never run. Local mode constructs only a driver
+/// (`cpp/src/ray/runtime/local_mode_ray_runtime.cc:30-34`), runs the creation task
+/// in the calling thread before `CreateActor` returns
+/// (`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:115-121`, `:143-151`) and
+/// throws `Task function name is empty` before any lookup
+/// (`cpp/src/ray/runtime/task/task_executor.cc:32-34`); the error text goes into the
+/// creation task's return value and no actor context is registered (same file,
+/// `:336-339`, so the branch at `:327-331` is skipped), and the first call throws a
+/// bare `_Map_base::at` from `actor_contexts_.at`
+/// (`local_mode_task_submitter.cc:110-112`). Cluster mode returns as soon as the
+/// creation task is submitted, and the worker fails it with `RayFunctionNotFound`
+/// (`cpp/src/ray/util/function_helper.cc:163-168`, caught at
+/// `task_executor.cc:101-111`): the actor worker stops at
+/// `src/ray/core_worker/core_worker_shutdown_executor.cc:40` and the driver reads
+/// only `Actor error ... unknown FFI error`. A whitespace-only name is not trimmed
+/// and is submitted as it is, as `ray_get_actor` does; a non-empty
+/// name nobody registered keeps Ray's asynchronous semantics, because the driver has
+/// no way to learn which names are registered.
 ray_bytes_t ray_actor_create_with_options(const char *func_name,
                                             const ray_bytes_t *args,
                                             size_t arg_count,

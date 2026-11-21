@@ -1434,11 +1434,55 @@ ray_bytes_t ray_task_call_python(const char *module_name,
 // ─── Actor ────────────────────────────────────────────────────
 
 /// Create an actor with full ActorCreationOptions via options JSON.
+///
+/// 函数名的前置检查放在取运行时之前：参数错误先于状态错误，与同文件 `ray_get_actor`、
+/// `wait` 的参数检查一致，被拒的调用不建运行时、不碰 SDK，而且不需要运行时就能测。
+/// 空函数名必须在这里拒掉，它在两种模式下都交出一个跑不起来的 id。本地模式只构造驱动
+/// （`cpp/src/ray/runtime/local_mode_ray_runtime.cc:30-34`），创建任务在调用线程里跑完了
+/// `CreateActor` 才返回（`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:115-121`、
+/// `:143-151`），`TaskExecutionHandler` 在任何查找之前抛 `Task function name is empty`
+/// （`cpp/src/ray/runtime/task/task_executor.cc:32-34`），`Invoke` 的 catch 把这段文本
+/// 放进创建任务的返回值、跳过 actor context 登记（同文件 `:336-339`，`:327-331` 那条
+/// 分支没有走到），第一次调用在 `actor_contexts_.at` 上抛裸的 `_Map_base::at`
+/// （`local_mode_task_submitter.cc:110-112`）。集群模式在创建任务提交之后就返回，actor
+/// worker 在自己的进程里解析这个名字：空名字在
+/// `cpp/src/ray/util/function_helper.cc:163-168` 抛 `RayFunctionNotFound`，
+/// `task_executor.cc:101-111` 把它转成 `Status::Invalid`，actor worker 停在
+/// `src/ray/core_worker/core_worker_shutdown_executor.cc:40`，驱动读到
+/// `Actor error ... unknown FFI error`。
 ray_bytes_t ray_actor_create_with_options(const char *func_name,
                                             const ray_bytes_t *args,
                                             size_t arg_count,
                                             const char *options_json) {
     ray_clear_error();
+    if (!func_name) {
+        set_last_error("func_name is null");
+        return ray_bytes_t{nullptr, 0};
+    }
+    if (func_name[0] == '\0') {
+        set_last_error(
+            "the function name is empty: every name a #[rayrust::actor] type registers is "
+            "non-empty (the constructor is __rayrust_actor_factory_<type>, a method is "
+            "__rayrust_actor_factory_<type>::<method>), and an empty one can never run. "
+            "Local mode runs the creation task in the calling thread before CreateActor "
+            "returns (cpp/src/ray/runtime/task/local_mode_task_submitter.cc:115-121) and "
+            "throws \"Task function name is empty\" before any lookup "
+            "(cpp/src/ray/runtime/task/task_executor.cc:32-34); the error text goes into "
+            "the creation task's return value and no actor context is registered (same "
+            "file, :336-339, so the branch at :327-331 is skipped), and the first call "
+            "throws a bare _Map_base::at from actor_contexts_.at "
+            "(local_mode_task_submitter.cc:110-112). Cluster mode returns as soon as the "
+            "creation task is submitted, and the worker fails it with RayFunctionNotFound "
+            "(cpp/src/ray/util/function_helper.cc:163-168, caught at "
+            "task_executor.cc:101-111): the actor worker stops at "
+            "src/ray/core_worker/core_worker_shutdown_executor.cc:40 and the driver reads "
+            "only \"Actor error ... unknown FFI error\". A name with an interior NUL byte "
+            "arrives here as an empty C string as well (#27). A whitespace-only name is "
+            "not trimmed and is submitted as it is, as ray_get_actor does; a "
+            "non-empty name nobody registered keeps Ray's asynchronous semantics, "
+            "because the driver has no way to learn which names are registered.");
+        return ray_bytes_t{nullptr, 0};
+    }
     try {
         auto runtime = ray::internal::GetRayRuntime();
         if (!runtime) {
