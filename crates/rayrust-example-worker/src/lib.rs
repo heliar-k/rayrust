@@ -141,6 +141,24 @@ impl Counter {
     }
 }
 
+// ─── 读环境变量的 actor ─────────────────────────────────────
+
+/// `read` 直接读工人进程自己的环境变量：actor 创建时带的 runtime_env 里的
+/// `env_vars` 是否真的装到了工人进程，由它交回的值判定。这个 actor 没有状态，
+/// 每个方法都在同一个进程里读同一份环境。
+struct EnvReader;
+
+#[rayrust::actor]
+impl EnvReader {
+    fn new() -> Self {
+        EnvReader
+    }
+
+    fn read(&self, name: String) -> Option<String> {
+        std::env::var(&name).ok()
+    }
+}
+
 // ─── 能结束自己的 actor ──────────────────────────────────────
 
 /// `exit()` 调用 `rayrust::exit_actor()` 结束自己；`get()` 是接管普通方法的对照组：
