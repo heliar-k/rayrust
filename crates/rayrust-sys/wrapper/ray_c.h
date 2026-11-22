@@ -127,30 +127,86 @@ int ray_init(const char *address, int local_mode, const char *node_ip,
 /// Returns true if ray::Init has been called.
 bool ray_is_initialized(void);
 
-/// Shutdown Ray runtime.
+/// 停止 Ray 运行时。
 ///
-/// In local mode, waits for every task submitted through the three task entries
-/// (`ray_task_call_with_options`, `ray_task_call_python`,
-/// `ray_task_call_python_with_options`) during the current runtime to become ready
-/// before closing the reference-count gate and calling `ray::Shutdown()`. Once shutdown
-/// begins, new local-mode task submissions are rejected with an error, and they
-/// keep being rejected after the shutdown has finished until a new `ray_init`
-/// establishes a runtime; `ray_init` itself reports -1 until the shutdown has
-/// finished. If waiting fails, prints
-/// the reason to `stderr` and aborts the process, because this `extern "C"` entry
-/// has no error channel and letting the runtime be destroyed while tasks are
-/// still running causes use-after-free on `object_store_`.
-/// Concurrent calls perform the shutdown once: the first call takes the snapshot
-/// and waits, every later call finds the shutdown in progress and returns
-/// immediately without waiting or touching Ray. Cluster mode does not wait for
-/// submitted tasks.
+/// 执行次序：一开始先置位关闭标志（拒绝所有取运行时的入口与新的引用计数调用）并
+/// 等待已经进入的引用计数调用退出；本地模式下接着等待当前运行时期间经三个任务入口
+/// （`ray_task_call_with_options`、`ray_task_call_python`、
+/// `ray_task_call_python_with_options`）提交的所有任务就绪；最后调用
+/// `ray::Shutdown()`。集群模式不等待已提交的任务。
+///
+/// 关闭一旦开始，新的调用（包括本地任务提交）即被拒绝，并在关闭结束后继续被拒绝，
+/// 直到下一次 `ray_init` 成功建立新运行时为止；`ray_init` 本身在本地关闭尚未完成
+/// 期间返回 -1（消息为 `a ray_shutdown is still in progress`）。若本地任务排空等待
+/// 失败，向 `stderr` 打印原因并调用 `std::abort()` 终止进程：本 `extern "C"` 入口
+/// 没有错误通道，在任务仍在运行时销毁运行时会导致对 `object_store_` 的悬垂访问。
+/// 并发调用只执行一次关闭：第一个进入的调用置位标志、取快照并等待，后续并发调用
+/// 见到关闭正在进行就立即返回，不等待也不访问 Ray。
 void ray_shutdown(void);
+
+/// Closing gate
+///
+/// 上游 `ray::Shutdown()`（`cpp/src/ray/api.cc:42-46`）调用
+/// `AbstractRayRuntime::DoShutdown()`（`cpp/src/ray/runtime/abstract_ray_runtime.cc:72-77`）：
+/// 集群模式下 `CoreWorkerProcess::Shutdown()`
+/// （`src/ray/core_worker/core_worker_process.cc:101-108`）先经 `ShutdownDriver()`
+/// （同文件 `:945-957`）清空 `core_worker_`，再执行 `core_worker_process.reset()`，
+/// 但 `RayRuntimeHolder::runtime_`（`cpp/include/ray/api/ray_runtime_holder.h:22-45`）
+/// 不会被清空，`GetRayRuntime()` 在关闭开始与结束之后仍返回非空指针。关闭开始后访问
+/// core worker 会在 `CoreWorkerProcessImpl::GetCoreWorker()`（`core_worker_process.cc:964-984`）
+/// 或 `CoreWorkerProcess::EnsureInitialized`（同文件 `:842-856`）里调用 `QuickExit()`
+/// （`_Exit(1)`，`src/ray/util/process.cc:845-848`）终止进程，`RAY_CATCH` 无法捕获。
+///
+/// - 关闭期间被拒绝的入口（共 24 个）：`ray_put`、`ray_get`、`ray_wait`、
+///   `ray_get_many`、`ray_task_call_with_options`、`ray_task_call_python`、
+///   `ray_task_call_python_with_options`、`ray_actor_create_with_options`、
+///   `ray_actor_create_python_with_options`、`ray_actor_call`、
+///   `ray_actor_call_python`、`ray_actor_kill`、`ray_actor_handle_serialize`、
+///   `ray_actor_handle_deserialize`、`ray_placement_group_create`、
+///   `ray_placement_group_remove`、`ray_placement_group_wait_ready`、
+///   `ray_placement_group_get_all`、`ray_placement_group_get_by_id`、
+///   `ray_placement_group_get_by_name`、`ray_was_current_actor_restarted`、
+///   `ray_get_namespace`、`ray_get_actor`、`ray_cancel`。被拒绝时返回各自的空值或
+///   错误码，错误类别为 `RAY_ERROR_KIND_RUNTIME`，`ray_last_error()` 消息原文为：
+///   `the Ray runtime is shutting down or has shut down: calls are refused until a new runtime is initialized`。
+/// - 判定次序：名字、id 宽度与引用参数 id 在取运行时之前检查，所以它们与关闭状态同时
+///   不合法时报的是参数错误；选项 JSON 以及其中 `placement_group_id` 的查表在取运行时
+///   之后（查表需要运行时），所以畸形 options JSON 与正在关闭同时出现时报关闭错误。
+///   本地模式判定在取运行时与关闭检查之后，所以关闭期间的本地模式调用报的是关闭错误。
+///   从未初始化过运行时时报 `Ray runtime is not initialized`
+///   （`RAY_ERROR_KIND_GENERIC`）。
+/// - 生效范围：关闭标志从 `ray_shutdown` 一开始置位（涵盖本地模式排空已提交任务的那段
+///   时间），关闭结束后保持置位，直到下一次 `ray_init` 成功之后清除。
+/// - 残留窗口：已经进入 Ray SDK 的调用不由 `ray_shutdown` 等待，因为阻塞调用可能没有
+///   期限（`Get` 的期限可以是 -1）。另一个线程 drop 最后一个 `Ray` 句柄时，在途的
+///   `Get` 会与关闭竞争：`CoreWorkerProcessImpl::ShutdownDriver()`
+///   （`src/ray/core_worker/core_worker_process.cc:945-957`）在清空 `core_worker_` 之前
+///   先调用 `CoreWorker::Disconnect()`（`src/ray/core_worker/core_worker.cc:563-596`），
+///   后者关掉与 raylet 的 IPC 连接（同文件 `:588-589`）；在途调用随后析构
+///   `CoreWorkerPlasmaStoreProvider::Get()` 里持有的 `ipc::ScopedResponse`
+///   （`src/ray/core_worker/store_provider/plasma_store_provider.cc:254-355`；持有它的是
+///   同文件 `:258` 的 `get_request_cleanup_handlers`，在 `:278-281` 填入），其
+///   `HandleCleanup()`（`src/ray/raylet_ipc_client/raylet_ipc_client_interface.h:67-72`）
+///   在 `:70` 对 `Broken pipe` 执行 `RAY_CHECK(s.ok())`，进程以退出码 1 终止。
+///   调用也可能以别的方式返回错误（实测到过 `Get object error: IOError: Broken pipe`）。
+///   这个风险覆盖 `get`、`get_timeout` 与 `get_async`（`get_async` 在 `spawn_blocking`
+///   里调同一个 `runtime::get_raw_timeout`）。通过关闭检查之后、还没进入
+///   `CoreWorkerProcessImpl::GetCoreWorker()`（`core_worker_process.cc:964-984`）或
+///   `CoreWorkerProcess::EnsureInitialized()`（同文件 `:842-856`）的那一段仍然可能撞上
+///   `QuickExit()`。关闭开始之后的新调用由代次（`check_epoch`）与关闭闸门挡成
+///   `RayError::Runtime`。Ray 自己的 C++ 前端同样不会等待在途的 `Get`。
+/// - 不被拒绝的入口：`ray_is_local_mode` 不被拒绝（无错误通道，`IsLocalMode()` 是对
+///   运行时对象的 C++ virtual 调用，关闭之后照常可答）；`ray_register_function` 与
+///   `ray_register_member_function` 只写 `FunctionManager`，不访问运行时；
+///   `ray_add_local_reference` 与 `ray_remove_local_reference` 在关闭开始后直接返回 0
+///   且不记录错误。
 
 // ─── Object Store ─────────────────────────────────────────────
 
 /// Put a serialized object into the object store.
 /// `data` is msgpack-serialized bytes.
 /// Returns a ray_bytes_t containing the binary object ID.
+/// 关闭期间同样拒绝（data=NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 /// Caller must free with ray_free_bytes.
 ray_bytes_t ray_put(const char *data, size_t len);
 
@@ -164,6 +220,7 @@ ray_bytes_t ray_put(const char *data, size_t len);
 /// `timeout_ms` is -1 for infinite wait.
 /// Returns a ray_bytes_t containing the serialized object data.
 /// On error, returns ray_bytes_t with data=NULL.
+/// 关闭期间同样拒绝（返回 data=NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 ray_bytes_t ray_get(const char *id_data, size_t id_len, int timeout_ms);
 
 /// Add one local reference to an object ID.
@@ -207,13 +264,21 @@ int ray_remove_local_reference(const char *id_data, size_t id_len);
 /// (src/ray/core_worker/core_worker.cc:1475-1483).
 /// `timeout_ms` is -1 for infinite wait.
 /// Returns a heap-allocated bool array (one per input ID).
+/// 关闭期间同样拒绝（返回 NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 /// Caller must free with ray_free_bools.
 bool *ray_wait(const ray_bytes_t *ids, size_t count, size_t num_objects, int timeout_ms);
 
 // ─── Task ─────────────────────────────────────────────────────
 
 /// Call a remote task with full CallOptions.
-/// `func_name` is a null-terminated C string (function names are ASCII).
+/// `func_name` is a null-terminated C string (function names are ASCII). A null
+///   pointer is rejected with RAY_ERROR_KIND_GENERIC and `func_name is null`. The
+///   empty string is refused too: the single-argument `RemoteFunctionHolder`
+///   constructor throws `Function not found. Please use RAY_REMOTE to register
+///   this function.` (`cpp/include/ray/api/ray_runtime.h:41-47`), which the entry's
+///   catch records as RAY_ERROR_KIND_RAY. Both checks run before the runtime
+///   lookup and before the closing check, so a null or empty name without a
+///   runtime reports the name error.
 /// `args` is an array of msgpack-serialized arguments.
 /// `is_ref` is an array of booleans (same length as args). If is_ref[i] is true,
 ///   args[i] is treated as a binary ObjectRef ID (pass by reference).
@@ -260,6 +325,7 @@ bool *ray_wait(const ray_bytes_t *ids, size_t count, size_t num_objects, int tim
 /// Pass NULL or empty string for no options (all defaults).
 /// Returns a ray_bytes_t containing the binary object ID of the result.
 /// On error, returns ray_bytes_t with data=NULL.
+/// 关闭期间同样拒绝（返回 data=NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 ray_bytes_t ray_task_call_with_options(const char *func_name,
                                          const ray_bytes_t *args,
                                          size_t arg_count,
@@ -322,6 +388,7 @@ ray_bytes_t ray_task_call_with_options(const char *func_name,
 /// times out. A whitespace-only name such as `" "` is not trimmed and is submitted
 /// as it is; names such as `"rayrust_test"` and `"add"` reach the submission
 /// unchanged.
+/// 关闭期间同样拒绝（data=NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 ray_bytes_t ray_task_call_python(const char *module_name,
                                   const char *function_name,
                                   const ray_bytes_t *args,
@@ -369,6 +436,7 @@ ray_bytes_t ray_task_call_python(const char *module_name,
 /// Pass NULL or empty string for no options (all defaults).
 /// Returns a ray_bytes_t containing the binary object ID of the result.
 /// On error, returns ray_bytes_t with data=NULL.
+/// 关闭期间同样拒绝（返回 data=NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 ray_bytes_t ray_task_call_python_with_options(const char *module_name,
                                               const char *function_name,
                                               const ray_bytes_t *args,
@@ -457,6 +525,7 @@ ray_bytes_t ray_task_call_python_with_options(const char *module_name,
 /// and is submitted as it is, as `ray_get_actor` does; a non-empty
 /// name nobody registered keeps Ray's asynchronous semantics, because the driver has
 /// no way to learn which names are registered.
+/// 关闭期间同样拒绝（data=NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 ray_bytes_t ray_actor_create_with_options(const char *func_name,
                                             const ray_bytes_t *args,
                                             size_t arg_count,
@@ -504,6 +573,7 @@ ray_bytes_t ray_actor_create_with_options(const char *func_name,
 /// table (`local_mode_task_submitter.cc:143-152`), which `ray_get_actor` reads
 /// back (`:159-168`) to hand out a handle nothing can call:
 /// `ray_actor_call_python` rejects every Python actor call in local mode.
+/// 关闭期间同样拒绝（data=NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 ray_bytes_t ray_actor_create_python_with_options(const char *module_name,
                                                    const char *class_name,
                                                    const ray_bytes_t *args,
@@ -529,7 +599,14 @@ ray_bytes_t ray_actor_create_python_with_options(const char *module_name,
 ///   Rust side. A reference argument must be exactly 28 bytes, the same
 ///   requirement and the same rejection as ray_task_call_with_options. The same
 ///   owner requirement applies as well.
+/// `func_name` is the member function name. A null pointer is rejected with
+///   RAY_ERROR_KIND_GENERIC and `func_name is null`. The empty string is refused
+///   too: the single-argument `RemoteFunctionHolder` constructor throws
+///   `RayException` (`cpp/include/ray/api/ray_runtime.h:41-47`), recorded as
+///   RAY_ERROR_KIND_RAY. Both checks run before the runtime lookup and before the
+///   closing check.
 /// Returns a ray_bytes_t containing the binary object ID of the result.
+/// 关闭期间同样拒绝（返回 data=NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
                             const char *func_name,
                             const ray_bytes_t *args,
@@ -569,7 +646,7 @@ ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
 /// the one where the method exists. The C++ entry `ray_actor_call` refuses an
 /// empty name in the driver as well: its single-argument `RemoteFunctionHolder`
 /// constructor throws `Function not found. Please use RAY_REMOTE to register this
-/// function.` (`cpp/include/ray/api/ray_runtime.h:41-45`) before any task is
+/// function.` (`cpp/include/ray/api/ray_runtime.h:41-47`) before any task is
 /// submitted, so its actor keeps running. A name with an interior NUL byte reaches
 /// this entry as an empty C string as well (`crates/rayrust-sys/src/lib.rs:253-255`,
 /// #27). The null and empty checks run after the actor id width check and before the
@@ -597,6 +674,7 @@ ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
 /// the actor id and the method name, and `LocalModeTaskSubmitter::Submit` builds
 /// every task as a C++ descriptor (`local_mode_task_submitter.cc:39-55`), so local
 /// mode has nothing to run a Python actor method with either.
+/// 关闭期间同样拒绝（data=NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len,
                                     const char *method_name,
                                     const ray_bytes_t *args,
@@ -615,6 +693,7 @@ ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len
 /// mode never starts a core worker process. `LocalModeRayRuntime` does not
 /// override `KillActor`, and a local actor lives in the calling process
 /// (`LocalModeTaskSubmitter::actor_contexts_`), so there is nothing to kill.
+/// 关闭期间同样拒绝，类别是 `RAY_ERROR_KIND_RUNTIME`。
 void ray_actor_kill(const char *actor_id_data, size_t actor_id_len, bool no_restart);
 
 /// Serialize a registered actor handle.
@@ -635,6 +714,7 @@ void ray_actor_kill(const char *actor_id_data, size_t actor_id_len, bool no_rest
 /// `QuickExit()` (`_Exit(1)`, `src/ray/util/process.cc`) because local mode never
 /// starts a core worker process.
 /// Returns the serialized handle bytes, or data=NULL with last_error set.
+/// 关闭期间同样拒绝（返回 data=NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 ray_bytes_t ray_actor_handle_serialize(const char *actor_id_data, size_t actor_id_len);
 
 /// Register an actor handle from its serialized bytes and return its binary
@@ -732,6 +812,7 @@ ray_bytes_t ray_actor_handle_serialize(const char *actor_id_data, size_t actor_i
 /// creation descriptor type decides whether the Python entry may run at all —
 /// that path reads the descriptor as a `PythonFunctionDescriptor`
 /// (`cpp/src/ray/runtime/abstract_ray_runtime.cc:202-211`).
+/// 关闭期间同样拒绝（data=NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 ray_bytes_t ray_actor_handle_deserialize(const char *serialized_data,
                                          size_t serialized_len,
                                          ray_actor_handle_meta_t *out_meta);
@@ -743,6 +824,7 @@ ray_bytes_t ray_actor_handle_deserialize(const char *serialized_data,
 /// `bundles_json` is a JSON array of bundle objects.
 /// `strategy` is 0=PACK, 1=SPREAD, 2=STRICT_PACK, 3=STRICT_SPREAD.
 /// Returns a ray_bytes_t containing the group ID.
+/// 关闭期间同样拒绝（返回 data=NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 ray_bytes_t ray_placement_group_create(const char *name,
                                         const char *bundles_json,
                                         int strategy);
@@ -776,6 +858,7 @@ ray_bytes_t ray_placement_group_create(const char *name,
 /// The crate wraps this entry in `Ray::placement_group_remove`, which returns
 /// `Result<(), RayError>`: it checks the width a second time before the call and
 /// turns a -1 into an error carrying this message.
+/// 关闭期间同样拒绝（返回 -1），类别是 `RAY_ERROR_KIND_RUNTIME`。
 int ray_placement_group_remove(const char *group_id_data, size_t group_id_len);
 
 /// Wait for a placement group to be ready.
@@ -795,6 +878,7 @@ int ray_placement_group_remove(const char *group_id_data, size_t group_id_len);
 /// Local mode returns -1: `LocalModeTaskSubmitter` does not override the
 /// interface default `return true` (`cpp/src/ray/runtime/task/task_submitter.h:49-52`),
 /// so the SDK would answer "ready" without waiting for anything.
+/// 关闭期间同样拒绝（返回 -1），类别是 `RAY_ERROR_KIND_RUNTIME`。
 int ray_placement_group_wait_ready(const char *group_id_data, size_t group_id_len,
                                    int timeout_seconds);
 
@@ -826,6 +910,7 @@ int ray_placement_group_wait_ready(const char *group_id_data, size_t group_id_le
 /// All three return data=NULL with last_error set on error, and all three fail in
 /// local mode: `global_state_accessor_` is null there and these three read it
 /// directly (`cpp/src/ray/runtime/abstract_ray_runtime.cc:342-370`).
+/// 三个查询入口在关闭期间同样拒绝（data=NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 ray_bytes_t ray_placement_group_get_all(void);
 ray_bytes_t ray_placement_group_get_by_id(const char *group_id_data, size_t group_id_len);
 ray_bytes_t ray_placement_group_get_by_name(const char *name);
@@ -841,6 +926,7 @@ ray_bytes_t ray_placement_group_get_by_name(const char *name);
 /// In local mode this returns `false` without touching the core worker
 /// (`AbstractRayRuntime::WasCurrentActorRestarted` takes its SINGLE_PROCESS
 /// branch, `cpp/src/ray/runtime/abstract_ray_runtime.cc:288-291`).
+/// 关闭期间同样拒绝（返回 false 并写入错误），类别是 `RAY_ERROR_KIND_RUNTIME`。
 bool ray_was_current_actor_restarted(void);
 
 /// Returns true if this process is in local mode.
@@ -858,6 +944,7 @@ bool ray_is_local_mode(void);
 /// returns the namespace passed to `ray_init`, which is the empty string when
 /// none was passed. An empty string comes back as a non-null buffer of length 0,
 /// not as an error.
+/// 关闭期间同样拒绝（data=NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 ray_bytes_t ray_get_namespace(void);
 
 /// Get a named actor by name.
@@ -893,6 +980,7 @@ ray_bytes_t ray_get_namespace(void);
 /// task as a C++ descriptor and writing `CPP` as the task language
 /// (same file, `:52-56`).
 /// Returns a ray_bytes_t containing the binary actor ID, or data=NULL if not found.
+/// 关闭期间同样拒绝（返回 data=NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 ray_bytes_t ray_get_actor(const char *name, const char *ray_namespace,
                           ray_actor_handle_meta_t *out_meta);
 
@@ -908,6 +996,7 @@ ray_bytes_t ray_get_actor(const char *name, const char *ray_namespace,
 /// mode never starts a core worker process. Local mode has no cancellation path
 /// either: `LocalModeTaskSubmitter` keeps no handle to withdraw a task once it
 /// is submitted.
+/// 关闭期间同样拒绝（返回 -1），类别是 `RAY_ERROR_KIND_RUNTIME`。
 int ray_cancel(const char *id_data, size_t id_len, bool force_kill, bool recursive);
 
 /// Get multiple objects from the object store.
@@ -916,6 +1005,7 @@ int ray_cancel(const char *id_data, size_t id_len, bool force_kill, bool recursi
 /// Ray for the same reasons as ray_get. `count` is the number of IDs.
 /// `timeout_ms` is -1 for infinite wait.
 /// Returns a heap-allocated array of ray_bytes_t (one per input ID).
+/// 关闭期间同样拒绝（返回 NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 /// On error for a specific ID, that element will have data=NULL.
 /// Caller must free each element with ray_free_bytes, then free the array.
 ray_bytes_t *ray_get_many(const ray_bytes_t *ids, size_t count, int timeout_ms);
@@ -984,6 +1074,8 @@ typedef enum {
     RAY_ERROR_KIND_WORKER = 5,
     RAY_ERROR_KIND_UNRECONSTRUCTABLE = 6,
     RAY_ERROR_KIND_TIMEOUT = 7,
+    /// 运行时正在关闭：仅由关闭闸门给出，与 Ray 的异常层次无关。
+    RAY_ERROR_KIND_RUNTIME = 8,
 } ray_error_kind_t;
 
 /// Get the last error message (thread-local).
@@ -991,7 +1083,8 @@ typedef enum {
 /// ray_* call on the same thread.
 const char *ray_last_error(void);
 
-/// Get the class of the last error (thread-local), one of ray_error_kind_t.
+/// Get the class of the last error (thread-local), one of ray_error_kind_t
+/// （0..=8，含关闭闸门写入的 `RAY_ERROR_KIND_RUNTIME`）。
 /// Returns RAY_ERROR_KIND_NONE when ray_last_error() returns NULL.
 int ray_last_error_kind(void);
 
