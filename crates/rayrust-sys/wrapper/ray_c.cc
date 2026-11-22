@@ -65,6 +65,7 @@ static_assert(alignof(RayIntentionalSystemExitException) == alignof(RayException
 // ─── Thread-local error storage ─────────────────────────────────
 // Instead of fprintf(stderr), we store the error message in a thread-local
 // string so the Rust side can retrieve it via ray_last_error().
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -78,10 +79,18 @@ static_assert(alignof(RayIntentionalSystemExitException) == alignof(RayException
 static thread_local std::string g_last_error;
 static thread_local int g_last_error_kind = RAY_ERROR_KIND_NONE;
 
+static constexpr const char *kRuntimeClosingMessage =
+    "the Ray runtime is shutting down or has shut down: calls are refused until a new runtime is initialized";
+
+/// Store an error message and its class.
+static void set_last_error_kind(const char *msg, int kind) {
+    g_last_error = msg ? msg : "";
+    g_last_error_kind = kind;
+}
+
 /// Store an error message (called from catch blocks).
 static void set_last_error(const char *msg) {
-    g_last_error = msg ? msg : "";
-    g_last_error_kind = RAY_ERROR_KIND_GENERIC;
+    set_last_error_kind(msg, RAY_ERROR_KIND_GENERIC);
 }
 
 /// Classify a C++ exception by the Ray exception hierarchy.
@@ -100,8 +109,7 @@ static int ray_exception_kind(const std::exception &e) {
 
 /// Store an error message from a C++ exception, with its class.
 static void set_last_error_exception(const std::exception &e) {
-    g_last_error = e.what();
-    g_last_error_kind = ray_exception_kind(e);
+    set_last_error_kind(e.what(), ray_exception_kind(e));
 }
 
 // Macro to reduce boilerplate in catch blocks.
@@ -770,7 +778,7 @@ static std::string saved_init_namespace() {
     return init_namespace();
 }
 
-static void reopen_ref_count_gate(void);
+static void open_runtime_gate(void);
 
 namespace {
 
@@ -916,7 +924,7 @@ int ray_init(const char *address, int local_mode, const char *node_ip,
         // 运行时没有换，登记必须保留，否则在途任务不会被排空。
         const bool already_initialized = ray::IsInitialized();
         ray::Init(config, argc, const_cast<char**>(arg_ptrs.data()));
-        reopen_ref_count_gate();
+        open_runtime_gate();
         if (!already_initialized) {
             local_tasks().ids.clear();
             local_tasks().shutting_down = false;
@@ -932,21 +940,25 @@ bool ray_is_initialized(void) {
     return ray::IsInitialized();
 }
 
-/// 引用计数调用与 `ray_shutdown` 互斥。
+/// 运行时关闭闸门。
 ///
-/// `CoreWorkerProcess::Shutdown()` 先 `ShutdownDriver()` 把 `core_worker_` 置空，
-/// 再 `core_worker_process.reset()`（src/ray/core_worker/core_worker_process.cc:101-108、
-/// 952-956）；在这两步之间 `IsInitialized()` 仍为真，而 `GetCoreWorker()` 发现
-/// `core_worker_` 为空就走 `QuickExit()` 直接终止进程（同文件 964-981），Rust 侧
-/// 没有捕获机会。
+/// `CoreWorkerProcess::Shutdown()`（`src/ray/core_worker/core_worker_process.cc:101-108`）
+/// 先调 `ShutdownDriver()` 把 `core_worker_` 置空（同文件 `:945-957`），再执行
+/// `core_worker_process.reset()`；`RayRuntimeHolder::runtime_`
+/// （`cpp/include/ray/api/ray_runtime_holder.h:22-45`）在 `DoShutdown()`
+/// （`cpp/src/ray/runtime/abstract_ray_runtime.cc:72-77`）里不会被清空，
+/// `GetRayRuntime()` 在关闭开始与结束之后仍返回非空指针。关闭开始后访问 core worker
+/// 会在 `CoreWorkerProcessImpl::GetCoreWorker()`（`core_worker_process.cc:964-984`）或
+/// `CoreWorkerProcess::EnsureInitialized`（同文件 `:842-856`）里调用 `QuickExit()`
+/// （`_Exit(1)`，`src/ray/util/process.cc:845-848`）直接终止进程，Rust 侧没有捕获机会。
 ///
-/// 闸门用「在途计数 + 关闭标志」而不是读写锁：`std::shared_mutex` 在 glibc 上是
-/// 读者优先，读者在共享锁里等 Ray 自己的引用计数互斥锁，关闭线程会一直拿不到独占
-/// 锁。这里关闭一开始就拒绝新的引用计数调用，随后等已进入的调用退出，后者只有微秒
-/// 级，所以关闭一定能推进。
-///
-/// 只有引用计数这两个函数进闸门：`get`/`put`/`wait` 这类阻塞调用不能进，
-/// 否则关闭要等一个可能无限的 `Get`。
+/// 关闭标志 `runtime_closing()` 有两类读者：
+/// - 24 个取运行时的入口经 `runtime_for_call()` 读这个原子标志，命中时写入
+///   `RAY_ERROR_KIND_RUNTIME` 并立即拒绝，不等待也不计入在途计数（`get`/`put`/`wait`
+///   等阻塞调用不能让关闭等待，例如无期限的 `Get`）；
+/// - 两个引用计数入口在 `ref_count_gate_mutex()` 下读这个标志并计入 `ref_count_in_flight()`，
+///   关闭一开始拒绝新的引用计数调用，并等待已经进入的调用退出（微秒级），采用「在途计数 +
+///   关闭标志」可保证关闭线程不被持续涌入的读者饿住。
 namespace {
 
 std::mutex &ref_count_gate_mutex() {
@@ -964,8 +976,10 @@ int &ref_count_in_flight() {
     return in_flight;
 }
 
-bool &ref_count_closing() {
-    static bool closing = false;
+/// 关闭标志：`ray_shutdown` 一开始置位，`ray_init` 成功之后清掉。
+/// 每个取运行时的入口在碰运行时之前读一次，命中就拒。
+std::atomic<bool> &runtime_closing() {
+    static std::atomic<bool> closing{false};
     return closing;
 }
 
@@ -974,7 +988,7 @@ bool &ref_count_closing() {
 /// 进入一次引用计数调用。关闭已经开始时返回 false，调用方跳过计数。
 static bool enter_ref_count(void) {
     std::lock_guard<std::mutex> lock(ref_count_gate_mutex());
-    if (ref_count_closing()) return false;
+    if (runtime_closing()) return false;
     ++ref_count_in_flight();
     return true;
 }
@@ -985,21 +999,22 @@ static void leave_ref_count(void) {
     if (ref_count_in_flight() == 0) ref_count_gate_drained().notify_all();
 }
 
-/// 关闭之前调用：拒绝新的引用计数调用，等已经进入的那些退出。
-static void close_ref_count_gate(void) {
+/// `ray_shutdown` 一开始调用：置位关闭标志以拒绝所有取运行时的入口与新的引用计数
+/// 调用，并等待已经进入的引用计数调用退出。
+static void close_runtime_gate(void) {
     std::unique_lock<std::mutex> lock(ref_count_gate_mutex());
-    ref_count_closing() = true;
+    runtime_closing() = true;
     ref_count_gate_drained().wait(lock, [] { return ref_count_in_flight() == 0; });
 }
 
-/// `ray_init` 成功之后调用：重新打开闸门。
+/// `ray_init` 成功之后调用：清除关闭标志，重新放行所有取运行时的入口与引用计数调用。
 ///
 /// 只清关闭标志。在途计数不能在这里抹平：`ray_init` 与引用计数调用没有互斥，
-/// 清零之后那几次在途调用的 `leave` 会把计数减成负数，`close_ref_count_gate`
+/// 清零之后那几次在途调用的 `leave` 会把计数减成负数，`close_runtime_gate`
 /// 的谓词从此不成立，关闭永远等下去。不变量成立时它本来就是 0。
-static void reopen_ref_count_gate(void) {
+static void open_runtime_gate(void) {
     std::lock_guard<std::mutex> lock(ref_count_gate_mutex());
-    ref_count_closing() = false;
+    runtime_closing() = false;
 }
 
 /// 一次引用计数调用的在途凭证：析构时退出闸门，异常路径也不会漏掉。
@@ -1013,6 +1028,22 @@ struct RefCountTicket {
 
     bool entered;
 };
+
+/// 取这次调用要用的运行时。没有运行时、或运行时正在关闭时返回空，并写好
+/// ray_last_error()。关闭标志用 RAY_ERROR_KIND_RUNTIME 的类别，Rust 侧据此得到
+/// RayError::Runtime。
+static std::shared_ptr<ray::internal::RayRuntime> runtime_for_call() {
+    auto runtime = ray::internal::GetRayRuntime();
+    if (!runtime) {
+        set_last_error("Ray runtime is not initialized");
+        return nullptr;
+    }
+    if (runtime_closing()) {
+        set_last_error_kind(kRuntimeClosingMessage, RAY_ERROR_KIND_RUNTIME);
+        return nullptr;
+    }
+    return runtime;
+}
 
 namespace {
 
@@ -1062,6 +1093,10 @@ void ray_shutdown(void) {
         // 另一个线程已经在关闭：这一次直接返回，由那一次把运行时关掉。
         if (local_tasks().shutting_down) return;
         local_tasks().shutting_down = true;
+        // 关闭标志必须在本地任务排空之前置位：排空期间放进来的调用可能活过排空、
+        // 随后撞上 `ray::Shutdown()`。锁的次序固定为 `local_tasks().mutex` ->
+        // `ref_count_gate_mutex()`；`leave_ref_count` 只取后者，不会反过来取前者。
+        close_runtime_gate();
         pending.swap(local_tasks().ids);
         // 与快照同一把锁：排空的 id 一定属于这个运行时；这条引用也让它在排空期间活下来。
         runtime = ray::internal::GetRayRuntime();
@@ -1086,7 +1121,6 @@ void ray_shutdown(void) {
         // 关闭完成之前一直持锁：`ray_init` 也取这把锁，于是「初始化」与「关闭」互斥。
         std::lock_guard<std::mutex> lock(local_tasks().mutex);
         runtime.reset();
-        close_ref_count_gate();
         ray::Shutdown();
         local_tasks().shutting_down = false;
     }
@@ -1097,11 +1131,8 @@ void ray_shutdown(void) {
 ray_bytes_t ray_put(const char *data, size_t len) {
     ray_clear_error();
     try {
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return ray_bytes_t{nullptr, 0};
-        }
+        auto runtime = runtime_for_call();
+        if (!runtime) return ray_bytes_t{nullptr, 0};
 
         // The data from Rust is already msgpack-serialized (by rmp-serde).
         // Write it directly into the sbuffer without wrapping in pack_bin,
@@ -1123,11 +1154,8 @@ ray_bytes_t ray_get(const char *id_data, size_t id_len, int timeout_ms) {
     ray_clear_error();
     try {
         if (check_object_id(id_data, id_len) != 0) return ray_bytes_t{nullptr, 0};
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return ray_bytes_t{nullptr, 0};
-        }
+        auto runtime = runtime_for_call();
+        if (!runtime) return ray_bytes_t{nullptr, 0};
 
         std::string id(id_data, id_len);
         auto buffer = runtime->Get(id, timeout_ms);
@@ -1220,11 +1248,8 @@ bool *ray_wait(const ray_bytes_t *ids, size_t count, size_t num_objects, int tim
                 return nullptr;
             }
         }
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return nullptr;
-        }
+        auto runtime = runtime_for_call();
+        if (!runtime) return nullptr;
 
         std::vector<std::string> id_vec;
         id_vec.reserve(count);
@@ -1394,15 +1419,19 @@ ray_bytes_t ray_task_call_with_options(const char *func_name,
                                          const bool *is_ref,
                                          const char *options_json) {
     ray_clear_error();
+    if (!func_name) {
+        set_last_error("func_name is null");
+        return ray_bytes_t{nullptr, 0};
+    }
     try {
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return ray_bytes_t{nullptr, 0};
-        }
-
         std::string fn(func_name);
         ray::internal::RemoteFunctionHolder holder{std::move(fn)};
+        // 引用参数先在这里查一次（`build_task_args_cpp` 内部还会再查，幂等），让引用参数
+        // 错误优先于关闭错误，与 `ray_c.h` 的判定次序一致。
+        check_reference_arg_ids(args, arg_count, is_ref);
+
+        auto runtime = runtime_for_call();
+        if (!runtime) return ray_bytes_t{nullptr, 0};
 
         auto task_args = build_task_args_cpp(runtime.get(), args, arg_count, is_ref);
 
@@ -1456,11 +1485,11 @@ static ray_bytes_t submit_python_task(const char *module_name,
             set_last_error("function_name is null");
             return ray_bytes_t{nullptr, 0};
         }
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return ray_bytes_t{nullptr, 0};
-        }
+        // 引用参数先在这里查一次（`build_task_args_python` 内部还会再查，幂等），让引用
+        // 参数错误优先于关闭错误，与 `ray_c.h` 的判定次序一致。
+        check_reference_arg_ids(args, arg_count, is_ref);
+        auto runtime = runtime_for_call();
+        if (!runtime) return ray_bytes_t{nullptr, 0};
         if (runtime->IsLocalMode()) {
             // 本地 submitter 丢掉 module 与语言，只按函数名建 C++ descriptor
             // （cpp/src/ray/runtime/task/local_mode_task_submitter.cc:39-40），任务规格的
@@ -1585,11 +1614,8 @@ ray_bytes_t ray_actor_create_with_options(const char *func_name,
         return ray_bytes_t{nullptr, 0};
     }
     try {
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return ray_bytes_t{nullptr, 0};
-        }
+        auto runtime = runtime_for_call();
+        if (!runtime) return ray_bytes_t{nullptr, 0};
 
         ray::internal::RemoteFunctionHolder holder("", std::string(func_name),
                                                    std::string(func_name),
@@ -1670,11 +1696,8 @@ ray_bytes_t ray_actor_create_python_with_options(const char *module_name,
         return ray_bytes_t{nullptr, 0};
     }
     try {
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return ray_bytes_t{nullptr, 0};
-        }
+        auto runtime = runtime_for_call();
+        if (!runtime) return ray_bytes_t{nullptr, 0};
         if (runtime->IsLocalMode()) {
             // LocalModeTaskSubmitter::Submit 忽略语言与 module，只用函数名建 C++
             // descriptor（cpp/src/ray/runtime/task/local_mode_task_submitter.cc:39-40），
@@ -1723,9 +1746,8 @@ ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
     try {
         if (check_actor_id(actor_id_data, actor_id_len) != 0)
             return ray_bytes_t{nullptr, 0};
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
+        if (!func_name) {
+            set_last_error("func_name is null");
             return ray_bytes_t{nullptr, 0};
         }
 
@@ -1736,6 +1758,12 @@ ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
         // (e.g. "__rayrust_actor_factory_counter::increment").
         std::string fn(func_name);
         ray::internal::RemoteFunctionHolder holder(fn);
+        // 引用参数先在这里查一次（`build_task_args_cpp` 内部还会再查，幂等），让引用参数
+        // 错误优先于关闭错误，与 `ray_c.h` 的判定次序一致。
+        check_reference_arg_ids(args, arg_count, is_ref);
+
+        auto runtime = runtime_for_call();
+        if (!runtime) return ray_bytes_t{nullptr, 0};
 
         auto task_args = build_task_args_cpp(runtime.get(), args, arg_count, is_ref);
 
@@ -1799,11 +1827,11 @@ ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len
                 "the same traceback, so callers must pass a method name that exists.");
             return ray_bytes_t{nullptr, 0};
         }
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return ray_bytes_t{nullptr, 0};
-        }
+        // 引用参数先在这里查一次（`build_task_args_python` 内部还会再查，幂等），让引用
+        // 参数错误优先于关闭错误，与 `ray_c.h` 的判定次序一致。
+        check_reference_arg_ids(args, arg_count, is_ref);
+        auto runtime = runtime_for_call();
+        if (!runtime) return ray_bytes_t{nullptr, 0};
         if (runtime->IsLocalMode()) {
             // AbstractRayRuntime::CallActor 的 PYTHON 分支在构造调用之前读取 actor handle
             // 上的 PythonFunctionDescriptor，把其中记录的 module 与 class 写入
@@ -1846,28 +1874,27 @@ void ray_actor_kill(const char *actor_id_data, size_t actor_id_len, bool no_rest
         // 宽度检查排在本地模式分支之前，与 ray_cancel 的次序一致：本地模式 + 3 字节
         // actor id 报的是宽度错误。
         if (check_actor_id(actor_id_data, actor_id_len) != 0) return;
-        auto runtime = ray::internal::GetRayRuntime();
-        if (runtime) {
-            if (runtime->IsLocalMode()) {
-                // AbstractRayRuntime::KillActor 的第一句是
-                // CoreWorkerProcess::GetCoreWorker()
-                // （cpp/src/ray/runtime/abstract_ray_runtime.cc:265-266），本地模式从不
-                // 启动 core worker 进程，那里的 EnsureInitialized 走 QuickExit()，最终
-                // _Exit(1)（src/ray/core_worker/core_worker_process.cc:842-850、
-                // src/ray/util/process.cc:845-848），RAY_CATCH 抓不到 _Exit。
-                // LocalModeRayRuntime 没有覆盖 KillActor
-                // （cpp/src/ray/runtime/local_mode_ray_runtime.h:24-36），本地 actor 活在
-                // 本进程的 LocalModeTaskSubmitter::actor_contexts_ 里
-                // （cpp/src/ray/runtime/task/local_mode_task_submitter.h:53），随进程结束。
-                set_last_error(
-                    "actors cannot be killed in local mode: local mode never starts a "
-                    "core worker process, and a local actor lives in the calling process "
-                    "and ends with it");
-                return;
-            }
-            std::string actor_id(actor_id_data, actor_id_len);
-            runtime->KillActor(actor_id, no_restart);
+        auto runtime = runtime_for_call();
+        if (!runtime) return;
+        if (runtime->IsLocalMode()) {
+            // AbstractRayRuntime::KillActor 的第一句是
+            // CoreWorkerProcess::GetCoreWorker()
+            // （cpp/src/ray/runtime/abstract_ray_runtime.cc:265-266），本地模式从不
+            // 启动 core worker 进程，那里的 EnsureInitialized 走 QuickExit()，最终
+            // _Exit(1)（src/ray/core_worker/core_worker_process.cc:842-856、
+            // src/ray/util/process.cc:845-848），RAY_CATCH 抓不到 _Exit。
+            // LocalModeRayRuntime 没有覆盖 KillActor
+            // （cpp/src/ray/runtime/local_mode_ray_runtime.h:24-36），本地 actor 活在
+            // 本进程的 LocalModeTaskSubmitter::actor_contexts_ 里
+            // （cpp/src/ray/runtime/task/local_mode_task_submitter.h:53），随进程结束。
+            set_last_error(
+                "actors cannot be killed in local mode: local mode never starts a "
+                "core worker process, and a local actor lives in the calling process "
+                "and ends with it");
+            return;
         }
+        std::string actor_id(actor_id_data, actor_id_len);
+        runtime->KillActor(actor_id, no_restart);
     } catch (const std::exception &e) {
         set_last_error_exception(e);
     }
@@ -1877,11 +1904,8 @@ ray_bytes_t ray_actor_handle_serialize(const char *actor_id_data, size_t actor_i
     ray_clear_error();
     if (check_actor_id(actor_id_data, actor_id_len) != 0) return ray_bytes_t{nullptr, 0};
     try {
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return ray_bytes_t{nullptr, 0};
-        }
+        auto runtime = runtime_for_call();
+        if (!runtime) return ray_bytes_t{nullptr, 0};
         if (runtime->IsLocalMode()) {
             // AbstractRayRuntime::SerializeActorHandle 的第一句就是
             // CoreWorkerProcess::GetCoreWorker()，本地模式从不启动 core worker 进程，
@@ -2412,11 +2436,8 @@ ray_bytes_t ray_actor_handle_deserialize(const char *serialized_data,
         if (check_actor_handle_payload(serialized_data, serialized_len, &fields) != 0) {
             return ray_bytes_t{nullptr, 0};
         }
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return ray_bytes_t{nullptr, 0};
-        }
+        auto runtime = runtime_for_call();
+        if (!runtime) return ray_bytes_t{nullptr, 0};
         if (runtime->IsLocalMode()) {
             // 本地模式从不创建 core worker 进程：DeserializeAndRegisterActorHandle 走
             // CoreWorkerProcess::GetCoreWorker()，那里的 EnsureInitialized 直接
@@ -2478,11 +2499,8 @@ ray_bytes_t ray_placement_group_create(const char *name,
                                         int strategy) {
     ray_clear_error();
     try {
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return ray_bytes_t{nullptr, 0};
-        }
+        auto runtime = runtime_for_call();
+        if (!runtime) return ray_bytes_t{nullptr, 0};
 
         ray::PlacementGroupCreationOptions options;
         if (name) options.name = name;
@@ -2513,11 +2531,8 @@ int ray_placement_group_remove(const char *group_id_data, size_t group_id_len) {
     ray_clear_error();
     if (check_placement_group_id(group_id_data, group_id_len) != 0) return -1;
     try {
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return -1;
-        }
+        auto runtime = runtime_for_call();
+        if (!runtime) return -1;
         // 本地模式不拒绝这一个：`LocalModeTaskSubmitter::CreatePlacementGroup` 把组插进
         // 自己的 map（cpp/src/ray/runtime/task/local_mode_task_submitter.cc:170-180，id 是
         // `PlacementGroupID::Of(job_id)`，18 字节），`RemovePlacementGroup` 就从那个 map 里
@@ -2565,11 +2580,8 @@ int ray_placement_group_wait_ready(const char *group_id_data, size_t group_id_le
     ray_clear_error();
     if (check_placement_group_id(group_id_data, group_id_len) != 0) return -1;
     try {
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return -1;
-        }
+        auto runtime = runtime_for_call();
+        if (!runtime) return -1;
         if (runtime->IsLocalMode()) {
             // 接口默认实现是 `return true`（task_submitter.h:49-52），本地模式没有
             // 覆盖它，报「ready」等于对任何 id 都说就绪。
@@ -2589,11 +2601,8 @@ int ray_placement_group_wait_ready(const char *group_id_data, size_t group_id_le
 ray_bytes_t ray_placement_group_get_all(void) {
     ray_clear_error();
     try {
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return ray_bytes_t{nullptr, 0};
-        }
+        auto runtime = runtime_for_call();
+        if (!runtime) return ray_bytes_t{nullptr, 0};
         if (runtime->IsLocalMode()) {
             set_last_error(
                 "placement group queries are not supported in local mode: the GCS "
@@ -2612,11 +2621,8 @@ ray_bytes_t ray_placement_group_get_by_id(const char *group_id_data, size_t grou
         return ray_bytes_t{nullptr, 0};
     }
     try {
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return ray_bytes_t{nullptr, 0};
-        }
+        auto runtime = runtime_for_call();
+        if (!runtime) return ray_bytes_t{nullptr, 0};
         if (runtime->IsLocalMode()) {
             set_last_error(
                 "placement group queries are not supported in local mode: the GCS "
@@ -2642,11 +2648,8 @@ ray_bytes_t ray_placement_group_get_by_name(const char *name) {
         return ray_bytes_t{nullptr, 0};
     }
     try {
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return ray_bytes_t{nullptr, 0};
-        }
+        auto runtime = runtime_for_call();
+        if (!runtime) return ray_bytes_t{nullptr, 0};
         if (runtime->IsLocalMode()) {
             set_last_error(
                 "placement group queries are not supported in local mode: the GCS "
@@ -2668,11 +2671,8 @@ ray_bytes_t ray_placement_group_get_by_name(const char *name) {
 bool ray_was_current_actor_restarted(void) {
     ray_clear_error();
     try {
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return false;
-        }
+        auto runtime = runtime_for_call();
+        if (!runtime) return false;
         return runtime->WasCurrentActorRestarted();
     } catch (const std::exception &e) {
         set_last_error_exception(e);
@@ -2690,11 +2690,8 @@ bool ray_is_local_mode(void) {
 ray_bytes_t ray_get_namespace(void) {
     ray_clear_error();
     try {
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return ray_bytes_t{nullptr, 0};
-        }
+        auto runtime = runtime_for_call();
+        if (!runtime) return ray_bytes_t{nullptr, 0};
         if (runtime->IsLocalMode()) return dup_bytes(saved_init_namespace());
         return dup_bytes(runtime->GetNamespace());
     } catch (const std::exception &e) {
@@ -2741,11 +2738,8 @@ ray_bytes_t ray_get_actor(const char *name, const char *ray_namespace,
         return ray_bytes_t{nullptr, 0};
     }
     try {
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return ray_bytes_t{nullptr, 0};
-        }
+        auto runtime = runtime_for_call();
+        if (!runtime) return ray_bytes_t{nullptr, 0};
 
         // namespace 允许为空：`NativeTaskSubmitter::GetActor` 在 namespace 为空时用
         // job config 的 namespace 顶替（cpp/src/ray/runtime/task/native_task_submitter.cc:181-186），
@@ -2800,11 +2794,8 @@ int ray_cancel(const char *id_data, size_t id_len, bool force_kill, bool recursi
             return -1;
         }
 
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return -1;
-        }
+        auto runtime = runtime_for_call();
+        if (!runtime) return -1;
         if (runtime->IsLocalMode()) {
             // 这个入口不经过 task_submitter_：C++ SDK 没有 AbstractRayRuntime::CancelTask，
             // CancelTask 只存在于 core worker 上，所以下面直接向 CoreWorkerProcess 要。本地模式
@@ -2850,11 +2841,8 @@ ray_bytes_t *ray_get_many(const ray_bytes_t *ids, size_t count, int timeout_ms) 
         for (size_t i = 0; i < count; i++) {
             if (check_object_id(ids[i].data, ids[i].len) != 0) return nullptr;
         }
-        auto runtime = ray::internal::GetRayRuntime();
-        if (!runtime) {
-            set_last_error("Ray runtime is not initialized");
-            return nullptr;
-        }
+        auto runtime = runtime_for_call();
+        if (!runtime) return nullptr;
 
         std::vector<std::string> id_vec;
         id_vec.reserve(count);

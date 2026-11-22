@@ -27,6 +27,7 @@ fn error_from_kind(kind: ErrorKind, msg: String) -> RayError {
         ErrorKind::Worker => RayError::Worker(msg),
         ErrorKind::Unreconstructable => RayError::Unreconstructable(msg),
         ErrorKind::Timeout => RayError::Timeout(msg),
+        ErrorKind::Runtime => RayError::Runtime(msg),
     }
 }
 
@@ -247,23 +248,29 @@ impl Drop for RayInner {
         {
             let mut live = LIVE.lock().expect("live runtime registry poisoned");
             *live = None;
-            // 早一点唤醒：正在等旧运行时消失的 `connect` 会拿到「正在关闭」的错误，
-            // 而不是继续等一个可能正在等它自己的排空。
+            // 早一点唤醒：正在等旧运行时消失的 `connect` 立即拿到「正在关闭」的错误，
+            // 不再等待一个可能正在等它自己的排空。
             LIVE_CHANGED.notify_all();
         }
         // 关闭之前先撤掉活着的代次：从这一刻起这个运行时的引用全部过期。
-        // 代次守卫只负责提前跳过；引用计数调用与 C++ 侧关闭之间的互斥在 C 包装层
-        // （`crates/rayrust-sys/wrapper/ray_c.cc` 的引用计数闸门）：关闭开始时闸门
-        // 拒绝新的引用计数调用，并等已经进入的那些退出（微秒级），所以关闭一定能
-        // 推进。闸门只覆盖引用计数两个函数，`get`/`put`/`wait` 这些阻塞调用不在
-        // 其中（阻塞调用不能让关闭等）。
+        // C 包装层的关闭闸门（`crates/rayrust-sys/wrapper/ray_c.cc`）在 `ray_shutdown`
+        // 一开始置位关闭标志：所有取运行时的入口遇到关闭标志都直接拒绝并返回
+        // `RAY_ERROR_KIND_RUNTIME`，两个引用计数入口拒绝新调用并等待已进入的调用退出
+        // （微秒级），所以关闭一定能推进。已经进入 Ray SDK 的调用不由关闭等待：阻塞
+        // 调用可能没有期限（`Get` 的期限可以是 -1），另一个线程正在 `get`/`get_timeout`/
+        // `get_async` 时，关闭里的 `CoreWorker::Disconnect()`
+        // （`src/ray/core_worker/core_worker.cc:563-596`）先关掉与 raylet 的 IPC 连接，
+        // 在途调用析构 `ipc::ScopedResponse`（`src/ray/raylet_ipc_client/raylet_ipc_client_interface.h:67-72`）
+        // 时在 `:70` 对 `Broken pipe` 执行 `RAY_CHECK`，进程以退出码 1 终止；也可能
+        // 返回错误（如 `Get object error: IOError: Broken pipe`）。关闭开始之后的新调用
+        // 由代次（`check_epoch`）与关闭闸门挡成 `RayError::Runtime`。
         crate::object_ref::retract_live_epoch();
         // 登记表跟着运行时清空：旧运行时的 handle 在新运行时里查不到，几个调用入口
         // 会因此在进 SDK 之前把它们拒掉。
         actor_registry::clear();
-        // 本地模式下 `ray_shutdown` 会在关闭引用计数闸门与 `ray::Shutdown()` 之前
-        // 等待本次运行时提交的所有任务就绪。排空可能在等一个任务，而本地模式的任务体
-        // 在驱动进程里执行、任务体里可能调用 `Ray::local()`，所以这里不能持有 `LIVE`。
+        // 本地模式下 `ray_shutdown` 在置位关闭闸门之后、`ray::Shutdown()` 之前等待
+        // 本次运行时提交的所有任务就绪。排空可能在等一个任务，而本地模式的任务体在
+        // 驱动进程里执行、任务体里可能调用 `Ray::local()`，所以这里不能持有 `LIVE`。
         shutdown();
         // 关闭完成之后重新拿锁：只清掉已经失效的登记，别把之后建出来的运行时抹掉。
         let mut live = LIVE.lock().expect("live runtime registry poisoned");
@@ -3098,6 +3105,64 @@ mod tests {
             ),
             Err(other) => panic!("{} 返回了别的错误变体: {}", label, other),
             Ok(_) => panic!("{}：长度对不上却提交了", label),
+        }
+    }
+
+    #[test]
+    fn error_from_kind_maps_runtime_to_ray_error_runtime() {
+        assert_eq!(ErrorKind::from_raw(8), ErrorKind::Runtime);
+        let err = error_from_kind(ErrorKind::Runtime, "x".to_string());
+        assert!(
+            matches!(err, RayError::Runtime(ref msg) if msg == "x"),
+            "预期 RayError::Runtime(\"x\"), 实际得到 {:?}",
+            err
+        );
+    }
+
+    /// 引用参数 id 的宽度检查排在取运行时之前：没有运行时也报宽度那一条，对应四个入口
+    /// 统一的「引用参数 id 先于关闭检查」次序。去掉入口那一次检查时，这里拿到的是
+    /// `Ray runtime is not initialized`。
+    #[test]
+    fn python_task_entry_rejects_a_short_reference_arg_before_the_runtime_check() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let arg = [0u8; 8];
+        let args: [&[u8]; 1] = [&arg];
+        match task_call_python_json_inner("m", "f", &args, &[true], "") {
+            Err(RayError::Ffi(message)) => assert!(
+                message.contains("is passed by reference, so its id must be 28 bytes"),
+                "错误文本里没有引用参数那条: {}",
+                message
+            ),
+            other => panic!("8 字节引用参数返回了 {:?}", other),
+        }
+    }
+
+    /// 同一个次序在 Python actor 调用入口上：语言与创建描述符登记都通过之后，宽度
+    /// 错误应该先于「运行时没有初始化」报出来。
+    #[test]
+    fn python_actor_call_entry_rejects_a_short_reference_arg_before_the_runtime_check() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let python_actor = [0x27u8; 16];
+        actor_registry::record(
+            &python_actor,
+            ActorLanguage::Python,
+            actor_registry::CREATION_DESCRIPTOR_PYTHON,
+        );
+        let arg = [0u8; 8];
+        let args: [&[u8]; 1] = [&arg];
+        match actor_call_python_inner(&python_actor, "increment", &args, &[true]) {
+            Err(RayError::Ffi(message)) => assert!(
+                message.contains("is passed by reference, so its id must be 28 bytes"),
+                "错误文本里没有引用参数那条: {}",
+                message
+            ),
+            other => panic!("8 字节引用参数返回了 {:?}", other),
         }
     }
 

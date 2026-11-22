@@ -204,6 +204,15 @@ pub(crate) fn check_epoch(epoch: u64) -> Result<(), RayError> {
 /// `wait`/批量取会返回 `RayError::Runtime`，消息里带引用自己的代次与活着的
 /// 运行时的代次，不会把调用交给已经关闭的 C++ 运行时。关闭之后从 id 字节
 /// 重建的引用（`impl From<Vec<u8>>` 走 `from_id`）拿到代次 0，同样被拒。
+/// 调用已经开始、另一个线程随后 drop 最后一个句柄时，那次已经进入 Ray SDK 的调用
+/// 仍然会与关闭竞争，可能让进程以退出码 1 终止：关闭里的 `CoreWorker::Disconnect()`
+/// （`src/ray/core_worker/core_worker.cc:563-596`）先关掉与 raylet 的 IPC 连接，在途
+/// `Get` 析构 `ipc::ScopedResponse`（`src/ray/raylet_ipc_client/raylet_ipc_client_interface.h:67-72`）
+/// 时在 `:70` 对 `Broken pipe` 执行 `RAY_CHECK`。这条风险覆盖 `get`、`get_timeout`
+/// 与 `get_async`（`get_async` 在 `spawn_blocking` 里调同一个
+/// `runtime::get_raw_timeout`）；这次调用也可能以错误返回（实测到过
+/// `Get object error: IOError: Broken pipe`）。关闭开始之后的新调用由代次与关闭闸门
+/// 挡成 `RayError::Runtime`。
 ///
 /// 调用结果构造的引用同时持有 Ray 的一个本地引用：clone 时加一个，drop 时减一个。
 /// 集群模式（core worker 已初始化）下最后一个引用 drop 之后对象可能被释放，要按

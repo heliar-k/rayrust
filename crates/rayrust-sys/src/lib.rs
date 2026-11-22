@@ -209,6 +209,8 @@ pub enum ErrorKind {
     Worker = 5,
     Unreconstructable = 6,
     Timeout = 7,
+    /// 运行时正在关闭：`ray_shutdown` 已经开始或已经结束，等下一次 `ray_init`。
+    Runtime = 8,
 }
 
 impl ErrorKind {
@@ -224,6 +226,7 @@ impl ErrorKind {
             5 => ErrorKind::Worker,
             6 => ErrorKind::Unreconstructable,
             7 => ErrorKind::Timeout,
+            8 => ErrorKind::Runtime,
             _ => ErrorKind::Generic,
         }
     }
