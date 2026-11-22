@@ -9,11 +9,15 @@
 //! 6. Compute-intensive: sum(0..1M) × 10 (Rust vs Python)
 //! 7. Complex type serialization overhead
 //!
-//! Run on mint-dev:
-//!   PYTHONPATH=/tmp LD_LIBRARY_PATH=/tmp \
-//!   RAY_ADDRESS=192.168.42.141:6379 RAY_NODE_IP=192.168.42.106 \
-//!   RAY_WORKER_SO=/tmp/librayrust_worker.so \
-//!   /tmp/raybench
+//! Build and run from the repository root:
+//!   cargo build --release --all-targets
+//!   LD_LIBRARY_PATH=/path/to/ray/cpp/lib \
+//!   RAY_ADDRESS=127.0.0.1:6379 RAY_NODE_IP=127.0.0.1 \
+//!   cargo run --release --example raybench
+//!
+//! Optional: set `RAY_WORKER_SO` to override the default
+//! `target/release/librayrust_worker.so` path. `PYTHONPATH` for `rayrust_test`
+//! (`tests/python`) is passed automatically via `runtime_env`.
 
 use rayrust::prelude::*;
 use std::time::{Duration, Instant};
@@ -35,6 +39,15 @@ fn compute(n: i64) -> i64 {
     (0..n).sum()
 }
 
+/// Worker-side directory of `rayrust_test`, passed through `runtime_env`.
+fn python_module_dir() -> String {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/python");
+    let path = std::fs::canonicalize(dir).expect("canonicalize the Python test module directory");
+    path.to_str()
+        .expect("the Python module path is valid UTF-8")
+        .to_string()
+}
+
 #[tokio::main]
 async fn main() {
     let address = std::env::var("RAY_ADDRESS")
@@ -42,15 +55,42 @@ async fn main() {
     let node_ip = std::env::var("RAY_NODE_IP")
         .unwrap_or_else(|_| "192.168.42.106".to_string());
     let worker_so = std::env::var("RAY_WORKER_SO")
-        .unwrap_or_else(|_| "/tmp/librayrust_worker.so".to_string());
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../target/release/librayrust_worker.so"
+            )
+            .to_string()
+        });
+    if !std::path::Path::new(&worker_so).exists() {
+        eprintln!(
+            "ERROR: worker library not found at {}. Build it first:",
+            worker_so
+        );
+        eprintln!("  cargo build --release --all-targets");
+        std::process::exit(1);
+    }
+    let worker_so = std::fs::canonicalize(&worker_so)
+        .expect("canonicalize worker library path")
+        .to_str()
+        .expect("worker library path is valid UTF-8")
+        .to_string();
 
     println!("╔══════════════════════════════════════════════════════════╗");
     println!("║         Rayrust Benchmark: Rust vs Python                ║");
     println!("╚══════════════════════════════════════════════════════════╝\n");
 
+    let python_dir = python_module_dir();
+    let runtime_env = format!(
+        "{{\"env_vars\": {{\"PYTHONPATH\": \"{}\"}}}}",
+        python_dir
+    );
     let config = RayConfig::new(&address)
         .node_ip(&node_ip)
-        .code_search_path(vec![worker_so.clone()]);
+        .code_search_path(vec![worker_so.clone()])
+        .runtime_env(runtime_env);
     let ray = Ray::connect(&config).expect("init failed");
     println!("✓ Ray initialized\n");
 

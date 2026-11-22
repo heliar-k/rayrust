@@ -360,7 +360,7 @@ Rust vs Python on Ray cluster (500 tasks):
 
 ### Multi-node C++ Actor Support
 
-Rust actors use the Ray C++ SDK's worker process (`default_worker`). Every node that may run C++ actors **must** have `ray[cpp]` installed:
+Rust actors and `#[remote]` tasks use the Ray C++ SDK's worker process (`default_worker`). Every node that may run them **must** have `ray[cpp]` installed, and the Rust worker library (`.so`) must exist at the same `code_search_path` path on that node:
 
 ```bash
 # On ALL worker nodes (not just the driver node):
@@ -371,7 +371,10 @@ If a node only has `pip install ray` (Python only, no `[cpp]` extra), it lacks:
 - `ray/cpp/default_worker` — the C++ worker binary that Ray's raylet launches
 - `ray/cpp/lib/libray_api.so` — the C++ SDK shared library
 
-C++ actors scheduled to such nodes will crash immediately (`never_started: true`, `NODE_DIED`).
+C++ actors scheduled to such nodes will crash immediately (`never_started: true`, `NODE_DIED`). Without `default_worker`, `ray start` passes an empty `--cpp_worker_command=` to the raylet, which then holds no C++ worker state, so the first C++ request aborts that node's raylet with `Check failed: state != states_by_lang_.end() Required Language isn't supported: CPP` (`src/ray/raylet/worker_pool.cc:1623`):
+
+- **Driver's node**: `Ray::connect` registers the driver as a C++ worker, the local raylet aborts in `WorkerPool::RegisterDriver`, and the driver exits with code 1 after `Failed to register worker to Raylet: IOError: Failed to read data from the socket: End of file`.
+- **Worker node**: the `#[remote]` task is submitted and its lease reaches that node, whose raylet aborts in `WorkerPool::PrestartWorkers`; GCS marks the node `UNEXPECTED_TERMINATION` (`health check failed due to missing too many heartbeats`), the driver logs `Retrying attempt to schedule lease ... Disconnected: GRPC client is shut down`, and `get()` waits for a node that has CPUs and the C++ worker.
 
 **Symptom**: `actor_create()` succeeds (returns an actor ID), but `actor_call()` hangs until timeout. Driver log shows `NODE_DIED` / `health check failed due to missing too many heartbeats`.
 
@@ -390,7 +393,7 @@ ray start --head --port=6380  # on the node with ray[cpp] installed
 | Feature | Needs `ray[cpp]` on worker nodes? | Why |
 |---|---|---|
 | `put` / `get` / `wait` | No | Runs in driver process |
-| `#[remote]` task | No | Executes in driver's local worker |
+| `#[remote]` task | **Yes** | The raylet starts `default_worker` on the node that runs the task; the Rust worker library must also be reachable at the `code_search_path` path there |
 | `#[actor]` (cluster mode) | **Yes** | Ray launches `default_worker` on a worker node |
 | `#[actor]` (local mode) | No | Everything runs in-process |
 | Python task/actor (xlang) | No | Uses Python workers (available everywhere) |

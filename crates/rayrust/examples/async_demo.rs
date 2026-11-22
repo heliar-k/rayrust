@@ -80,6 +80,12 @@ async fn main() {
 
     let mut sum = 0i32;
     for (i, val) in results.iter().enumerate() {
+        assert_eq!(
+            *val,
+            i as i32 * 3,
+            "task[{}] printed a value that belongs to another submission",
+            i
+        );
         sum += val;
         if i < 3 || i >= results.len() - 1 {
             println!("  task[{}] add({}, {}) = {}", i, i, i * 2, val);
@@ -101,12 +107,13 @@ where
     T: Send + 'static,
 {
     let mut set = tokio::task::JoinSet::new();
-    for f in futs {
-        set.spawn(f);
+    for (idx, f) in futs.into_iter().enumerate() {
+        set.spawn(async move { (idx, f.await) });
     }
-    let mut results = Vec::with_capacity(set.len());
+    let mut indexed = Vec::with_capacity(set.len());
     while let Some(res) = set.join_next().await {
-        results.push(res.unwrap());
+        indexed.push(res.unwrap());
     }
-    results
+    indexed.sort_by_key(|(idx, _)| *idx);
+    indexed.into_iter().map(|(_, val)| val).collect()
 }

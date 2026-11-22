@@ -268,12 +268,6 @@ void ray_register_function(const char *func_name, ray_func_callback_t callback) 
     map.emplace(name, [name](const ray::internal::ArgsBufferList &args) -> msgpack::sbuffer {
         return invoke_rust_function(name, args);
     });
-
-    FILE *dbg = fopen("/tmp/rayrust_debug.log", "a");
-    if (dbg) {
-        fprintf(dbg, "[rayrust] register_fn: '%s' map_size=%zu\n", name.c_str(), map.size());
-        fclose(dbg);
-    }
 }
 
 // ─── Actor Member Function Registration ───────────────────────
@@ -345,14 +339,12 @@ void ray_register_member_function(const char *func_name, ray_member_callback_t c
 
     // Verify registration
     auto *verify = fm.GetMemberFunction(name);
-    FILE *dbg = fopen("/tmp/rayrust_debug.log", "a");
-    if (dbg) {
-        fprintf(dbg, "[rayrust] register_member_fn: '%s' %s verify=%s map_size=%zu\n",
-                name.c_str(),
-                inserted ? "inserted" : "overwritten",
-                verify ? "OK" : "FAIL",
-                mem_map.size());
-        fclose(dbg);
+    if (!verify) {
+        std::fprintf(stderr,
+                     "[rayrust] register_member_fn: GetMemberFunction('%s') returned null (%s, map_size=%zu)\n",
+                     name.c_str(),
+                     inserted ? "inserted" : "overwritten",
+                     mem_map.size());
     }
 }
 

@@ -8,6 +8,15 @@
 use rayrust::prelude::*;
 use std::collections::HashMap;
 
+/// Worker-side directory of `rayrust_test`, passed through `runtime_env`.
+fn python_module_dir() -> String {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/python");
+    let path = std::fs::canonicalize(dir).expect("canonicalize the Python test module directory");
+    path.to_str()
+        .expect("the Python module path is valid UTF-8")
+        .to_string()
+}
+
 /// Helper: look up a key in an rmpv::Value map.
 fn vget<'a>(val: &'a rmpv::Value, key: &str) -> Option<&'a rmpv::Value> {
     let map = val.as_map()?;
@@ -54,7 +63,12 @@ async fn main() {
     if address.is_empty() || address == "local" {
         // Local mode: rely on PYTHONPATH env var inherited by subprocess
     } else {
-        config = config.runtime_env(r#"{"env_vars": {"PYTHONPATH": "/tmp"}}"#);
+        let python_dir = python_module_dir();
+        let runtime_env = format!(
+            "{{\"env_vars\": {{\"PYTHONPATH\": \"{}\"}}}}",
+            python_dir
+        );
+        config = config.runtime_env(runtime_env);
     }
     let ray = Ray::connect(&config).expect("init failed");
     println!("✓ Ray initialized\n");
@@ -158,7 +172,9 @@ async fn main() {
             assert_eq!(arr[1].as_str().unwrap(), "hello");  // str
             assert!(arr[2].as_bool().unwrap());    // bool
             assert!(arr[3].is_nil());                        // None
-            assert!((arr[4].as_f64().unwrap() - 3.15).abs() < 1e-9); // float
+            #[allow(clippy::approx_constant)]
+            let expected_float = 3.14;
+            assert!((arr[4].as_f64().unwrap() - expected_float).abs() < 1e-9); // float
             println!("return_mixed() = [42, \"hello\", true, None, 3.14] ✓");
         }
         Err(e) => println!("return_mixed failed: {}", e),

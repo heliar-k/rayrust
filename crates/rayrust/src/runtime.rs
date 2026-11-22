@@ -146,6 +146,9 @@ impl RayConfig {
     }
 
     /// Set the code search path (directories or .so files for the worker).
+    ///
+    /// 该路径随任务与 Actor 提交给 Ray，worker 进程由执行该任务的节点上的 raylet 启动，
+    /// 因此库文件必须在该节点的相同路径下存在。
     pub fn code_search_path(mut self, paths: Vec<String>) -> Self {
         self.code_search_path = paths;
         self
@@ -1358,9 +1361,7 @@ pub(crate) fn init_with_config(config: &RayConfig) -> Result<(), RayError> {
 
     crate::object_ref::publish_live_epoch();
 
-    // Warn if C++ SDK (default_worker) is not installed on this node.
-    // This is needed for cluster-mode Rust actors — raylet launches default_worker
-    // on worker nodes, and if it's missing, actors will silently die (NODE_DIED).
+    // 本机候选 SDK 目录下找不到 `default_worker` 时打印警告。
     if !config.local_mode {
         check_cpp_sdk();
     }
@@ -1368,31 +1369,48 @@ pub(crate) fn init_with_config(config: &RayConfig) -> Result<(), RayError> {
     Ok(())
 }
 
-/// Check if the Ray C++ SDK is properly installed on this node.
-/// Prints a warning if `default_worker` is missing — this node cannot run C++ actors.
+/// 检查本机候选 Ray C++ SDK 目录下是否存在 `default_worker`。
+/// 找到或无法确定候选目录时静默返回；候选目录存在却缺少 `default_worker` 时打印一次警告。
 fn check_cpp_sdk() {
-    let ray_path = std::process::Command::new("python3")
-        .args(["-c", "import ray, os; print(os.path.dirname(ray.__file__))"])
-        .output()
+    let candidates: Vec<std::path::PathBuf> = match std::env::var("RAY_CPP_DIR")
         .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string());
+        .filter(|s| !s.is_empty())
+    {
+        Some(dir) => vec![std::path::PathBuf::from(dir)],
+        None => std::process::Command::new("python3")
+            .args(["-c", "import ray, os; print(os.path.dirname(ray.__file__))"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|ray_dir| vec![std::path::PathBuf::from(ray_dir).join("cpp")])
+            .unwrap_or_default(),
+    };
 
-    if let Some(ray_dir) = ray_path {
-        let default_worker = std::path::Path::new(&ray_dir)
-            .join("cpp")
-            .join("default_worker");
-        if !default_worker.exists() {
-            eprintln!("\n⚠️  WARNING: Ray C++ SDK not found on this node (missing {}).", default_worker.display());
-            eprintln!("   Rust actors require 'pip install ray[cpp]' on ALL worker nodes.");
-            eprintln!("   Without it, actor_create() succeeds but actor_call() hangs (NODE_DIED).");
-            eprintln!("   Use local mode (RayConfig::local()) if C++ SDK is unavailable.\n");
-        } else {
-            // SDK exists on driver node — remind user to check worker nodes too
-            eprintln!("ℹ️  Note: Rust actors in cluster mode require 'pip install ray[cpp]' on ALL worker nodes,");
-            eprintln!("   not just this node. If actor_call() hangs, check that worker nodes have the C++ SDK.");
-        }
+    if candidates.is_empty() {
+        return;
     }
+
+    if candidates
+        .iter()
+        .any(|dir| dir.join("default_worker").exists())
+    {
+        return;
+    }
+
+    let checked: Vec<String> = candidates
+        .iter()
+        .map(|dir| dir.join("default_worker").display().to_string())
+        .collect();
+    eprintln!(
+        "WARNING: Ray C++ SDK worker binary not found on this node (checked: {}).",
+        checked.join(", ")
+    );
+    eprintln!("  Install it on this node with 'pip install ray[cpp]'.");
+    eprintln!("  Without default_worker, actor_create() succeeds but actor_call() hangs (NODE_DIED).");
+    eprintln!("  Use local mode (RayConfig::local()) to run without ray[cpp].");
 }
 
 /// Check if Ray is initialized.
