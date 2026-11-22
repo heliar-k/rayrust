@@ -335,7 +335,7 @@ Rust vs Python 在 Ray 集群上（500 个任务）：
 
 ### 多节点 C++ Actor 支持
 
-Rust Actor 使用 Ray C++ SDK 的 worker 进程（`default_worker`）。每个可能运行 C++ Actor 的节点**必须**安装 `ray[cpp]`：
+Rust Actor 与 `#[remote]` 任务都使用 Ray C++ SDK 的 worker 进程（`default_worker`）。每个可能运行它们的节点**必须**安装 `ray[cpp]`，并且该节点的相同 `code_search_path` 路径下必须存在对应的 Rust worker 动态库（`.so`）：
 
 ```bash
 # 在所有 worker 节点上（不仅仅是 driver 节点）：
@@ -346,7 +346,10 @@ pip install "ray[cpp]==2.51.1"
 - `ray/cpp/default_worker` — Ray raylet 启动的 C++ worker 二进制
 - `ray/cpp/lib/libray_api.so` — C++ SDK 共享库
 
-C++ Actor 被调度到此类节点会立即崩溃（`never_started: true`，`NODE_DIED`）。
+C++ Actor 被调度到此类节点会立即崩溃（`never_started: true`，`NODE_DIED`）。缺少 `default_worker` 时，`ray start` 传给 raylet 的 `--cpp_worker_command=` 为空，该 raylet 因此没有任何 C++ worker 状态，第一个 C++ 请求就会以 `Check failed: state != states_by_lang_.end() Required Language isn't supported: CPP`（`src/ray/raylet/worker_pool.cc:1623`）终止该节点的 raylet 进程：
+
+- **driver 所在的节点**：`Ray::connect` 把 driver 作为 C++ worker 注册，本机 raylet 在 `WorkerPool::RegisterDriver` 中终止，driver 在打印 `Failed to register worker to Raylet: IOError: Failed to read data from the socket: End of file` 后以退出码 1 结束。
+- **执行任务的 worker 节点**：`#[remote]` 任务提交成功，租约到达该节点后其 raylet 在 `WorkerPool::PrestartWorkers` 中终止；GCS 因心跳超时把该节点记为 `UNEXPECTED_TERMINATION`（`health check failed due to missing too many heartbeats`），driver 日志出现 `Retrying attempt to schedule lease ... Disconnected: GRPC client is shut down`，`get()` 持续等待具备 CPU 与 C++ worker 的节点。
 
 **症状**：`actor_create()` 成功（返回 actor ID），但 `actor_call()` 超时挂起。Driver 日志显示 `NODE_DIED`。
 
@@ -365,7 +368,7 @@ ray start --head --port=6380  # 在安装了 ray[cpp] 的节点上
 | 功能 | 需要 worker 节点安装 `ray[cpp]`？ | 原因 |
 |---|---|---|
 | `put` / `get` / `wait` | 否 | 在 driver 进程内执行 |
-| `#[remote]` task | 否 | 在 driver 的 local worker 执行 |
+| `#[remote]` task | **是** | 执行任务的节点由 raylet 启动 `default_worker`，且该节点的相同 `code_search_path` 路径下必须能访问 Rust worker 动态库 |
 | `#[actor]`（集群模式） | **是** | Ray 在 worker 节点启动 `default_worker` |
 | `#[actor]`（本地模式） | 否 | 全部在进程内 |
 | Python task/actor（xlang） | 否 | 使用 Python worker（所有节点可用） |

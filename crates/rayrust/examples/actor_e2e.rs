@@ -49,7 +49,29 @@ impl Counter {
 async fn main() {
     let address = std::env::var("RAY_ADDRESS").unwrap_or_else(|_| "192.168.42.141:6379".to_string());
     let node_ip = std::env::var("RAY_NODE_IP").unwrap_or_else(|_| "192.168.42.106".to_string());
-    let worker_so = std::env::var("RAY_WORKER_SO").unwrap_or_else(|_| "/tmp/librayrust_worker.so".to_string());
+    let worker_so = std::env::var("RAY_WORKER_SO")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../target/release/librayrust_worker.so"
+            )
+            .to_string()
+        });
+    if !std::path::Path::new(&worker_so).exists() {
+        eprintln!(
+            "ERROR: worker library not found at {}. Build it first:",
+            worker_so
+        );
+        eprintln!("  cargo build --release --all-targets");
+        std::process::exit(1);
+    }
+    let worker_so = std::fs::canonicalize(&worker_so)
+        .expect("canonicalize worker library path")
+        .to_str()
+        .expect("worker library path is valid UTF-8")
+        .to_string();
 
     println!("=== Rust Actor E2E Test (macro-generated callers) ===\n");
 
