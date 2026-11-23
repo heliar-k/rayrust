@@ -44,7 +44,7 @@ cd rayrust
 cargo build --release -p rayrust-example-worker
 ```
 
-首次构建会从 PyPI 下载 Ray wheel（约 71MB），提取 C++ SDK 到 `~/.cache/rayrust/`。后续构建复用缓存。
+首次构建会从 PyPI 下载 `ray-cpp` wheel，提取 C++ SDK 到 `~/.cache/rayrust/`。后续构建复用缓存。
 
 **可选：** 使用已安装的 Ray C++ SDK（如 `pip install ray[cpp]`）：
 
@@ -64,10 +64,11 @@ cargo run --example hello_ray
 export RAY_ADDRESS='<head节点IP>:6379'
 export RAY_NODE_IP='<本机IP>'
 export RAY_WORKER_SO="$(pwd)/target/release/librayrust_worker.so"
-export LD_LIBRARY_PATH="$HOME/.cache/rayrust/ray-cpp-2.51.1/lib:$LD_LIBRARY_PATH"
 
 cargo run --example full_test
 ```
+
+在 Linux 上，构建过程会把 SDK 的 `lib` 目录写进本仓库构建出的二进制、测试与 worker `.so` 的 RPATH，`cargo test` 与 `cargo run --example ...` 可直接使用；`LD_LIBRARY_PATH` 仅在构建完成后移动了 SDK 目录时才需要。把自己的 crate 依赖 `rayrust` 时不会继承这些条目：需要在自身构建配置里加链接参数，或在运行它的时候设置 `LD_LIBRARY_PATH`。
 
 ## 使用方式
 
@@ -253,13 +254,16 @@ libray_api.so（Ray C++ SDK）  ->  Ray Core (raylet / GCS / object store)
 
 ## 构建系统
 
-`rayrust-sys` 的 `build.rs` 处理 SDK 获取：
+各包的 `build.rs` 共用 `rayrust-build` 获取 Ray C++ SDK：
 
-1. **`RAY_CPP_DIR` 环境变量** — 使用已安装的 SDK
-2. **`~/.cache/rayrust/ray-cpp-{version}/`** — 共享缓存（debug + release）
-3. **从 PyPI 自动下载** — 下载 wheel，提取 `ray/cpp/`
+1. **`RAY_CPP_DIR` 环境变量** — 使用指定的 SDK 目录，按给定值使用，不做版本比对
+2. **`~/.cache/rayrust/ray-cpp-{version}-{platform}/`**（或 `$RAYRUST_CACHE_DIR/ray-cpp-{version}-{platform}/`）— 共享缓存（debug + release）
+3. **`python3`（`ray[cpp]`）** — 在 `sys.path` 中查找已安装的 `ray/cpp/`，要求其 `ray` 版本与 `RAY_VERSION` 一致
+4. **从 PyPI 自动下载** — 下载 `ray-cpp` wheel，提取 `ray/cpp/`
 
-通过 `RAY_VERSION=2.51.1` 覆盖 Ray 版本。
+`RAY_VERSION`（默认 `2.51.1`）决定第 2 步的缓存目录名、第 3 步的版本匹配与第 4 步下载的 wheel；第 1 步直接使用 `RAY_CPP_DIR` 给出的目录，不比对版本。
+
+`RAY_CPP_DIR` 与 `RAYRUST_CACHE_DIR` 中的相对路径按执行 `cargo` 的目录（`PWD`；`PWD` 未设时按工作区根）解释；`~` 不做展开，需要家用目录时写 `$HOME`。
 
 ## 关键设计决策
 

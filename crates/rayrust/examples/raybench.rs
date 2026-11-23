@@ -11,7 +11,6 @@
 //!
 //! Build and run from the repository root:
 //!   cargo build --release --all-targets
-//!   LD_LIBRARY_PATH=/path/to/ray/cpp/lib \
 //!   RAY_ADDRESS=127.0.0.1:6379 RAY_NODE_IP=127.0.0.1 \
 //!   cargo run --release --example raybench
 //!

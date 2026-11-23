@@ -46,7 +46,7 @@ cd rayrust
 cargo build --release -p rayrust-example-worker
 ```
 
-The first build will download the Ray wheel (~71MB) from PyPI and extract the C++ SDK to `~/.cache/rayrust/`. Subsequent builds reuse the cache.
+The first build downloads the `ray-cpp` wheel from PyPI and extracts the C++ SDK to `~/.cache/rayrust/`. Subsequent builds reuse the cache.
 
 **Optional:** To use a pre-installed Ray C++ SDK (e.g. from `pip install ray[cpp]`):
 
@@ -66,10 +66,11 @@ cargo run --example hello_ray
 export RAY_ADDRESS='<head-node-ip>:6379'
 export RAY_NODE_IP='<this-node-ip>'
 export RAY_WORKER_SO="$(pwd)/target/release/librayrust_worker.so"
-export LD_LIBRARY_PATH="$HOME/.cache/rayrust/ray-cpp-2.51.1/lib:$LD_LIBRARY_PATH"
 
 cargo run --example full_test
 ```
+
+On Linux, the build embeds the SDK's `lib` directory into the RPATH of binaries, tests and the worker `.so` built from this repository, so `cargo test` and `cargo run --example ...` work directly; `LD_LIBRARY_PATH` is only needed if the SDK is moved after building. A crate of your own that depends on `rayrust` does not inherit those entries: add the link arguments to its own build configuration, or set `LD_LIBRARY_PATH` when running it.
 
 ## Usage
 
@@ -276,13 +277,16 @@ libray_api.so (Ray C++ SDK)  ->  Ray Core (raylet / GCS / object store)
 
 ## Build System
 
-The `build.rs` in `rayrust-sys` handles SDK acquisition:
+Build scripts share `rayrust-build` to acquire the Ray C++ SDK:
 
-1. **`RAY_CPP_DIR` env var** — use a pre-installed SDK
-2. **`~/.cache/rayrust/ray-cpp-{version}/`** — shared cache (debug + release)
-3. **Auto-download from PyPI** — downloads wheel, extracts `ray/cpp/`
+1. **`RAY_CPP_DIR` env var** — use a specified SDK directory, used as given with no version comparison
+2. **`~/.cache/rayrust/ray-cpp-{version}-{platform}/`** (or `$RAYRUST_CACHE_DIR/ray-cpp-{version}-{platform}/`) — shared cache (debug + release)
+3. **`python3` (`ray[cpp]`)** — probe `sys.path` for an installed `ray/cpp/` whose `ray` version matches `RAY_VERSION`
+4. **Auto-download from PyPI** — downloads `ray-cpp` wheel, extracts `ray/cpp/`
 
-Override the Ray version with `RAY_VERSION=2.51.1`.
+`RAY_VERSION` (default `2.51.1`) names the cache directory in step 2, the version matched in step 3 and the wheel downloaded in step 4; step 1 takes `RAY_CPP_DIR` as given and does not compare versions.
+
+Relative values in `RAY_CPP_DIR` and `RAYRUST_CACHE_DIR` are resolved against the directory `cargo` runs in (`PWD`, or the workspace root when `PWD` is unset); `~` is not expanded, so write `$HOME` instead.
 
 ## Key Design Decisions
 

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/rayrust-build",
     "crates/rayrust-sys",
     "crates/rayrust-macros",
     "crates/rayrust",
