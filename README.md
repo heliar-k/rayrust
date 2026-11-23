@@ -38,17 +38,17 @@ rayrust wraps the Ray C++ SDK (`libray_api.so`) via a C ABI layer, providing idi
 
 ### Prerequisites
 
-**No Python installation required.** The build system automatically downloads the Ray C++ SDK from PyPI:
+Provide the Ray C++ SDK through an installed `ray[cpp]` package, `RAY_CPP_DIR`, or an opt-in download from PyPI (`RAYRUST_DOWNLOAD=1`):
 
 ```bash
 git clone https://github.com/NolanHo/rayrust.git
 cd rayrust
-cargo build --release -p rayrust-example-worker
+RAYRUST_DOWNLOAD=1 cargo build --release -p rayrust-example-worker
 ```
 
-The first build downloads the `ray-cpp` wheel from PyPI and extracts the C++ SDK to `~/.cache/rayrust/`. Subsequent builds reuse the cache.
+With `RAYRUST_DOWNLOAD=1`, the first build downloads the `ray-cpp` wheel from PyPI, verifies its SHA-256 digest, and extracts the C++ SDK to `~/.cache/rayrust/`. Subsequent builds reuse the cache without setting `RAYRUST_DOWNLOAD=1`.
 
-**Optional:** To use a pre-installed Ray C++ SDK (e.g. from `pip install ray[cpp]`):
+To use a pre-installed Ray C++ SDK (e.g. from `pip install ray[cpp]`):
 
 ```bash
 export RAY_CPP_DIR=/path/to/site-packages/ray/cpp
@@ -264,7 +264,7 @@ rayrust (safe Rust API)
     |
     v
 rayrust-sys (FFI bindings)
-    extern "C" declarations, build.rs (auto-download SDK from PyPI)
+    extern "C" declarations, build.rs (SDK lookup; opt-in PyPI download via RAYRUST_DOWNLOAD=1)
     |
     v
 ray_c.h / ray_c.cc (C ABI wrapper)
@@ -282,11 +282,20 @@ Build scripts share `rayrust-build` to acquire the Ray C++ SDK:
 1. **`RAY_CPP_DIR` env var** — use a specified SDK directory, used as given with no version comparison
 2. **`~/.cache/rayrust/ray-cpp-{version}-{platform}/`** (or `$RAYRUST_CACHE_DIR/ray-cpp-{version}-{platform}/`) — shared cache (debug + release)
 3. **`python3` (`ray[cpp]`)** — probe `sys.path` for an installed `ray/cpp/` whose `ray` version matches `RAY_VERSION`
-4. **Auto-download from PyPI** — downloads `ray-cpp` wheel, extracts `ray/cpp/`
+4. **Opt-in download from PyPI (`RAYRUST_DOWNLOAD=1`)** — only runs when `RAYRUST_DOWNLOAD` is enabled (`1`/`true`/`yes`; `0`/`false`/`no` or unset disables it): fetches the PyPI JSON index for that version's `ray-cpp` wheel, verifies its SHA-256 digest against `digests.sha256` (writing the digest to `ray-cpp-{version}-{platform}.sha256` alongside the cache directory), and extracts `ray/cpp/`. When `RAYRUST_DOWNLOAD` is unset, the build makes zero network requests and on failure lists the three ways to acquire the SDK (`RAY_CPP_DIR`, `pip install ray[cpp]`, or `RAYRUST_DOWNLOAD=1`).
 
-`RAY_VERSION` (default `2.51.1`) names the cache directory in step 2, the version matched in step 3 and the wheel downloaded in step 4; step 1 takes `RAY_CPP_DIR` as given and does not compare versions.
+`RAY_VERSION` (default `2.51.1`) names the cache directory in step 2, the version matched in step 3, and the wheel downloaded in step 4; step 1 takes `RAY_CPP_DIR` as given and does not compare versions. The `.sha256` pin file alongside the cache directory records the identity of the wheel verified at download time; cache hits validate and read that pin file without re-hashing the extracted SDK directory on every build.
 
 Relative values in `RAY_CPP_DIR` and `RAYRUST_CACHE_DIR` are resolved against the directory `cargo` runs in (`PWD`, or the workspace root when `PWD` is unset); `~` is not expanded, so write `$HOME` instead.
+
+Build warnings print the resolved SDK directory, source, and Ray version:
+
+- `cargo:warning=Using Ray C++ SDK at <dir> (from RAY_CPP_DIR, version not checked)`
+- `cargo:warning=Using Ray C++ SDK at <dir> (from cache, Ray <ver>)` (or `(from cache, Ray <ver>, sha256 <64-hex>)` when the `.sha256` pin file is present)
+- `cargo:warning=Using Ray C++ SDK at <dir> (from python3, Ray <ver>)`
+- `cargo:warning=Using Ray C++ SDK at <dir> (from download, Ray <ver>, sha256 <64-hex>)`
+
+The public headers shipped in the wheel (`include/ray/api.h`, `include/ray/api/*.h`) contain neither a version query nor a GCS entry point. `libray_api.so` does export C++ symbols for `ray::gcs::GlobalStateAccessor` (`Connect`, `GetInternalKV`, `GetAllNodeInfo`, etc.) and `GcsClient` (`nm -D --defined-only libray_api.so | grep -E 'GlobalStateAccessor|GcsClient' | c++filt`), all versioned with `@@VERSION_1.0` as private symbols whose declarations are omitted from the SDK; calling them requires hand-written private declarations and matching the `std::string` ABI tracked in #19. No exported symbol carries the Ray version string (`nm -D --defined-only libray_api.so | grep -i version | grep -Ev 'VERSION_1.0|FLAGS_'`). Upstream keeps the cluster version on internal paths: GCS fills `CheckAliveReply.ray_version` in `GcsNodeManager::HandleCheckAlive` (`src/ray/gcs/gcs_node_manager.cc:154-166`, set at `:158`) and only the raylet calls `CheckAlive` (`src/ray/raylet/node_manager.cc:442`), while Python reads cluster metadata from GCS internal KV via `get_cluster_metadata` (`ray/_common/usage/usage_lib.py:841-862`) and compares it with `ray.__version__` in `_check_ray_version` (`ray/scripts/scripts.py:69-79`). Automatic runtime cluster version comparison is therefore deferred to #19; compare the resolved version in the build warning with `ray.__version__` on the cluster manually.
 
 ## Key Design Decisions
 
@@ -294,7 +303,7 @@ Relative values in `RAY_CPP_DIR` and `RAYRUST_CACHE_DIR` are resolved against th
 |---|---|
 | Wrap C++ SDK, not native rewrite | `libray_api.so` is 38MB of Bazel-built code |
 | C ABI wrapper | C++ templates have no stable ABI |
-| build.rs auto-download | No Python dependency for building |
+| Opt-in `build.rs` download (`RAYRUST_DOWNLOAD=1`) | Offline by default; optional SHA-256-verified wheel fetch without requiring Python |
 | Binary-safe IDs (`ptr + len`) | Ray ObjectIDs may contain null bytes |
 | XLANG header auto-detection | Ray 2.51.1+ changed header format (non-zero padding) |
 | `rmpv::Value` for dynamic types | Python returns unknown types at compile time |
@@ -458,7 +467,7 @@ fn main() {
 
 GitHub Actions (`.github/workflows/ci.yml`) runs on `ubuntu-24.04` (`linux/x86_64` only; macOS, Windows, and `linux/aarch64` are not tested in CI) using `actions/setup-python@v7` (Python 3.12):
 
-- **`build` job** — downloads and extracts the `ray-cpp` wheel for each Ray version in the matrix (`2.49.0`, `2.51.1`, `2.55.0`, `2.60.0`), sets `RAY_CPP_DIR` to the extracted `ray/cpp`, and runs `cargo build --release --all-targets`, `cargo test`, `cargo test --release`, `cargo test --doc`, and `cargo doc --no-deps`. On the `2.60.0` matrix entry it also unsets `RAY_CPP_DIR` with a fresh `RAYRUST_CACHE_DIR` to verify the PyPI auto-download branch on a cold cache (`(from download)`) followed by cache reuse (`(from cache)`).
+- **`build` job** — downloads and extracts the `ray-cpp` wheel for each Ray version in the matrix (`2.49.0`, `2.51.1`, `2.55.0`, `2.60.0`), sets `RAY_CPP_DIR` to the extracted `ray/cpp`, and runs `cargo build --release --all-targets`, `cargo test`, `cargo test --release`, `cargo test --doc`, and `cargo doc --no-deps`. On the `2.60.0` matrix entry it also unsets `RAY_CPP_DIR` with a fresh `RAYRUST_CACHE_DIR` and `RAYRUST_DOWNLOAD=1` to verify the opt-in PyPI download branch on a cold cache (the warning names the wheel digest: `(from download, Ray 2.60.0, sha256 <digest>)`) followed by cache reuse (`(from cache, Ray 2.60.0, sha256 <digest>)`).
 - **`cluster` job** — installs `ray[cpp]==2.51.1` via `actions/setup-python@v7` (Python 3.12) without setting `RAY_CPP_DIR` (exercising `python3` SDK discovery), sets `RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE=1` so an object store larger than `/dev/shm` falls back to Ray's own temporary directory, starts a single-node Ray cluster (`ray start --head --num-cpus=2`), runs the `full_test`, `actor_e2e`, and `async_demo` examples, and stops the cluster with `ray stop --force`.
 
 `cargo fmt --check` and `cargo clippy` are omitted because the repository carries pre-existing `rustfmt` diffs and `clippy` warnings on `main`.

@@ -1,17 +1,56 @@
+//! Build-time Ray C++ SDK locator and opt-in PyPI wheel fetcher.
+//!
+//! SDK lookup order:
+//! 1. `RAY_CPP_DIR` (used as given; version is not checked)
+//! 2. Shared cache `<cache_root>/ray-cpp-<version>-<platform>/` (with optional `.sha256` pin file)
+//! 3. `python3` (`ray/cpp` on `sys.path` whose `ray.__version__` equals `RAY_VERSION`)
+//! 4. Opt-in PyPI wheel download (`RAYRUST_DOWNLOAD=1`), verified against `digests.sha256`
+//!
+//! Runtime version handshake boundary (issue #12):
+//! - The public headers shipped in `ray-cpp` (`include/ray/api.h`, `include/ray/api/*.h`) declare
+//!   neither a version query nor a GCS entry point.
+//! - `libray_api.so` does export C++ symbols for `ray::gcs::GlobalStateAccessor` (`Connect`,
+//!   `GetInternalKV`, `GetAllNodeInfo`, etc.) and `GcsClient` (inspectable via
+//!   `nm -D --defined-only libray_api.so | grep -E 'GlobalStateAccessor|GcsClient' | c++filt`),
+//!   all versioned with `@@VERSION_1.0` as private symbols whose declarations are omitted from the
+//!   SDK; calling them requires hand-written private declarations and matching the `std::string`
+//!   ABI tracked in #19.
+//! - No exported symbol carries the Ray version string
+//!   (`nm -D --defined-only libray_api.so | grep -i version | grep -Ev 'VERSION_1.0|FLAGS_'`).
+//! - Upstream records the cluster version on internal paths: GCS fills
+//!   `CheckAliveReply.ray_version` in `GcsNodeManager::HandleCheckAlive`
+//!   (`src/ray/gcs/gcs_node_manager.cc:154-166`, set at `:158`), which only the raylet calls
+//!   (`src/ray/raylet/node_manager.cc:442`); Python reads cluster metadata from GCS internal KV in
+//!   `get_cluster_metadata` (`ray/_common/usage/usage_lib.py:841-862`) and compares it against
+//!   `ray.__version__` in `_check_ray_version` (`ray/scripts/scripts.py:69-79`).
+//!
+//! Automatic runtime cluster version comparison is therefore deferred to #19; build scripts emit a
+//! `cargo:warning` recording the resolved SDK path, source, and Ray version for manual comparison
+//! with `ray.__version__` on the cluster.
+
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::env;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
 pub const DEFAULT_RAY_VERSION: &str = "2.51.1";
 
-const FIX_HINT: &str = "Set RAY_CPP_DIR=/path/to/ray/cpp or install via `pip install ray[cpp]` \
+const FIX_HINT: &str = "Set RAY_CPP_DIR=/path/to/ray/cpp, install via `pip install ray[cpp]`, \
+or set RAYRUST_DOWNLOAD=1 to download the ray-cpp wheel from PyPI \
 (supported PyPI wheel platforms: linux/x86_64, linux/aarch64, macos/aarch64, windows/x86_64).";
+
+const FIX_HINT_NO_DOWNLOAD: &str =
+    "Set RAY_CPP_DIR=/path/to/ray/cpp or install via `pip install ray[cpp]`.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sdk {
     pub cpp_dir: PathBuf,
+    pub version: String,
+    pub sha256: Option<String>,
 }
 
 impl Sdk {
@@ -43,12 +82,46 @@ impl fmt::Display for Source {
     }
 }
 
+pub fn format_warning(sdk: &Sdk, source: Source) -> String {
+    let dir = sdk.cpp_dir.display();
+    let detail = match (source, sdk.sha256.as_deref()) {
+        (Source::Env, _) => format!("from {source}, version not checked"),
+        (Source::Cache, Some(sha)) => {
+            format!("from {source}, Ray {}, sha256 {sha}", sdk.version)
+        }
+        (Source::Cache, None) => format!("from {source}, Ray {}", sdk.version),
+        (Source::Python, _) => format!("from {source}, Ray {}", sdk.version),
+        (Source::Download, Some(sha)) => {
+            format!("from {source}, Ray {}, sha256 {sha}", sdk.version)
+        }
+        (Source::Download, None) => format!("from {source}, Ray {}", sdk.version),
+    };
+    format!("cargo:warning=Using Ray C++ SDK at {dir} ({detail})")
+}
+
 #[derive(Debug, Clone)]
 pub struct Args {
     pub ray_cpp_dir: Option<PathBuf>,
     pub ray_version: String,
     pub cache_root: PathBuf,
     pub python3: Option<PathBuf>,
+    pub download: bool,
+}
+
+pub fn parse_download_flag(raw: Option<&str>) -> Result<bool, String> {
+    let Some(raw) = raw else {
+        return Ok(false);
+    };
+    if raw.is_empty() {
+        return Ok(false);
+    }
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        _ => Err(format!(
+            "invalid RAYRUST_DOWNLOAD value '{raw}' (expected 1/true/yes or 0/false/no)"
+        )),
+    }
 }
 
 fn find_workspace_root() -> Option<PathBuf> {
@@ -105,11 +178,22 @@ pub fn from_env() -> Result<Args, String> {
             }
         },
     };
+    let download = match env::var("RAYRUST_DOWNLOAD") {
+        Ok(val) => parse_download_flag(Some(&val))?,
+        Err(env::VarError::NotPresent) => parse_download_flag(None)?,
+        Err(env::VarError::NotUnicode(os)) => {
+            return Err(format!(
+                "invalid RAYRUST_DOWNLOAD value '{}' (expected 1/true/yes or 0/false/no)",
+                os.to_string_lossy()
+            ));
+        }
+    };
     Ok(Args {
         ray_cpp_dir,
         ray_version,
         cache_root,
         python3: Some(PathBuf::from("python3")),
+        download,
     })
 }
 
@@ -129,6 +213,101 @@ pub fn platform_tag(os: &str, arch: &str) -> Result<&'static str, String> {
 
 pub fn cache_dir(cache_root: &Path, version: &str, platform: &str) -> PathBuf {
     cache_root.join(format!("ray-cpp-{version}-{platform}"))
+}
+
+pub fn pin_file_path(cache_root: &Path, version: &str, platform: &str) -> PathBuf {
+    cache_root.join(format!("ray-cpp-{version}-{platform}.sha256"))
+}
+
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn format_hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+pub fn verify_sha256(path: &Path, expected_hex: &str) -> Result<(), String> {
+    let mut file = fs::File::open(path).map_err(|e| {
+        format!(
+            "failed to open {} for sha256 verification: {e}",
+            path.display()
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| {
+            format!(
+                "failed to read {} for sha256 verification: {e}",
+                path.display()
+            )
+        })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let actual = format_hex_lower(&hasher.finalize());
+    if !actual.eq_ignore_ascii_case(expected_hex) {
+        return Err(format!(
+            "sha256 mismatch for {}: expected {expected_hex}, got {actual}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn write_pin_file(pin_path: &Path, sha256: &str, pid: u32) -> Result<(), String> {
+    let normalized = sha256.trim().to_ascii_lowercase();
+    if !is_sha256_hex(&normalized) {
+        return Err(format!(
+            "invalid sha256 digest for {}: expected a 64-character sha256, got {sha256}",
+            pin_path.display()
+        ));
+    }
+    let tmp_path = PathBuf::from(format!("{}.tmp-{pid}", pin_path.display()));
+    if let Err(e) = fs::write(&tmp_path, format!("{normalized}\n")) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!(
+            "failed to write temporary pin file {}: {e}",
+            tmp_path.display()
+        ));
+    }
+    if let Err(e) = fs::rename(&tmp_path, pin_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!(
+            "failed to move temporary pin file {} to {}: {e}",
+            tmp_path.display(),
+            pin_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn read_pin_file(pin_path: &Path) -> Result<Option<String>, String> {
+    let contents = match fs::read_to_string(pin_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "failed to read pin file {path}: {e}. Delete {path} and rebuild; with RAYRUST_DOWNLOAD=1 the wheel is downloaded again.",
+                path = pin_path.display()
+            ));
+        }
+    };
+    let trimmed = contents.trim_end_matches(&['\r', '\n'][..]);
+    if !is_sha256_hex(trimmed) {
+        return Err(format!(
+            "invalid pin file {path}: expected a 64-character sha256, got {trimmed}. Delete {path} and rebuild; with RAYRUST_DOWNLOAD=1 the wheel is downloaded again.",
+            path = pin_path.display()
+        ));
+    }
+    Ok(Some(trimmed.to_ascii_lowercase()))
 }
 
 fn check_sdk_dir(dir: &Path) -> Result<(), String> {
@@ -167,7 +346,7 @@ pub fn validate(dir: &Path) -> Result<(), String> {
     })
 }
 
-fn build_sdk(dir: &Path) -> Result<Sdk, String> {
+fn build_sdk(dir: &Path, version: String, sha256: Option<String>) -> Result<Sdk, String> {
     check_sdk_dir(dir)?;
     let canonical = fs::canonicalize(dir).map_err(|e| {
         format!(
@@ -175,7 +354,11 @@ fn build_sdk(dir: &Path) -> Result<Sdk, String> {
             dir.display()
         )
     })?;
-    Ok(Sdk { cpp_dir: canonical })
+    Ok(Sdk {
+        cpp_dir: canonical,
+        version,
+        sha256,
+    })
 }
 
 pub fn version_matches(installed: &str, requested: &str) -> bool {
@@ -225,32 +408,63 @@ fn probe_python(python3: &Path) -> Result<Option<(PathBuf, String)>, String> {
     }
 }
 
-pub fn resolve(args: &Args) -> Result<(Sdk, Source), String> {
+#[derive(Debug)]
+enum ResolveFailure {
+    Fatal(String),
+    NotFound(String),
+}
+
+impl ResolveFailure {
+    fn into_message(self) -> String {
+        match self {
+            ResolveFailure::Fatal(msg) | ResolveFailure::NotFound(msg) => msg,
+        }
+    }
+}
+
+fn resolve_inner(
+    args: &Args,
+    report_download_disabled: bool,
+) -> Result<(Sdk, Source), ResolveFailure> {
     if let Some(ref dir) = args.ray_cpp_dir {
-        return build_sdk(dir)
+        return build_sdk(dir, args.ray_version.clone(), None)
             .map(|sdk| (sdk, Source::Env))
-            .map_err(|reason| format!("invalid RAY_CPP_DIR ({}): {reason}", dir.display()));
+            .map_err(|reason| {
+                ResolveFailure::Fatal(format!(
+                    "invalid RAY_CPP_DIR ({}): {reason}. {FIX_HINT}",
+                    dir.display()
+                ))
+            });
     }
 
     let mut checked = Vec::new();
     checked.push("RAY_CPP_DIR: not set".to_string());
 
-    match platform_tag(env::consts::OS, env::consts::ARCH) {
+    let platform_supported = match platform_tag(env::consts::OS, env::consts::ARCH) {
         Ok(platform) => {
             let cached = cache_dir(&args.cache_root, &args.ray_version, platform);
-            match build_sdk(&cached) {
-                Ok(sdk) => return Ok((sdk, Source::Cache)),
+            match build_sdk(&cached, args.ray_version.clone(), None) {
+                Ok(mut sdk) => {
+                    let pin_path = pin_file_path(&args.cache_root, &args.ray_version, platform);
+                    sdk.sha256 = read_pin_file(&pin_path).map_err(ResolveFailure::Fatal)?;
+                    return Ok((sdk, Source::Cache));
+                }
                 Err(e) => checked.push(format!("cache ({}): {e}", cached.display())),
             }
+            true
         }
-        Err(e) => checked.push(format!("cache: skipped ({e})")),
-    }
+        Err(e) => {
+            checked.push(format!("cache: skipped ({e})"));
+            false
+        }
+    };
 
     match args.python3 {
         Some(ref py) => match probe_python(py) {
             Ok(Some((dir, installed_ver))) => {
                 if version_matches(&installed_ver, &args.ray_version) {
-                    match build_sdk(&dir) {
+                    let resolved_ver = installed_ver.trim().to_string();
+                    match build_sdk(&dir, resolved_ver, None) {
                         Ok(sdk) => return Ok((sdk, Source::Python)),
                         Err(e) => checked.push(format!("python3 ({}): {e}", py.display())),
                     }
@@ -277,7 +491,18 @@ pub fn resolve(args: &Args) -> Result<(Sdk, Source), String> {
         None => checked.push("python3: not configured".to_string()),
     }
 
-    Err(not_found_error(&checked))
+    if report_download_disabled && platform_supported && !args.download {
+        checked.push(format!(
+            "download: disabled (set RAYRUST_DOWNLOAD=1 to download ray-cpp {} from PyPI)",
+            args.ray_version
+        ));
+    }
+
+    Err(ResolveFailure::NotFound(not_found_error(&checked)))
+}
+
+pub fn resolve(args: &Args) -> Result<(Sdk, Source), String> {
+    resolve_inner(args, true).map_err(ResolveFailure::into_message)
 }
 
 fn not_found_error(checked: &[String]) -> String {
@@ -293,6 +518,7 @@ fn unsupported_platform_panic(resolve_err: &str) -> String {
 
 pub fn download(args: &Args, platform: &str) -> Result<Sdk, String> {
     let target_dir = cache_dir(&args.cache_root, &args.ray_version, platform);
+    let pin_path = pin_file_path(&args.cache_root, &args.ray_version, platform);
     fs::create_dir_all(&args.cache_root).map_err(|e| {
         format!(
             "failed to create cache root {}: {e}",
@@ -303,17 +529,20 @@ pub fn download(args: &Args, platform: &str) -> Result<Sdk, String> {
     let pid = process::id();
     let wheel_path = args
         .cache_root
-        .join(format!("ray-{}-{pid}.whl", args.ray_version));
-    let tmp_extract = args
-        .cache_root
-        .join(format!("ray-extract-{}-{pid}", args.ray_version));
+        .join(format!("ray_cpp-{}-{platform}-{pid}.whl", args.ray_version));
+    let tmp_extract = args.cache_root.join(format!(
+        "ray_cpp-extract-{}-{platform}-{pid}",
+        args.ray_version
+    ));
 
     let result = download_into(
         &args.ray_version,
         platform,
+        pid,
         &wheel_path,
         &tmp_extract,
         &target_dir,
+        &pin_path,
     );
     let _ = fs::remove_file(&wheel_path);
     let _ = fs::remove_dir_all(&tmp_extract);
@@ -323,11 +552,14 @@ pub fn download(args: &Args, platform: &str) -> Result<Sdk, String> {
 fn download_into(
     version: &str,
     platform: &str,
+    pid: u32,
     wheel_path: &Path,
     tmp_extract: &Path,
     target_dir: &Path,
+    pin_path: &Path,
 ) -> Result<Sdk, String> {
-    let wheel_url = fetch_wheel_url(version, platform)?;
+    let index_json = fetch_index(version)?;
+    let wheel = select_wheel(&index_json, version, platform)?;
 
     let dl_out = Command::new("curl")
         .args([
@@ -341,17 +573,20 @@ fn download_into(
             "-o",
         ])
         .arg(wheel_path)
-        .arg(&wheel_url)
+        .arg(&wheel.url)
         .output()
-        .map_err(|e| format!("failed to run curl to download {wheel_url}: {e}"))?;
+        .map_err(|e| format!("failed to run curl to download {}: {e}", wheel.url))?;
 
     if !dl_out.status.success() {
         return Err(format!(
-            "failed to download Ray C++ wheel from {wheel_url} ({}): {}",
+            "failed to download Ray C++ wheel from {} ({}): {}",
+            wheel.url,
             dl_out.status,
             String::from_utf8_lossy(&dl_out.stderr).trim()
         ));
     }
+
+    verify_sha256(wheel_path, &wheel.sha256)?;
 
     let _ = fs::remove_dir_all(tmp_extract);
     fs::create_dir_all(tmp_extract).map_err(|e| {
@@ -381,9 +616,24 @@ fn download_into(
     let extracted_cpp = tmp_extract.join("ray").join("cpp");
     check_sdk_dir(&extracted_cpp)?;
 
+    move_extracted_sdk(&extracted_cpp, target_dir)?;
+
+    write_pin_file(pin_path, &wheel.sha256, pid)?;
+    build_sdk(target_dir, version.to_string(), Some(wheel.sha256))
+}
+
+fn move_extracted_sdk(extracted_cpp: &Path, target_dir: &Path) -> Result<(), String> {
     // Concurrent cold-start build scripts may download in parallel and race on rename; keep existing valid dir.
-    if let Err(rename_err) = fs::rename(&extracted_cpp, target_dir) {
+    if let Err(rename_err) = fs::rename(extracted_cpp, target_dir) {
         if check_sdk_dir(target_dir).is_err() {
+            if target_dir.exists() {
+                return Err(format!(
+                    "failed to move extracted SDK from {} to {}: {rename_err}; {} exists but is not a usable SDK — delete it and rebuild",
+                    extracted_cpp.display(),
+                    target_dir.display(),
+                    target_dir.display()
+                ));
+            }
             return Err(format!(
                 "failed to move extracted SDK from {} to {}: {rename_err}",
                 extracted_cpp.display(),
@@ -391,11 +641,10 @@ fn download_into(
             ));
         }
     }
-
-    build_sdk(target_dir)
+    Ok(())
 }
 
-fn fetch_wheel_url(version: &str, platform: &str) -> Result<String, String> {
+fn fetch_index(version: &str) -> Result<String, String> {
     let api_url = format!("https://pypi.org/pypi/ray-cpp/{version}/json");
     let output = Command::new("curl")
         .args(["-sS", "--fail", "--connect-timeout", "30", "-L", &api_url])
@@ -410,17 +659,57 @@ fn fetch_wheel_url(version: &str, platform: &str) -> Result<String, String> {
         ));
     }
 
-    let json = String::from_utf8_lossy(&output.stdout);
-    select_wheel_url(&json, version, platform)
+    String::from_utf8(output.stdout)
+        .map_err(|e| format!("non-UTF-8 PyPI metadata from {api_url}: {e}"))
+}
+
+#[derive(Deserialize)]
+struct PypiIndex {
+    urls: Vec<IndexFile>,
+}
+
+#[derive(Deserialize)]
+struct IndexFile {
+    filename: String,
+    url: String,
+    #[serde(default)]
+    digests: Digests,
+}
+
+#[derive(Default, Deserialize)]
+struct Digests {
+    sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wheel {
+    pub filename: String,
+    pub url: String,
+    pub sha256: String,
 }
 
 const WHEEL_TAGS: &[&str] = &["py3-none", "cp312-cp312", "cp311-cp311", "cp310-cp310"];
 
-fn select_wheel_url(json: &str, version: &str, platform: &str) -> Result<String, String> {
+pub fn select_wheel(json: &str, version: &str, platform: &str) -> Result<Wheel, String> {
+    let index: PypiIndex = serde_json::from_str(json)
+        .map_err(|e| format!("failed to parse PyPI metadata for ray-cpp {version}: {e}"))?;
+
     for tag in WHEEL_TAGS {
         let filename = format!("ray_cpp-{version}-{tag}-{platform}.whl");
-        if let Some(url) = extract_url_for_filename(json, &filename) {
-            return Ok(url);
+        if let Some(file) = index.urls.iter().find(|u| u.filename == filename) {
+            let sha256 = file
+                .digests
+                .sha256
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("PyPI metadata for {} has no sha256 digest", file.filename))?
+                .to_ascii_lowercase();
+            return Ok(Wheel {
+                filename: file.filename.clone(),
+                url: file.url.clone(),
+                sha256,
+            });
         }
     }
 
@@ -430,36 +719,18 @@ fn select_wheel_url(json: &str, version: &str, platform: &str) -> Result<String,
     ))
 }
 
-fn extract_url_for_filename(json: &str, filename: &str) -> Option<String> {
-    let needle = format!("\"filename\":\"{filename}\"");
-    let idx = json
-        .find(&needle)
-        .or_else(|| json.find(&format!("\"filename\": \"{filename}\"")))
-        .or_else(|| json.find(filename))?;
-    let after = &json[idx..];
-    let url_key = after.find("\"url\"")?;
-    let after_url = &after[url_key..];
-    let colon = after_url.find(':')?;
-    let after_colon = &after_url[colon + 1..];
-    let q1 = after_colon.find('"')?;
-    let after_quote = &after_colon[q1 + 1..];
-    let q2 = after_quote.find('"')?;
-    Some(after_quote[..q2].to_string())
-}
-
 pub fn resolve_or_download() -> Sdk {
     let args = from_env().unwrap_or_else(|e| panic!("Failed to configure Ray C++ SDK lookup: {e}"));
-    match resolve(&args) {
+    match resolve_inner(&args, true) {
         Ok((sdk, source)) => {
-            println!(
-                "cargo:warning=Using Ray C++ SDK at {} (from {})",
-                sdk.cpp_dir.display(),
-                source
-            );
+            println!("{}", format_warning(&sdk, source));
             sdk
         }
-        Err(resolve_err) => {
-            if args.ray_cpp_dir.is_some() {
+        Err(ResolveFailure::Fatal(err)) => {
+            panic!("{err}");
+        }
+        Err(ResolveFailure::NotFound(resolve_err)) => {
+            if !args.download {
                 panic!("{resolve_err}\n{FIX_HINT}");
             }
             let platform = match platform_tag(env::consts::OS, env::consts::ARCH) {
@@ -469,16 +740,12 @@ pub fn resolve_or_download() -> Sdk {
             };
             match download(&args, platform) {
                 Ok(sdk) => {
-                    println!(
-                        "cargo:warning=Using Ray C++ SDK at {} (from {})",
-                        sdk.cpp_dir.display(),
-                        Source::Download
-                    );
+                    println!("{}", format_warning(&sdk, Source::Download));
                     sdk
                 }
                 Err(dl_err) => {
                     panic!(
-                        "{resolve_err}\nAuto-download of ray-cpp {} ({platform}) failed: {dl_err}\n{FIX_HINT}",
+                        "{resolve_err}\nDownload of ray-cpp {} ({platform}) failed: {dl_err}\n{FIX_HINT}",
                         args.ray_version
                     );
                 }
@@ -487,18 +754,21 @@ pub fn resolve_or_download() -> Sdk {
     }
 }
 
+fn format_require_failure(failure: ResolveFailure) -> String {
+    match failure {
+        ResolveFailure::Fatal(err) => err,
+        ResolveFailure::NotFound(err) => format!("{err}\n{FIX_HINT_NO_DOWNLOAD}"),
+    }
+}
+
 pub fn require() -> Sdk {
     let args = from_env().unwrap_or_else(|e| panic!("Failed to configure Ray C++ SDK lookup: {e}"));
-    match resolve(&args) {
+    match resolve_inner(&args, false) {
         Ok((sdk, source)) => {
-            println!(
-                "cargo:warning=Using Ray C++ SDK at {} (from {})",
-                sdk.cpp_dir.display(),
-                source
-            );
+            println!("{}", format_warning(&sdk, source));
             sdk
         }
-        Err(err) => panic!("{err}\n{FIX_HINT}"),
+        Err(failure) => panic!("{}", format_require_failure(failure)),
     }
 }
 
@@ -576,20 +846,26 @@ mod tests {
             ray_version: DEFAULT_RAY_VERSION.to_string(),
             cache_root: cache_root.clone(),
             python3: None,
+            download: false,
         };
         let (sdk, source) = resolve(&args).expect("resolve env sdk");
         assert_eq!(source, Source::Env);
         assert_eq!(sdk.cpp_dir, fs::canonicalize(&env_sdk).unwrap());
+        assert_eq!(sdk.version, DEFAULT_RAY_VERSION);
+        assert_eq!(sdk.sha256, None);
 
         let cache_args = Args {
             ray_cpp_dir: None,
             ray_version: DEFAULT_RAY_VERSION.to_string(),
             cache_root,
             python3: None,
+            download: false,
         };
         let (sdk_cached, source_cached) = resolve(&cache_args).expect("resolve cached sdk");
         assert_eq!(source_cached, Source::Cache);
         assert_eq!(sdk_cached.cpp_dir, fs::canonicalize(&cached_sdk).unwrap());
+        assert_eq!(sdk_cached.version, DEFAULT_RAY_VERSION);
+        assert_eq!(sdk_cached.sha256, None);
     }
 
     #[test]
@@ -604,6 +880,7 @@ mod tests {
             ray_version: DEFAULT_RAY_VERSION.to_string(),
             cache_root: base.join("cache"),
             python3: None,
+            download: false,
         };
         let (sdk, source) = resolve(&args).expect("resolve unnormalized sdk");
         assert_eq!(source, Source::Env);
@@ -619,7 +896,8 @@ mod tests {
         let resolved = resolve_relative(Path::new("relative-sdk"), Some(&base));
         assert_eq!(resolved, base.join("relative-sdk"));
 
-        let sdk = build_sdk(&resolved).expect("build relative sdk");
+        let sdk =
+            build_sdk(&resolved, DEFAULT_RAY_VERSION.to_string(), None).expect("build relative");
         assert!(sdk.cpp_dir.is_absolute());
         assert_eq!(
             sdk.cpp_dir,
@@ -652,11 +930,16 @@ mod tests {
             ray_version: DEFAULT_RAY_VERSION.to_string(),
             cache_root,
             python3: None,
+            download: false,
         };
         let err = resolve(&args).unwrap_err();
         assert!(
             err.contains(&empty_env_sdk.display().to_string()),
             "err should mention empty_env_sdk path, got: {err}"
+        );
+        assert!(
+            err.contains("RAY_CPP_DIR") && err.contains("ray[cpp]") && err.contains(FIX_HINT),
+            "err should include FIX_HINT keywords, got: {err}"
         );
     }
 
@@ -677,6 +960,7 @@ mod tests {
             ray_version: DEFAULT_RAY_VERSION.to_string(),
             cache_root: cache_root.clone(),
             python3: None,
+            download: false,
         };
         let err = resolve(&args).unwrap_err();
         let host_platform = platform_tag(env::consts::OS, env::consts::ARCH).unwrap();
@@ -704,7 +988,7 @@ mod tests {
             "  - cache: skipped (unsupported platform 'macos/x86_64' for PyPI ray-cpp wheels (supported: linux/x86_64, linux/aarch64, macos/aarch64, windows/x86_64); or set RAY_CPP_DIR to point to your own Ray C++ SDK)\n",
             "  - python3 (python3): ray/cpp not found in sys.path\n",
             "Auto-download needs a supported platform.\n",
-            "Set RAY_CPP_DIR=/path/to/ray/cpp or install via `pip install ray[cpp]` (supported PyPI wheel platforms: linux/x86_64, linux/aarch64, macos/aarch64, windows/x86_64).",
+            "Set RAY_CPP_DIR=/path/to/ray/cpp, install via `pip install ray[cpp]`, or set RAYRUST_DOWNLOAD=1 to download the ray-cpp wheel from PyPI (supported PyPI wheel platforms: linux/x86_64, linux/aarch64, macos/aarch64, windows/x86_64).",
         );
         assert_eq!(message, expected);
         assert_eq!(message.matches("unsupported platform").count(), 1);
@@ -752,37 +1036,364 @@ mod tests {
     fn select_wheel_url_matches_py3_none_and_cp_wheels() {
         let pypi_255 = concat!(
             r#"{"urls":["#,
-            r#"{"filename":"ray_cpp-2.55.0-py3-none-macosx_12_0_arm64.whl","url":"https://files.pythonhosted.org/packages/arm64/ray_cpp-2.55.0-py3-none-macosx_12_0_arm64.whl"},"#,
-            r#"{"filename":"ray_cpp-2.55.0-py3-none-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/61/64/4de4ad58dd50532aa2774462af8531395af55ff54c19e6d270c643611823/ray_cpp-2.55.0-py3-none-manylinux2014_x86_64.whl"}"#,
+            r#"{"filename":"ray_cpp-2.55.0-py3-none-macosx_12_0_arm64.whl","url":"https://files.pythonhosted.org/packages/8f/38/640ada368f4d6554ffa5ed0719ee89d8787d1309448a39046aec44f5a3bc/ray_cpp-2.55.0-py3-none-macosx_12_0_arm64.whl","digests":{"sha256":"129e3862fbf6938c670c3b1bb91fe01d6001287c12cb1787750fec989cee434d"}},"#,
+            r#"{"filename":"ray_cpp-2.55.0-py3-none-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/61/64/4de4ad58dd50532aa2774462af8531395af55ff54c19e6d270c643611823/ray_cpp-2.55.0-py3-none-manylinux2014_x86_64.whl","digests":{"sha256":"fabf15f1403cfb3b4cc707b21eaaf7b80081763386393a87f9e392dd137c5849"}}"#,
             r#"]}"#,
         );
+        let w_255 = select_wheel(pypi_255, "2.55.0", "manylinux2014_x86_64").unwrap();
         assert_eq!(
-            select_wheel_url(pypi_255, "2.55.0", "manylinux2014_x86_64").unwrap(),
-            "https://files.pythonhosted.org/packages/61/64/4de4ad58dd50532aa2774462af8531395af55ff54c19e6d270c643611823/ray_cpp-2.55.0-py3-none-manylinux2014_x86_64.whl"
+            w_255,
+            Wheel {
+                filename: "ray_cpp-2.55.0-py3-none-manylinux2014_x86_64.whl".to_string(),
+                url: "https://files.pythonhosted.org/packages/61/64/4de4ad58dd50532aa2774462af8531395af55ff54c19e6d270c643611823/ray_cpp-2.55.0-py3-none-manylinux2014_x86_64.whl".to_string(),
+                sha256: "fabf15f1403cfb3b4cc707b21eaaf7b80081763386393a87f9e392dd137c5849".to_string(),
+            }
         );
 
         let pypi_260 = concat!(
             r#"{"urls":["#,
-            r#"{"filename":"ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/97/e0/099d1ea4558d3d7115a0b4143f25c20830d36dfd3e0f8200868d63a2aadf/ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl"}"#,
+            r#"{"filename":"ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/97/e0/099d1ea4558d3d7115a0b4143f25c20830d36dfd3e0f8200868d63a2aadf/ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl","digests":{"sha256":"43433cf59e2c5f41c0a4b2dbe3aa87a664a8ed1f00cbccf06967fd9819e1dac0"}}"#,
             r#"]}"#,
         );
+        let w_260 = select_wheel(pypi_260, "2.60.0", "manylinux2014_x86_64").unwrap();
         assert_eq!(
-            select_wheel_url(pypi_260, "2.60.0", "manylinux2014_x86_64").unwrap(),
-            "https://files.pythonhosted.org/packages/97/e0/099d1ea4558d3d7115a0b4143f25c20830d36dfd3e0f8200868d63a2aadf/ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl"
+            w_260,
+            Wheel {
+                filename: "ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl".to_string(),
+                url: "https://files.pythonhosted.org/packages/97/e0/099d1ea4558d3d7115a0b4143f25c20830d36dfd3e0f8200868d63a2aadf/ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl".to_string(),
+                sha256: "43433cf59e2c5f41c0a4b2dbe3aa87a664a8ed1f00cbccf06967fd9819e1dac0".to_string(),
+            }
         );
 
         let pypi_2511 = concat!(
             r#"{"urls":["#,
-            r#"{"filename":"ray_cpp-2.51.1-cp310-cp310-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/cp310/ray_cpp-2.51.1-cp310-cp310-manylinux2014_x86_64.whl"},"#,
-            r#"{"filename":"ray_cpp-2.51.1-cp312-cp312-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/1c/84/c7aecb7867ca3b85dbcfa20808f698727c35163b76ad2baae94fcad9531c/ray_cpp-2.51.1-cp312-cp312-manylinux2014_x86_64.whl"}"#,
+            r#"{"filename":"ray_cpp-2.51.1-cp310-cp310-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/cp310/ray_cpp-2.51.1-cp310-cp310-manylinux2014_x86_64.whl","digests":{"sha256":"0000000000000000000000000000000000000000000000000000000000000310"}},"#,
+            r#"{"filename":"ray_cpp-2.51.1-cp312-cp312-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/1c/84/c7aecb7867ca3b85dbcfa20808f698727c35163b76ad2baae94fcad9531c/ray_cpp-2.51.1-cp312-cp312-manylinux2014_x86_64.whl","digests":{"sha256":"9b9fd02af0e750a3dd8c4702d82551e83393d89fda9baa75c2513d22b079a9f6"}}"#,
             r#"]}"#,
         );
+        let w_2511 = select_wheel(pypi_2511, "2.51.1", "manylinux2014_x86_64").unwrap();
         assert_eq!(
-            select_wheel_url(pypi_2511, "2.51.1", "manylinux2014_x86_64").unwrap(),
-            "https://files.pythonhosted.org/packages/1c/84/c7aecb7867ca3b85dbcfa20808f698727c35163b76ad2baae94fcad9531c/ray_cpp-2.51.1-cp312-cp312-manylinux2014_x86_64.whl"
+            w_2511,
+            Wheel {
+                filename: "ray_cpp-2.51.1-cp312-cp312-manylinux2014_x86_64.whl".to_string(),
+                url: "https://files.pythonhosted.org/packages/1c/84/c7aecb7867ca3b85dbcfa20808f698727c35163b76ad2baae94fcad9531c/ray_cpp-2.51.1-cp312-cp312-manylinux2014_x86_64.whl".to_string(),
+                sha256: "9b9fd02af0e750a3dd8c4702d82551e83393d89fda9baa75c2513d22b079a9f6".to_string(),
+            }
         );
 
-        let err = select_wheel_url(pypi_260, "2.60.0", "win_amd64").unwrap_err();
+        let err = select_wheel(pypi_260, "2.60.0", "win_amd64").unwrap_err();
         assert!(err.contains("py3-none"), "err was: {err}");
+    }
+
+    #[test]
+    fn select_wheel_tag_priority_falls_back_to_cp312_when_py3_none_absent() {
+        let only_cp = concat!(
+            r#"{"urls":["#,
+            r#"{"filename":"ray_cpp-2.51.1-cp311-cp311-manylinux2014_x86_64.whl","url":"https://example.invalid/cp311.whl","digests":{"sha256":"1111111111111111111111111111111111111111111111111111111111111111"}},"#,
+            r#"{"filename":"ray_cpp-2.51.1-cp312-cp312-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/1c/84/c7aecb7867ca3b85dbcfa20808f698727c35163b76ad2baae94fcad9531c/ray_cpp-2.51.1-cp312-cp312-manylinux2014_x86_64.whl","digests":{"sha256":"9b9fd02af0e750a3dd8c4702d82551e83393d89fda9baa75c2513d22b079a9f6"}}"#,
+            r#"]}"#,
+        );
+        let selected = select_wheel(only_cp, "2.51.1", "manylinux2014_x86_64").unwrap();
+        assert_eq!(
+            selected.filename,
+            "ray_cpp-2.51.1-cp312-cp312-manylinux2014_x86_64.whl"
+        );
+        assert_eq!(
+            selected.sha256,
+            "9b9fd02af0e750a3dd8c4702d82551e83393d89fda9baa75c2513d22b079a9f6"
+        );
+
+        let both_py3_and_cp = concat!(
+            r#"{"urls":["#,
+            r#"{"filename":"ray_cpp-2.60.0-cp312-cp312-manylinux2014_x86_64.whl","url":"https://example.invalid/cp312.whl","digests":{"sha256":"2222222222222222222222222222222222222222222222222222222222222222"}},"#,
+            r#"{"filename":"ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/97/e0/099d1ea4558d3d7115a0b4143f25c20830d36dfd3e0f8200868d63a2aadf/ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl","digests":{"sha256":"43433cf59e2c5f41c0a4b2dbe3aa87a664a8ed1f00cbccf06967fd9819e1dac0"}}"#,
+            r#"]}"#,
+        );
+        let preferred = select_wheel(both_py3_and_cp, "2.60.0", "manylinux2014_x86_64").unwrap();
+        assert_eq!(
+            preferred.filename,
+            "ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl"
+        );
+    }
+
+    #[test]
+    fn select_wheel_invalid_json_mentions_package_and_version() {
+        let err = select_wheel("{not-json", "2.60.0", "manylinux2014_x86_64").unwrap_err();
+        assert!(
+            err.contains("ray-cpp 2.60.0"),
+            "err should mention 'ray-cpp 2.60.0', got: {err}"
+        );
+    }
+
+    #[test]
+    fn select_wheel_missing_sha256_mentions_filename_and_sha256() {
+        let no_digests = r#"{"urls":[{"filename":"ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl","url":"https://example.invalid/w.whl"}]}"#;
+        let err1 = select_wheel(no_digests, "2.60.0", "manylinux2014_x86_64").unwrap_err();
+        assert!(
+            err1.contains("ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl"),
+            "err was: {err1}"
+        );
+        assert!(err1.contains("sha256"), "err was: {err1}");
+
+        let empty_sha = r#"{"urls":[{"filename":"ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl","url":"https://example.invalid/w.whl","digests":{"sha256":""}}]}"#;
+        let err2 = select_wheel(empty_sha, "2.60.0", "manylinux2014_x86_64").unwrap_err();
+        assert!(
+            err2.contains("ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl"),
+            "err was: {err2}"
+        );
+        assert!(err2.contains("sha256"), "err was: {err2}");
+    }
+
+    #[test]
+    fn verify_sha256_matches_and_reports_mismatch_digests() {
+        let base = test_case_dir("verify_sha256");
+        let file_path = base.join("payload.bin");
+        // Exceed 1 MiB to exercise multi-chunk streaming reads.
+        let mut payload = vec![b'a'; 1024 * 1024 + 37];
+        fs::write(&file_path, &payload).expect("write payload");
+
+        let expected = format_hex_lower(&Sha256::digest(&payload));
+        verify_sha256(&file_path, &expected).expect("matching digest passes");
+
+        payload[1024 * 1024] = b'b';
+        fs::write(&file_path, &payload).expect("write mutated payload");
+        let actual = format_hex_lower(&Sha256::digest(&payload));
+        let err = verify_sha256(&file_path, &expected).unwrap_err();
+        assert!(
+            err.contains("sha256 mismatch"),
+            "err should say sha256 mismatch, got: {err}"
+        );
+        assert!(
+            err.contains(&expected),
+            "err should contain expected digest {expected}, got: {err}"
+        );
+        assert!(
+            err.contains(&actual),
+            "err should contain actual digest {actual}, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_download_flag_cases() {
+        assert!(!parse_download_flag(None).unwrap());
+        assert!(!parse_download_flag(Some("")).unwrap());
+        assert!(parse_download_flag(Some("1")).unwrap());
+        assert!(parse_download_flag(Some("true")).unwrap());
+        assert!(parse_download_flag(Some("YES")).unwrap());
+        assert!(parse_download_flag(Some(" 1 ")).unwrap());
+        assert!(!parse_download_flag(Some("0")).unwrap());
+        assert!(!parse_download_flag(Some("false")).unwrap());
+        assert!(!parse_download_flag(Some("no")).unwrap());
+        assert!(!parse_download_flag(Some(" NO ")).unwrap());
+
+        for bad in ["2", "auto", "   "] {
+            let err = parse_download_flag(Some(bad)).unwrap_err();
+            assert!(
+                err.contains(&format!("invalid RAYRUST_DOWNLOAD value '{bad}'")),
+                "err was: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn pin_file_roundtrip_and_invalid_pin_fails_cache_lookup() {
+        let base = test_case_dir("pin_file");
+        let cache_root = base.join("cache");
+        fs::create_dir_all(&cache_root).expect("create cache_root");
+        let host_platform = platform_tag(env::consts::OS, env::consts::ARCH).unwrap();
+        let cached_sdk = cache_dir(&cache_root, "2.60.0", host_platform);
+        populate_fake_sdk(&cached_sdk);
+
+        let pin = pin_file_path(&cache_root, "2.60.0", host_platform);
+        let digest = "43433cf59e2c5f41c0a4b2dbe3aa87a664a8ed1f00cbccf06967fd9819e1dac0";
+        write_pin_file(&pin, digest, 4242).expect("write pin file");
+        assert_eq!(fs::read_to_string(&pin).unwrap(), format!("{digest}\n"));
+        assert_eq!(read_pin_file(&pin).unwrap().as_deref(), Some(digest));
+
+        let args = Args {
+            ray_cpp_dir: None,
+            ray_version: "2.60.0".to_string(),
+            cache_root: cache_root.clone(),
+            python3: None,
+            download: false,
+        };
+        let (sdk, source) = resolve(&args).expect("resolve cached sdk with pin");
+        assert_eq!(source, Source::Cache);
+        assert_eq!(sdk.version, "2.60.0");
+        assert_eq!(sdk.sha256.as_deref(), Some(digest));
+
+        fs::write(&pin, "deadbeef\n").expect("corrupt pin file");
+        let err = resolve(&args).unwrap_err();
+        assert!(
+            err.contains("invalid pin file"),
+            "err should say invalid pin file, got: {err}"
+        );
+        assert!(
+            err.contains(&pin.display().to_string()),
+            "err should mention pin path {}, got: {err}",
+            pin.display()
+        );
+        assert!(
+            err.contains("deadbeef"),
+            "err should mention deadbeef, got: {err}"
+        );
+        assert!(
+            err.contains("Delete"),
+            "err should instruct user to Delete the pin file, got: {err}"
+        );
+        assert!(
+            err.contains("RAYRUST_DOWNLOAD=1"),
+            "err should mention rebuilding with RAYRUST_DOWNLOAD=1, got: {err}"
+        );
+    }
+
+    #[test]
+    fn require_hint_excludes_rayrust_download_and_preserves_fatal() {
+        assert!(FIX_HINT_NO_DOWNLOAD.contains("RAY_CPP_DIR"));
+        assert!(FIX_HINT_NO_DOWNLOAD.contains("ray[cpp]"));
+        assert!(!FIX_HINT_NO_DOWNLOAD.contains("RAYRUST_DOWNLOAD"));
+
+        let base = test_case_dir("require_hint");
+        let args = Args {
+            ray_cpp_dir: None,
+            ray_version: "2.60.0".to_string(),
+            cache_root: base.join("empty-cache"),
+            python3: None,
+            download: false,
+        };
+        let failure = resolve_inner(&args, false).expect_err("missing SDK fails");
+        let msg = format_require_failure(failure);
+        assert!(msg.contains("Ray C++ SDK not found."), "msg was: {msg}");
+        assert!(msg.ends_with(FIX_HINT_NO_DOWNLOAD), "msg was: {msg}");
+        assert!(
+            !msg.contains("RAYRUST_DOWNLOAD"),
+            "require() failure message must not mention RAYRUST_DOWNLOAD, got: {msg}"
+        );
+
+        let fatal_msg = format_require_failure(ResolveFailure::Fatal(
+            "invalid pin file /x: bad. Delete /x and rebuild.".to_string(),
+        ));
+        assert_eq!(
+            fatal_msg,
+            "invalid pin file /x: bad. Delete /x and rebuild."
+        );
+    }
+
+    #[test]
+    fn move_extracted_sdk_reuses_valid_target_and_reports_corrupt_target() {
+        let base = test_case_dir("move_extracted_sdk");
+
+        let extracted_corrupt = base.join("extracted-1");
+        populate_fake_sdk(&extracted_corrupt);
+        let corrupt_target = base.join("target-corrupt");
+        fs::create_dir_all(&corrupt_target).expect("create corrupt target");
+        fs::write(corrupt_target.join("leftover"), b"partial").expect("write leftover");
+
+        let err = move_extracted_sdk(&extracted_corrupt, &corrupt_target).unwrap_err();
+        assert!(
+            err.contains(&format!(
+                "{} exists but is not a usable SDK — delete it and rebuild",
+                corrupt_target.display()
+            )),
+            "err was: {err}"
+        );
+
+        let extracted_race = base.join("extracted-2");
+        populate_fake_sdk(&extracted_race);
+        let valid_target = base.join("target-valid");
+        populate_fake_sdk(&valid_target);
+        move_extracted_sdk(&extracted_race, &valid_target)
+            .expect("existing valid target succeeds on concurrent rename race");
+    }
+
+    #[test]
+    fn resolve_reports_download_disabled_and_formats_all_warnings() {
+        let base = test_case_dir("download_disabled_and_warnings");
+        let disabled_args = Args {
+            ray_cpp_dir: None,
+            ray_version: "2.60.0".to_string(),
+            cache_root: base.join("empty-cache"),
+            python3: None,
+            download: false,
+        };
+        let err_disabled = resolve(&disabled_args).unwrap_err();
+        assert!(
+            err_disabled.contains(
+                "download: disabled (set RAYRUST_DOWNLOAD=1 to download ray-cpp 2.60.0 from PyPI)"
+            ),
+            "err was: {err_disabled}"
+        );
+
+        let enabled_args = Args {
+            download: true,
+            ..disabled_args
+        };
+        let err_enabled = resolve(&enabled_args).unwrap_err();
+        assert!(
+            !err_enabled.contains("download: disabled"),
+            "err was: {err_enabled}"
+        );
+
+        let dir = PathBuf::from("/opt/ray/cpp");
+        let digest = "43433cf59e2c5f41c0a4b2dbe3aa87a664a8ed1f00cbccf06967fd9819e1dac0";
+        assert_eq!(
+            format_warning(
+                &Sdk {
+                    cpp_dir: dir.clone(),
+                    version: "2.51.1".to_string(),
+                    sha256: None,
+                },
+                Source::Env,
+            ),
+            "cargo:warning=Using Ray C++ SDK at /opt/ray/cpp (from RAY_CPP_DIR, version not checked)"
+        );
+        assert_eq!(
+            format_warning(
+                &Sdk {
+                    cpp_dir: dir.clone(),
+                    version: "2.60.0".to_string(),
+                    sha256: None,
+                },
+                Source::Cache,
+            ),
+            "cargo:warning=Using Ray C++ SDK at /opt/ray/cpp (from cache, Ray 2.60.0)"
+        );
+        assert_eq!(
+            format_warning(
+                &Sdk {
+                    cpp_dir: dir.clone(),
+                    version: "2.60.0".to_string(),
+                    sha256: Some(digest.to_string()),
+                },
+                Source::Cache,
+            ),
+            format!(
+                "cargo:warning=Using Ray C++ SDK at /opt/ray/cpp (from cache, Ray 2.60.0, sha256 {digest})"
+            )
+        );
+        assert_eq!(
+            format_warning(
+                &Sdk {
+                    cpp_dir: dir.clone(),
+                    version: "2.51.1".to_string(),
+                    sha256: None,
+                },
+                Source::Python,
+            ),
+            "cargo:warning=Using Ray C++ SDK at /opt/ray/cpp (from python3, Ray 2.51.1)"
+        );
+        assert_eq!(
+            format_warning(
+                &Sdk {
+                    cpp_dir: dir,
+                    version: "2.60.0".to_string(),
+                    sha256: Some(digest.to_string()),
+                },
+                Source::Download,
+            ),
+            format!(
+                "cargo:warning=Using Ray C++ SDK at /opt/ray/cpp (from download, Ray 2.60.0, sha256 {digest})"
+            )
+        );
     }
 }
