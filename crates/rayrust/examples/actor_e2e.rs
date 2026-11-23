@@ -165,6 +165,8 @@ async fn main() {
         sum += res.unwrap();
     }
     println!("   50 concurrent increments: sum={} in {:?}", sum, t0.elapsed());
+    // Fifty increments of one from zero return 1..=50, whose sum is 1275.
+    assert_eq!(sum, (1..=50).sum::<i64>(), "50 concurrent increments of 1");
     println!();
 
     // 6. Reset
@@ -182,27 +184,22 @@ async fn main() {
     let opts = ActorOptions::new()
         .name("counter_gpu")
         .resource("CPU", 1.0);
-    match counter_actor_create(&ray, &opts, 42i64) {
-        Ok(h) => {
-            let r = counter_get(&ray, &h).await.expect("call failed");
-            let v: i64 = r.get_async().await.expect("get failed");
-            println!("   Named actor with CPU=1: get() = {} (expect 42)", v);
-            assert_eq!(v, 42);
+    let h = counter_actor_create(&ray, &opts, 42i64).expect("resource actor create failed");
+    let r = counter_get(&ray, &h).await.expect("call failed");
+    let v: i64 = r.get_async().await.expect("get failed");
+    println!("   Named actor with CPU=1: get() = {} (expect 42)", v);
+    assert_eq!(v, 42);
 
-            // Look up by name (cross-namespace lookup demo)
-            match ray.get_actor("counter_gpu", "") {
-                Ok(Some(found)) => {
-                    println!("   get_actor(\"counter_gpu\") found (id_len={})", found.id().len());
-                }
-                Ok(None) => println!("   get_actor(\"counter_gpu\") not found"),
-                Err(e) => println!("   get_actor error: {}", e),
-            }
+    // Look up by name (cross-namespace lookup demo)
+    let found = ray
+        .get_actor("counter_gpu", "")
+        .expect("get_actor(\"counter_gpu\") failed")
+        .expect("get_actor(\"counter_gpu\") did not find the named actor");
+    println!("   get_actor(\"counter_gpu\") found (id_len={})", found.id().len());
+    assert_eq!(found.id(), h.id(), "get_actor returns the named actor's id");
 
-            let _ = ray.kill_actor(&h, true);
-            println!("   Resource scheduling OK\n");
-        }
-        Err(e) => println!("   Resource scheduling failed: {}\n", e),
-    }
+    let _ = ray.kill_actor(&h, true);
+    println!("   Resource scheduling OK\n");
 
     let _ = ray.kill_actor(&handle, true);
     let _ = ray.kill_actor(&handle2, true);

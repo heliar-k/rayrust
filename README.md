@@ -454,6 +454,15 @@ fn main() {
 | `actor_e2e` | Rust actor e2e with `#[actor]` macro |
 | `raybench` | Performance benchmark (Rust vs Python) |
 
+## Continuous Integration
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on `ubuntu-24.04` (`linux/x86_64` only; macOS, Windows, and `linux/aarch64` are not tested in CI) using `actions/setup-python@v7` (Python 3.12):
+
+- **`build` job** — downloads and extracts the `ray-cpp` wheel for each Ray version in the matrix (`2.49.0`, `2.51.1`, `2.55.0`, `2.60.0`), sets `RAY_CPP_DIR` to the extracted `ray/cpp`, and runs `cargo build --release --all-targets`, `cargo test`, `cargo test --release`, `cargo test --doc`, and `cargo doc --no-deps`. On the `2.60.0` matrix entry it also unsets `RAY_CPP_DIR` with a fresh `RAYRUST_CACHE_DIR` to verify the PyPI auto-download branch on a cold cache (`(from download)`) followed by cache reuse (`(from cache)`).
+- **`cluster` job** — installs `ray[cpp]==2.51.1` via `actions/setup-python@v7` (Python 3.12) without setting `RAY_CPP_DIR` (exercising `python3` SDK discovery), sets `RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE=1` so an object store larger than `/dev/shm` falls back to Ray's own temporary directory, starts a single-node Ray cluster (`ray start --head --num-cpus=2`), runs the `full_test`, `actor_e2e`, and `async_demo` examples, and stops the cluster with `ray stop --force`.
+
+`cargo fmt --check` and `cargo clippy` are omitted because the repository carries pre-existing `rustfmt` diffs and `clippy` warnings on `main`.
+
 ## License
 
 Apache-2.0 (same as Ray)
