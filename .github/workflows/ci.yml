@@ -57,20 +57,21 @@ jobs:
       - name: Build documentation
         run: cargo doc --no-deps
 
-      - name: Resolve the SDK through the download branch
+      - name: Resolve the SDK through the opt-in download branch
         if: matrix.ray == '2.60.0'
         env:
           RAYRUST_CACHE_DIR: ${{ runner.temp }}/sdk-cache
+          RAYRUST_DOWNLOAD: '1'
         run: |
           set -o pipefail
           cargo clean -p rayrust-sys
           first="$(env -u RAY_CPP_DIR cargo build -p rayrust-sys -v 2>&1)"
           printf '%s\n' "$first"
-          grep -q '(from download)' <<< "$first"
+          grep -q '(from download, Ray 2.60.0, sha256 ' <<< "$first"
           cargo clean -p rayrust-sys
           second="$(env -u RAY_CPP_DIR cargo build -p rayrust-sys -v 2>&1)"
           printf '%s\n' "$second"
-          grep -q '(from cache)' <<< "$second"
+          grep -q '(from cache, Ray 2.60.0, sha256 ' <<< "$second"
 
   cluster:
     name: Cluster E2E (Ray 2.51.1)

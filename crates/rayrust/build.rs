@@ -3,6 +3,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RAY_CPP_DIR");
     println!("cargo:rerun-if-env-changed=RAY_VERSION");
     println!("cargo:rerun-if-env-changed=RAYRUST_CACHE_DIR");
+    println!("cargo:rerun-if-env-changed=RAYRUST_DOWNLOAD");
     println!("cargo:rerun-if-env-changed=HOME");
     println!("cargo:rerun-if-env-changed=PWD");
     println!("cargo:rerun-if-env-changed=PATH");
