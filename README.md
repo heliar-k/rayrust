@@ -32,7 +32,7 @@ rayrust wraps the Ray C++ SDK (`libray_api.so`) via a C ABI layer, providing idi
 | XLANG header auto-detection (Ray 2.51.1+ compatible) | ✅ | ✅ |
 | `rmpv::Value` dynamic deserialization | ✅ | ✅ |
 | `put_xlang` (writes the xlang header into the stored data; Python still rejects it for lack of metadata, see #21) | ✅ | ✅ |
-| `ray_last_error()` (thread-local error messages) | ✅ | ✅ |
+| `ray_last_error_bytes()` (thread-local error bytes + length, UTF-8 lossy in Rust) | ✅ | ✅ |
 
 ## Quick Start
 
@@ -309,7 +309,7 @@ The public headers shipped in the wheel (`include/ray/api.h`, `include/ray/api/*
 | `rmpv::Value` for dynamic types | Python returns unknown types at compile time |
 | Persistent global tokio runtime | Avoid per-call runtime creation overhead |
 | `#[actor]` macro | Reduces 40 lines of boilerplate to 10 |
-| Thread-local `ray_last_error()` | Structured error propagation from C++ to Rust |
+| Thread-local `ray_last_error_bytes()` | Length-delimited error propagation from C++ to Rust (UTF-8 lossy conversion) |
 | `clear_error()` before FFI call | Prevents stale errors from prior operations |
 
 ## Design Paradigm
@@ -468,7 +468,7 @@ fn main() {
 GitHub Actions (`.github/workflows/ci.yml`) runs on `ubuntu-24.04` (`linux/x86_64` only; macOS, Windows, and `linux/aarch64` are not tested in CI) using `actions/setup-python@v7` (Python 3.12):
 
 - **`build` job** — downloads and extracts the `ray-cpp` wheel for each Ray version in the matrix (`2.49.0`, `2.51.1`, `2.55.0`, `2.60.0`), sets `RAY_CPP_DIR` to the extracted `ray/cpp`, and runs `cargo build --release --all-targets`, `cargo test`, `cargo test --release`, `cargo test --doc`, and `cargo doc --no-deps`. On the `2.60.0` matrix entry it also unsets `RAY_CPP_DIR` with a fresh `RAYRUST_CACHE_DIR` and `RAYRUST_DOWNLOAD=1` to verify the opt-in PyPI download branch on a cold cache (the warning names the wheel digest: `(from download, Ray 2.60.0, sha256 <digest>)`) followed by cache reuse (`(from cache, Ray 2.60.0, sha256 <digest>)`).
-- **`cluster` job** — installs `ray[cpp]==2.51.1` via `actions/setup-python@v7` (Python 3.12) without setting `RAY_CPP_DIR` (exercising `python3` SDK discovery), sets `RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE=1` so an object store larger than `/dev/shm` falls back to Ray's own temporary directory, starts a single-node Ray cluster (`ray start --head --num-cpus=2`), runs the `full_test`, `actor_e2e`, and `async_demo` examples, and stops the cluster with `ray stop --force`.
+- **`cluster` job** — installs `ray[cpp]==2.51.1` via `actions/setup-python@v7` (Python 3.12) without setting `RAY_CPP_DIR` (exercising `python3` SDK discovery), sets `RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE=1` so an object store larger than `/dev/shm` falls back to Ray's own temporary directory, starts a single-node Ray cluster (`ray start --head --num-cpus=2`), runs the `full_test`, `actor_e2e`, `async_demo`, and `error_kinds_test` examples, and stops the cluster with `ray stop --force`.
 
 `cargo fmt --check` and `cargo clippy` are omitted because the repository carries pre-existing `rustfmt` diffs and `clippy` warnings on `main`.
 

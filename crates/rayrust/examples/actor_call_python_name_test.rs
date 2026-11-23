@@ -9,7 +9,8 @@
 //! `execute_task`）→ `:1873`，那一行是
 //! `function_name = execution_info.function_name`，抛
 //! `AttributeError: 'dict' object has no attribute 'function_name'`；驱动第一次读值
-//! 只得到 `Actor error ... unknown FFI error`，这个 actor 之后不能再调用。C 入口
+//! 得到 `RayError::Actor` 变体（消息里是 SDK 记录的载荷按 UTF-8 lossy 呈现），这个
+//! actor 之后不能再调用。C 入口
 //! `ray_actor_call_python` 在 id 宽度检查之后、取运行时之前拒掉空方法名（两种情形都
 //! 拒，包括方法存在的那种），消息以 `the method name is empty` 开头；被拒的调用不提交
 //! 任务，actor 照常活着。带内部 NUL

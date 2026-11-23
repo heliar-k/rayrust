@@ -30,7 +30,7 @@ Ray 的 Rust SDK —— 通过 FFI 封装 Ray C++ SDK，提供地道的 Rust API
 | XLANG header 自动检测（兼容 Ray 2.51.1+） | ✅ | ✅ |
 | `rmpv::Value` 动态反序列化 | ✅ | ✅ |
 | `put_xlang`（把 xlang 头写进存入的数据；Python 侧仍因缺 metadata 拒收，见 #21） | ✅ | ✅ |
-| `ray_last_error()`（线程局部错误消息） | ✅ | ✅ |
+| `ray_last_error_bytes()`（带长度的线程局部错误字节，按 UTF-8 lossy 转换） | ✅ | ✅ |
 
 ## 快速开始
 
@@ -286,7 +286,7 @@ wheel 附带的公开头文件（`include/ray/api.h`、`include/ray/api/*.h`）�
 | `rmpv::Value` 动态类型 | Python 返回类型编译时未知 |
 | 持久化全局 tokio runtime | 避免每次调用创建 runtime 的开销 |
 | `#[actor]` 宏 | 将 40 行样板代码减少到 10 行 |
-| 线程局部 `ray_last_error()` | 从 C++ 到 Rust 的结构化错误传递 |
+| 线程局部 `ray_last_error_bytes()` | 带长度的错误字节从 C++ 传到 Rust，按 UTF-8 lossy 转换 |
 | FFI 调用前 `clear_error()` | 防止上次操作的残留错误被误报 |
 
 ## 编程范式
@@ -443,7 +443,7 @@ fn main() {
 GitHub Actions（`.github/workflows/ci.yml`）在 `ubuntu-24.04` 上通过 `actions/setup-python@v7`（Python 3.12）运行，仅验证 `linux/x86_64` 平台（CI 未测试 macOS、Windows 与 `linux/aarch64`）：
 
 - **`build` 任务** — 按版本矩阵（`2.49.0`、`2.51.1`、`2.55.0`、`2.60.0`）逐一下载并解压 `ray-cpp` wheel，将 `RAY_CPP_DIR` 指向解压出的 `ray/cpp` 目录，依次执行 `cargo build --release --all-targets`、`cargo test`、`cargo test --release`、`cargo test --doc` 与 `cargo doc --no-deps`；并在 `2.60.0` 矩阵项上清除 `RAY_CPP_DIR`、设置 `RAYRUST_DOWNLOAD=1` 与全新 `RAYRUST_CACHE_DIR` 验证显式开启的 PyPI 下载分支（首次空缓存下载的警告带有 wheel 摘要：`(from download, Ray 2.60.0, sha256 <digest>)`，再次构建复用缓存断言 `(from cache, Ray 2.60.0, sha256 <digest>)`）。
-- **`cluster` 任务** — 通过 `actions/setup-python@v7`（Python 3.12）安装 `ray[cpp]==2.51.1` 且不设置 `RAY_CPP_DIR`（验证通过 `python3` 查找已安装 SDK 的路径），设置 `RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE=1` 使对象存储大小超过 `/dev/shm` 时回退到 Ray 自己的临时目录，随后启动单节点集群（`ray start --head --num-cpus=2`），依次运行 `full_test`、`actor_e2e` 与 `async_demo` 三个示例，最后执行 `ray stop --force` 停止集群。
+- **`cluster` 任务** — 通过 `actions/setup-python@v7`（Python 3.12）安装 `ray[cpp]==2.51.1` 且不设置 `RAY_CPP_DIR`（验证通过 `python3` 查找已安装 SDK 的路径），设置 `RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE=1` 使对象存储大小超过 `/dev/shm` 时回退到 Ray 自己的临时目录，随后启动单节点集群（`ray start --head --num-cpus=2`），依次运行 `full_test`、`actor_e2e`、`async_demo` 与 `error_kinds_test` 四个示例，最后执行 `ray stop --force` 停止集群。
 
 CI 未包含 `cargo fmt --check` 与 `cargo clippy`：仓库在 `main` 分支上已存在既有的 `rustfmt` 格式差异与 `clippy` 警告，`cargo fmt --check` 在 `main` 上无法通过。
 

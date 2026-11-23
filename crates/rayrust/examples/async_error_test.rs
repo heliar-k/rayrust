@@ -64,10 +64,9 @@ fn cancel_running(ray: &Ray, obj_ref: &ObjectRef<()>, label: &str) {
 
 /// A task that raises must report the failure itself, not run into the deadline.
 ///
-/// The message text is not asserted: a Python failure crosses the C ABI as the
-/// binary msgpack payload of a RayTaskError, which the C string error channel
-/// cannot carry, so the detail reads "unknown FFI error". Readable task text
-/// only exists for workers that report plain strings.
+/// Only the error variant and elapsed time are asserted here: a Python failure
+/// crosses the C ABI as the binary payload of a `RayTaskException` rendered
+/// through `String::from_utf8_lossy`.
 async fn check_failed_task(ray: &Ray) {
     println!("\n--- 1. A failed task returns at once ---");
     // add() takes two arguments; one string makes the worker raise TypeError.
@@ -75,7 +74,11 @@ async fn check_failed_task(ray: &Ray) {
     let obj_ref = ray
         .task_call_python(PYTHON_MODULE, "add", &[&arg], &[])
         .expect("submit add() with one argument");
-    println!("  ray.{}.add(<one string arg>) → {}", PYTHON_MODULE, obj_ref.id_hex());
+    println!(
+        "  ray.{}.add(<one string arg>) → {}",
+        PYTHON_MODULE,
+        obj_ref.id_hex()
+    );
 
     let start = Instant::now();
     let result = obj_ref
@@ -246,10 +249,7 @@ async fn main() {
 
     let python_dir = python_module_dir();
     println!("Python module dir: {}", python_dir);
-    let runtime_env = format!(
-        "{{\"env_vars\": {{\"PYTHONPATH\": \"{}\"}}}}",
-        python_dir
-    );
+    let runtime_env = format!("{{\"env_vars\": {{\"PYTHONPATH\": \"{}\"}}}}", python_dir);
 
     let config = RayConfig::new(&address)
         .node_ip(&node_ip)

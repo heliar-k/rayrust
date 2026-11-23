@@ -105,6 +105,7 @@ jobs:
           cargo run --release --example full_test
           cargo run --release --example actor_e2e
           cargo run --release --example async_demo
+          cargo run --release --example error_kinds_test
 
       - name: Stop Ray cluster
         if: always()

@@ -178,7 +178,12 @@ extern "C" {
         ray_namespace: *const c_char,
         out_meta: *mut RayActorHandleMeta,
     ) -> RayBytes;
-    pub fn ray_cancel(id_data: *const c_char, id_len: usize, force_kill: bool, recursive: bool) -> c_int;
+    pub fn ray_cancel(
+        id_data: *const c_char,
+        id_len: usize,
+        force_kill: bool,
+        recursive: bool,
+    ) -> c_int;
     pub fn ray_get_many(ids: *const RayBytes, count: usize, timeout_ms: c_int) -> *mut RayBytes;
     pub fn ray_free_bytes_array(array: *mut RayBytes, count: usize);
 
@@ -187,7 +192,7 @@ extern "C" {
     pub fn ray_free_bools(ptr: *mut bool);
 
     // Error Handling
-    pub fn ray_last_error() -> *const c_char;
+    pub fn ray_last_error_bytes(data: *mut *const c_char, len: *mut usize);
     pub fn ray_last_error_kind() -> c_int;
     pub fn ray_clear_error();
 }
@@ -265,20 +270,19 @@ pub fn to_cstring(s: &str) -> CString {
     CString::new(s).unwrap_or_else(|_| CString::new("").unwrap())
 }
 
-/// Get the last error message from the C wrapper (thread-local).
-/// Returns None if no error is set.
+/// 读取当前线程在 C 包装层记录的最后一条错误消息。
+///
+/// 记录了什么就返回什么，非 UTF-8 字节以替换字符（U+FFFD）呈现；只有当前线程
+/// 没有记录错误时才返回 `None`。
 pub fn last_error() -> Option<String> {
-    unsafe {
-        let ptr = ray_last_error();
-        if ptr.is_null() {
-            None
-        } else {
-            std::ffi::CStr::from_ptr(ptr)
-                .to_str()
-                .ok()
-                .map(|s| s.to_string())
-        }
+    let mut data: *const c_char = std::ptr::null();
+    let mut len: usize = 0;
+    unsafe { ray_last_error_bytes(&mut data, &mut len) };
+    if data.is_null() {
+        return None;
     }
+    let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, len) };
+    Some(String::from_utf8_lossy(bytes).into_owned())
 }
 
 /// Clear the last error message and its kind.
