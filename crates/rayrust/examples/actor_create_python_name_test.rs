@@ -2,8 +2,8 @@
 //!
 //! Python actor 由 module 与 class 两个名字确定，worker 在自己的 Python 侧解析它们，
 //! 所以任何一个为空都交出一个跑不起来的 actor：驱动只提交创建任务，调用方拿到 `Ok`
-//! 与 16 字节 id，第一次读值得到 `RayError::Actor` 变体（消息里是 SDK 记录的载荷按
-//! UTF-8 lossy 呈现）。空 module 名在
+//! 与 16 字节 id，第一次读值得到 `RayError::Actor` 变体（消息为从错误载荷提取出的错误
+//! 文本，无法提取时按 UTF-8 lossy 呈现原始字节）。空 module 名在
 //! `python/ray/_private/function_manager.py:531`（`load_actor_class`）→ `:589`
 //! （`_load_actor_class_from_local`）→ `:138`（`load_function_or_class_from_local`）→
 //! `importlib.import_module(module_name)` 抛 `ValueError: Empty module name`；空 class

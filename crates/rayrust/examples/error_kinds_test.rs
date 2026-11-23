@@ -144,7 +144,7 @@ fn main() {
     }
 
     // ── A Python task that raises ValueError ───────────────
-    println!("\n--- Python task failure: binary payload preserves class and text ---");
+    println!("\n--- Python task failure: formatted traceback extracted from payload ---");
     let fail_arg = serialize(&PYTHON_FAIL_MESSAGE).expect("serialize the failure message");
     let py_failed = ray
         .task_call_python(PYTHON_MODULE, PYTHON_FAIL_FUNCTION, &[&fail_arg], &[])
@@ -185,19 +185,33 @@ fn main() {
                 msg.len(),
                 hex_prefix(msg.as_bytes(), 32)
             );
+            println!("    decoded message:\n{}", msg);
+            // `RayError.to_bytes`（`ray/exceptions.py:29-37`）对 `RayTaskError` 调用
+            // `format_exception` 生成字段 3，而 `RayTaskError.__str__`
+            // （`ray/exceptions.py:246-309`，`:261-275`）把原始 `"Traceback "` 行改写成
+            // `proctitle() (pid=..., ip=...)`，因此字段 3 以
+            // `"ray.exceptions.RayTaskError: "` 开头，后接 `File ".../rayrust_test.py"` 调用帧与
+            // `"ValueError: ..."`。
+            let expected_value_error = format!("ValueError: {}", PYTHON_FAIL_MESSAGE);
             assert!(
-                !msg.trim().is_empty(),
-                "the Python task error carries an empty message"
-            );
-            assert!(
-                !msg.contains("unknown FFI error"),
-                "the Python task error fell back to 'unknown FFI error': {}",
+                msg.starts_with("ray_get: ray.exceptions.RayTaskError:"),
+                "the Python task error does not start with 'ray_get: ray.exceptions.RayTaskError:': {:?}",
                 msg
             );
             assert!(
-                msg.contains(PYTHON_FAIL_MESSAGE),
-                "the Python task error does not contain {:?}: {}",
-                PYTHON_FAIL_MESSAGE,
+                msg.contains("rayrust_test.py") && msg.contains("in fail"),
+                "the Python task error does not contain the Python stack frame: {:?}",
+                msg
+            );
+            assert!(
+                msg.contains(&expected_value_error),
+                "the Python task error does not contain {:?}: {:?}",
+                expected_value_error,
+                msg
+            );
+            assert!(
+                !msg.contains('\u{FFFD}'),
+                "the Python task error still contains replacement characters: {:?}",
                 msg
             );
         }

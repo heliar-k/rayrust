@@ -32,7 +32,7 @@ rayrust wraps the Ray C++ SDK (`libray_api.so`) via a C ABI layer, providing idi
 | XLANG header auto-detection (Ray 2.51.1+ compatible) | ✅ | ✅ |
 | `rmpv::Value` dynamic deserialization | ✅ | ✅ |
 | `put_xlang` (writes the xlang header into the stored data; Python still rejects it for lack of metadata, see #21) | ✅ | ✅ |
-| `ray_last_error_bytes()` (thread-local error bytes + length, UTF-8 lossy in Rust) | ✅ | ✅ |
+| `ray_last_error_bytes()` (thread-local error bytes + length; Rust extracts formatted exception text with UTF-8 lossy fallback) | ✅ | ✅ |
 
 ## Quick Start
 
@@ -309,7 +309,7 @@ The public headers shipped in the wheel (`include/ray/api.h`, `include/ray/api/*
 | `rmpv::Value` for dynamic types | Python returns unknown types at compile time |
 | Persistent global tokio runtime | Avoid per-call runtime creation overhead |
 | `#[actor]` macro | Reduces 40 lines of boilerplate to 10 |
-| Thread-local `ray_last_error_bytes()` | Length-delimited error propagation from C++ to Rust (UTF-8 lossy conversion) |
+| Thread-local `ray_last_error_bytes()` | Length-delimited error propagation from C++ to Rust; `last_error()` extracts formatted exception text with UTF-8 lossy fallback |
 | `clear_error()` before FFI call | Prevents stale errors from prior operations |
 
 ## Design Paradigm
@@ -354,7 +354,7 @@ let futs = (0..10).map(|i| add_remote_async(&ray, i, 1));
 
 ### Error Handling — `Result` everywhere, no hidden panics
 
-`put`, `kill_actor`, `get_actor`, and every macro-generated caller return `Result`: argument serialization and task/actor submission errors both reach the caller instead of panicking. The C ABI's thread-local `last_error()` is checked after FFI calls and `clear_error()` is called before to prevent stale errors.
+`put`, `kill_actor`, `get_actor`, and every macro-generated caller return `Result`: argument serialization and task/actor submission errors both reach the caller instead of panicking. The C ABI's thread-local `last_error()` is checked after FFI calls and `clear_error()` is called before to prevent stale errors. Failed tasks and actors carry the formatted exception text (such as a Python traceback) extracted from the error payload, falling back to UTF-8 lossy rendering of the raw bytes.
 
 ## Benchmark
 

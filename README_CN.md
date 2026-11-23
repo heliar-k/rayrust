@@ -30,7 +30,7 @@ Ray 的 Rust SDK —— 通过 FFI 封装 Ray C++ SDK，提供地道的 Rust API
 | XLANG header 自动检测（兼容 Ray 2.51.1+） | ✅ | ✅ |
 | `rmpv::Value` 动态反序列化 | ✅ | ✅ |
 | `put_xlang`（把 xlang 头写进存入的数据；Python 侧仍因缺 metadata 拒收，见 #21） | ✅ | ✅ |
-| `ray_last_error_bytes()`（带长度的线程局部错误字节，按 UTF-8 lossy 转换） | ✅ | ✅ |
+| `ray_last_error_bytes()`（带长度的线程局部错误字节；Rust 提取格式化异常文本，失败时按 UTF-8 lossy 回退） | ✅ | ✅ |
 
 ## 快速开始
 
@@ -286,7 +286,7 @@ wheel 附带的公开头文件（`include/ray/api.h`、`include/ray/api/*.h`）�
 | `rmpv::Value` 动态类型 | Python 返回类型编译时未知 |
 | 持久化全局 tokio runtime | 避免每次调用创建 runtime 的开销 |
 | `#[actor]` 宏 | 将 40 行样板代码减少到 10 行 |
-| 线程局部 `ray_last_error_bytes()` | 带长度的错误字节从 C++ 传到 Rust，按 UTF-8 lossy 转换 |
+| 线程局部 `ray_last_error_bytes()` | 带长度的错误字节从 C++ 传到 Rust，`last_error()` 提取格式化异常文本并在无法提取时按 UTF-8 lossy 呈现原始字节 |
 | FFI 调用前 `clear_error()` | 防止上次操作的残留错误被误报 |
 
 ## 编程范式
@@ -331,7 +331,7 @@ let futs = (0..10).map(|i| add_remote_async(&ray, i, 1));
 
 ### 错误处理 —— 全部 `Result`，无隐藏 panic
 
-`put`、`kill_actor`、`get_actor` 与全部宏生成的调用器都返回 `Result`：参数序列化错误与任务、actor 提交错误都回到调用方，不变成 panic。C ABI 的线程局部 `last_error()` 在 FFI 调用后检查，调用前 `clear_error()` 防止残留错误。
+`put`、`kill_actor`、`get_actor` 与全部宏生成的调用器都返回 `Result`：参数序列化错误与任务、actor 提交错误都回到调用方，不变成 panic。C ABI 的线程局部 `last_error()` 在 FFI 调用后检查，调用前 `clear_error()` 防止残留错误。失败的任务与 actor 从错误载荷中提取格式化异常文本（如 Python traceback），无法提取时按 UTF-8 lossy 呈现原始字节。
 
 Rust vs Python 在 Ray 集群上（500 个任务）：
 
