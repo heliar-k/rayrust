@@ -13,3 +13,6 @@ rayrust-sys = { path = "../rayrust-sys" }
 ctor = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1", features = ["rt", "time"] }
+
+[build-dependencies]
+rayrust-build = { path = "../rayrust-build", version = "0.2.1" }

@@ -162,6 +162,7 @@ version = "0.2.1"
 dependencies = [
  "ctor",
  "libc",
+ "rayrust-build",
  "rayrust-macros",
  "rayrust-sys",
  "rmp-serde",
@@ -173,11 +174,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rayrust-build"
+version = "0.2.1"
+
+[[package]]
 name = "rayrust-example-worker"
 version = "0.1.0"
 dependencies = [
  "ctor",
  "rayrust",
+ "rayrust-build",
  "rayrust-sys",
  "serde",
  "tokio",
@@ -197,6 +203,7 @@ name = "rayrust-sys"
 version = "0.2.1"
 dependencies = [
  "cc",
+ "rayrust-build",
 ]
 
 [[package]]

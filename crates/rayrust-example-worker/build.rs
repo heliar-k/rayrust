@@ -1,57 +1,34 @@
 fn main() {
-    // Locate ray[cpp] — same logic as rayrust-sys/build.rs
-    let ray_cpp_dir = std::env::var("RAY_CPP_DIR").ok().or_else(|| {
-        let output = std::process::Command::new("python3")
-            .args([
-                "-c",
-                "import ray, os, sys\n\
-                 for p in sys.path:\n\
-                 \x20   c = os.path.join(p, 'ray', 'cpp')\n\
-                 \x20   h = os.path.join(c, 'include', 'ray', 'api.h')\n\
-                 \x20   l = os.path.join(c, 'lib', 'libray_api.so')\n\
-                 \x20   if os.path.exists(h) and os.path.exists(l):\n\
-                 \x20       print(c); break\n",
-            ])
-            .output()
-            .ok()?;
-        let s = String::from_utf8(output.stdout).ok()?;
-        let s = s.trim();
-        if s.is_empty() { None } else { Some(s.to_string()) }
-    });
+    let sdk = rayrust_build::resolve_or_download();
+    let lib_dir = sdk.lib_dir();
 
-    // Also check cached SDK (same cache as rayrust-sys/build.rs)
-    let ray_cpp_dir = ray_cpp_dir.or_else(|| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let cache_dir = std::path::PathBuf::from(&home)
-            .join(".cache")
-            .join("rayrust");
-        let dir = cache_dir.join("ray-cpp-2.51.1");
-        let lib = dir.join("lib").join("libray_api.so");
-        if lib.exists() {
-            return Some(dir.to_string_lossy().to_string());
-        }
-        None
-    });
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=RAY_CPP_DIR");
+    println!("cargo:rerun-if-env-changed=RAY_VERSION");
+    println!("cargo:rerun-if-env-changed=RAYRUST_CACHE_DIR");
+    println!("cargo:rerun-if-env-changed=HOME");
+    println!("cargo:rerun-if-env-changed=PWD");
+    println!("cargo:rerun-if-env-changed=PATH");
+    println!("cargo:rerun-if-env-changed=PYTHONPATH");
 
-    if let Some(ref dir) = ray_cpp_dir {
-        let lib_dir = std::path::PathBuf::from(dir).join("lib");
-        println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
 
-        // ── RPATH: ensure librayrust_worker.so can find libray_api.so at runtime ──
-        //
-        // Ray's default_worker dlopens librayrust_worker.so. The dynamic linker
-        // searches for NEEDED libs using the loaded .so's RPATH, not the calling
-        // process. Without RPATH, libray_api.so is not found.
-        //
-        // Two entries, searched in order:
-        //   1. $ORIGIN — .so's own directory (deployment: copy libray_api.so alongside)
-        //   2. absolute path to ray/cpp/lib (dev: same machine builds and runs)
-        //
-        // DT_RPATH (--disable-new-dtags) is used instead of DT_RUNPATH because
-        // RPATH is inherited by transitive dlopen dependencies, while RUNPATH is not.
-        println!("cargo:rustc-link-arg-cdylib=-Wl,--disable-new-dtags");
+    // ── RPATH: ensure librayrust_worker.so can find libray_api.so at runtime ──
+    //
+    // Ray's default_worker dlopens librayrust_worker.so. The dynamic linker
+    // searches for NEEDED libs using the loaded .so's RPATH, not the calling
+    // process. Without RPATH, libray_api.so is not found.
+    //
+    // Two entries, searched in order:
+    //   1. $ORIGIN — .so's own directory (deployment: copy libray_api.so alongside)
+    //   2. absolute path to ray/cpp/lib (dev: same machine builds and runs)
+    //
+    // DT_RPATH (--disable-new-dtags) is used instead of DT_RUNPATH because
+    // RPATH is inherited by transitive dlopen dependencies, while RUNPATH is not.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         println!("cargo:rustc-link-arg-cdylib=-Wl,-rpath,$ORIGIN");
-        println!("cargo:rustc-link-arg-cdylib=-Wl,-rpath,{}", lib_dir.display());
+        println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
     }
 
     // Force libray_api.so into NEEDED.

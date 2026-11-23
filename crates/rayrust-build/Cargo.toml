@@ -1,0 +1,9 @@
+[package]
+name = "rayrust-build"
+version = "0.2.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Build-time Ray C++ SDK locator and PyPI wheel downloader for rayrust"
+repository = "https://github.com/NolanHo/rayrust"
+keywords = ["ray", "distributed", "ffi", "cpp"]
+categories = ["development-tools::build-utils", "external-ffi-bindings"]
