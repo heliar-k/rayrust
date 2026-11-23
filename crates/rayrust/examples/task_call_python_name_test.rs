@@ -4,16 +4,16 @@
 //! （`python/ray/_private/function_manager.py:138`），它在任何查找之前就抛
 //! `ValueError: Empty module name`；异常逃出 `task_execution_handler`
 //! （`python/ray/_raylet.pyx:2432` → `:2275`），worker 以 `SYSTEM_ERROR` 退出，
-//! 驱动第一次读值得到 `RayError::Worker` 变体（消息里是 SDK 记录的载荷按 UTF-8
-//! lossy 呈现），worker 池补一个新 worker。C 入口 `ray_task_call_python` 在取
+//! 驱动第一次读值得到 `RayError::Worker` 变体（消息为从错误载荷提取出的错误文本，无法
+//! 提取时按 UTF-8 lossy 呈现原始字节），worker 池补一个新 worker。C 入口 `ray_task_call_python` 在取
 //! 运行时之前就拒掉这个输入，错误里带 `the module name is empty`。
 //!
 //! 空 function 名不拒，因为它能跑通：加载器把名字按点切开、丢掉空片段
 //! （`function_manager.py:139`），空名字查到的是 module 对象本身，加载器把它登记
 //! 成任务的函数（`:391-395`）。普通 module 不可调用，任务就以
 //! `TypeError: 'module' object is not callable` 失败——普通任务失败，worker 活着，
-//! 驱动第一次读值得到 `RayError::Task` 变体，消息里是 SDK 记录的载荷按 UTF-8
-//! lossy 呈现（第 3 项的断言只匹配 `RayError::Task` 变体）；而 module 对象可以可调用
+//! 驱动第一次读值得到 `RayError::Task` 变体，消息为从错误载荷提取出的格式化异常文本
+//! （Python traceback；无法提取时按 UTF-8 lossy 呈现原始字节；第 3 项的断言只匹配 `RayError::Task` 变体）；而 module 对象可以可调用
 //! （`types.ModuleType` 子类带 `__call__`，或者往 `sys.modules` 放可调用对象），那时
 //! 任务真的执行（实测返回 3）。第 3 项断言的就是这条异步语义。
 //!

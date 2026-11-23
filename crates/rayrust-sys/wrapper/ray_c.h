@@ -367,9 +367,10 @@ ray_bytes_t ray_task_call_with_options(const char *func_name,
 /// importlib raises `ValueError: Empty module name` for an empty string — it
 /// raises before any lookup, so a module planted in `sys.modules` under the empty
 /// name does not change that. The exception escapes `task_execution_handler`, the
-/// worker exits with `SYSTEM_ERROR`, the caller's first read gets a worker
-/// error (`RAY_ERROR_KIND_WORKER`) carrying the SDK's binary payload, and the
-/// worker pool starts a replacement worker afterwards.
+/// worker exits with `SYSTEM_ERROR`, the caller's first read fails with
+/// `RAY_ERROR_KIND_WORKER` (whose `RayErrorInfo` message Rust's `last_error()`
+/// extracts from the recorded payload, falling back to UTF-8 lossy bytes), and
+/// the worker pool starts a replacement worker afterwards.
 /// `function_name` is not checked. The loader splits it on dots and throws the
 /// empty pieces away (`function_manager.py:139`), so an empty name resolves to the
 /// module object itself, which `_load_function_from_local` registers as the task's
@@ -521,7 +522,9 @@ ray_bytes_t ray_task_call_python_with_options(const char *module_name,
 /// (`cpp/src/ray/util/function_helper.cc:163-168`, caught at
 /// `task_executor.cc:101-111`): the actor worker stops at
 /// `src/ray/core_worker/core_worker_shutdown_executor.cc:40` and the driver's
-/// first read fails with `RAY_ERROR_KIND_ACTOR` carrying the SDK's payload. A whitespace-only name is not trimmed
+/// first read fails with `RAY_ERROR_KIND_ACTOR` (whose error message Rust's
+/// `last_error()` extracts from the recorded payload, falling back to UTF-8
+/// lossy bytes). A whitespace-only name is not trimmed
 /// and is submitted as it is, as `ray_get_actor` does; a non-empty
 /// name nobody registered keeps Ray's asynchronous semantics, because the driver has
 /// no way to learn which names are registered.
@@ -538,7 +541,8 @@ ray_bytes_t ray_actor_create_with_options(const char *func_name,
 /// both, and the worker resolves them in Python, so either one empty hands out
 /// an actor that never runs: the driver only submits the creation task and the
 /// caller gets `Ok` with a 16-byte id whose first read fails with
-/// `RAY_ERROR_KIND_ACTOR` carrying the SDK's payload. An empty module name fails in
+/// `RAY_ERROR_KIND_ACTOR` (whose error message Rust's `last_error()` extracts
+/// from the recorded payload, falling back to UTF-8 lossy bytes). An empty module name fails in
 /// `python/ray/_private/function_manager.py:531` (`load_actor_class`) → `:589`
 /// (`_load_actor_class_from_local`) → `:138`
 /// (`load_function_or_class_from_local`), where
@@ -641,8 +645,9 @@ ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
 /// calls `execute_task`) and `:1873`, where `execute_task` runs
 /// `function_name = execution_info.function_name` and raises
 /// `AttributeError: 'dict' object has no attribute 'function_name'`; the caller's
-/// first read then fails with `RAY_ERROR_KIND_ACTOR` carrying the SDK's payload
-/// and that actor cannot be called again. This entry refuses the empty name in both cases, including
+/// first read then fails with `RAY_ERROR_KIND_ACTOR` (whose error message Rust's
+/// `last_error()` extracts from the recorded payload, falling back to UTF-8
+/// lossy bytes) and that actor cannot be called again. This entry refuses the empty name in both cases, including
 /// the one where the method exists. The C++ entry `ray_actor_call` refuses an
 /// empty name in the driver as well: its single-argument `RemoteFunctionHolder`
 /// constructor throws `Function not found. Please use RAY_REMOTE to register this

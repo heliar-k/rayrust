@@ -9,6 +9,8 @@
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 
+pub mod error_payload;
+
 // ─── C struct definitions ─────────────────────────────────────
 
 #[repr(C)]
@@ -272,8 +274,8 @@ pub fn to_cstring(s: &str) -> CString {
 
 /// 读取当前线程在 C 包装层记录的最后一条错误消息。
 ///
-/// 记录了什么就返回什么，非 UTF-8 字节以替换字符（U+FFFD）呈现；只有当前线程
-/// 没有记录错误时才返回 `None`。
+/// 能从 Ray 二进制错误载荷中提取出格式化异常文本时直接返回该文本，否则按 UTF-8
+/// lossy 呈现全部原始字节；只有当前线程没有记录错误时才返回 `None`。
 pub fn last_error() -> Option<String> {
     let mut data: *const c_char = std::ptr::null();
     let mut len: usize = 0;
@@ -282,7 +284,7 @@ pub fn last_error() -> Option<String> {
         return None;
     }
     let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, len) };
-    Some(String::from_utf8_lossy(bytes).into_owned())
+    Some(error_payload::render(bytes))
 }
 
 /// Clear the last error message and its kind.

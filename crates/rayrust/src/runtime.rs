@@ -646,15 +646,17 @@ impl Ray {
     /// and importlib raises `ValueError: Empty module name` for an empty string —
     /// it raises before any lookup, so a module planted in `sys.modules` under the
     /// empty name does not change that — and the worker exits with `SYSTEM_ERROR`.
-    /// The first read returns [`RayError::Worker`] with the SDK's payload
-    /// lossily decoded as UTF-8, and the worker pool starts a replacement worker.
+    /// The first read returns [`RayError::Worker`] carrying the worker error
+    /// message extracted from the payload (or the raw payload lossily decoded as
+    /// UTF-8 if extraction fails), and the worker pool starts a replacement worker.
     /// `function` is not checked. The loader splits it on dots and throws the empty
     /// pieces away (`function_manager.py:139`), so an empty name resolves to the
     /// module object itself, which the loader registers as the task's function
     /// (`:391-395`). An ordinary module is not callable, so the task then fails
     /// with `TypeError: 'module' object is not callable`: an ordinary task failure,
     /// where the worker stays alive and the first read returns [`RayError::Task`]
-    /// with the SDK's payload lossily decoded as UTF-8. A module object can be callable, though — a `types.ModuleType`
+    /// carrying the formatted Python traceback extracted from the payload (or the
+    /// raw payload lossily decoded as UTF-8 if extraction fails). A module object can be callable, though — a `types.ModuleType`
     /// subclass with `__call__` assigned to the module's `__class__`, or any
     /// callable placed in `sys.modules` under that name — and then the task runs
     /// and returns that object's result (measured on 2.51.1: such a module
@@ -764,8 +766,9 @@ impl Ray {
     /// (`cpp/src/ray/util/function_helper.cc:163-168`, caught at
     /// `task_executor.cc:101-111`): the actor worker stops at
     /// `src/ray/core_worker/core_worker_shutdown_executor.cc:40` and the driver's
-    /// first read returns [`RayError::Actor`] with the SDK's payload lossily decoded
-    /// as UTF-8. A name with an interior NUL byte
+    /// first read returns [`RayError::Actor`] carrying the actor error message
+    /// extracted from the payload (or the raw payload lossily decoded as UTF-8 if
+    /// extraction fails). A name with an interior NUL byte
     /// reaches the C entry as an empty C string, the same as in [`Ray::get_actor`],
     /// and is refused with it.
     ///
@@ -791,7 +794,8 @@ impl Ray {
     /// both and the worker resolves them in Python, so an empty name hands out an
     /// actor that never runs: the driver only submits the creation task and the
     /// caller gets `Ok` with a 16-byte id whose first read returns
-    /// [`RayError::Actor`] with the SDK's payload lossily decoded as UTF-8. An empty module name fails in
+    /// [`RayError::Actor`] carrying the actor error message extracted from the
+    /// payload (or the raw payload lossily decoded as UTF-8 if extraction fails). An empty module name fails in
     /// `python/ray/_private/function_manager.py:531` (`load_actor_class`) → `:589`
     /// (`_load_actor_class_from_local`) → `:138`
     /// (`load_function_or_class_from_local`), where
@@ -999,8 +1003,9 @@ impl Ray {
     /// `:2291` (which calls `execute_task`) and `:1873`, where `execute_task` runs
     /// `function_name = execution_info.function_name` and raises
     /// `AttributeError: 'dict' object has no attribute 'function_name'`; the first
-    /// read returns [`RayError::Actor`] with the SDK's payload lossily decoded as
-    /// UTF-8 and that actor cannot be called again. The empty name is refused in both cases, including the one where
+    /// read returns [`RayError::Actor`] carrying the actor error message extracted
+    /// from the payload (or the raw payload lossily decoded as UTF-8 if extraction
+    /// fails) and that actor cannot be called again. The empty name is refused in both cases, including the one where
     /// the method exists. A method name with an interior NUL byte is refused by the
     /// same check, because `to_cstring` (`crates/rayrust-sys/src/lib.rs:253-255`,
     /// #27) turns it into an empty C string.

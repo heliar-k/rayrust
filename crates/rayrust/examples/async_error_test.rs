@@ -64,9 +64,10 @@ fn cancel_running(ray: &Ray, obj_ref: &ObjectRef<()>, label: &str) {
 
 /// A task that raises must report the failure itself, not run into the deadline.
 ///
-/// Only the error variant and elapsed time are asserted here: a Python failure
-/// crosses the C ABI as the binary payload of a `RayTaskException` rendered
-/// through `String::from_utf8_lossy`.
+/// Only the error variant and elapsed time are asserted here: `last_error()`
+/// extracts the formatted Python traceback from the `RayTaskException` payload
+/// (falling back to `String::from_utf8_lossy` on raw bytes), and
+/// `error_kinds_test` asserts the message contents.
 async fn check_failed_task(ray: &Ray) {
     println!("\n--- 1. A failed task returns at once ---");
     // add() takes two arguments; one string makes the worker raise TypeError.
