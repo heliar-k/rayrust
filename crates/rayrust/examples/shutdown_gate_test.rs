@@ -28,10 +28,10 @@
 //! 1. 前置对照：建立运行时，`put` 一个整数再 `get` 回来等于原值。
 //! 2. 释放句柄后，`rayrust::sys::ray_is_initialized()` 返回 `false`。
 //! 3. 24 个取运行时的 C 入口逐个调用：均返回空值或错误码，`ray_last_error_kind()` 为
-//!    `RAY_ERROR_KIND_RUNTIME`（8，`ErrorKind::Runtime`），`ray_last_error()` 包含关闭
+//!    `RAY_ERROR_KIND_RUNTIME`（8，`ErrorKind::Runtime`），`ray_last_error_bytes()` 包含关闭
 //!    拒绝消息。每个入口使用合法参数，排除参数校验提前拦截的干扰。
 //! 4. 两个引用计数入口（`ray_add_local_reference`、`ray_remove_local_reference`）在关闭
-//!    后返回 0，且 `ray_last_error()` 为空指针。
+//!    后返回 0，且 `ray_last_error_bytes()` 写出空指针与零长度。
 //! 5. `ray_is_local_mode()` 在关闭后照常返回对应模式的布尔值，且不记录错误。
 //! 6. 关闭进行中的拒绝（仅在 local 模式运行）：提交一个 `sleep_for(1.5)` 任务，在另一
 //!    个线程释放句柄触发本地排空，主线程等待 300 ms 后调用 `ray_put`，验证排空期间已被
@@ -468,16 +468,20 @@ fn main() {
     sys::clear_error();
     let rc_add =
         unsafe { sys::ray_add_local_reference(ref_id.as_ptr() as *const c_char, ref_id.len()) };
-    let err_add = unsafe { sys::ray_last_error() };
+    let mut err_add: *const c_char = std::ptr::null();
+    let mut err_add_len: usize = 0;
+    unsafe { sys::ray_last_error_bytes(&mut err_add, &mut err_add_len) };
     println!(
-        "  ray_add_local_reference -> rc={}, last_error_is_null={}",
+        "  ray_add_local_reference -> rc={}, last_error_is_null={}, len={}",
         rc_add,
-        err_add.is_null()
+        err_add.is_null(),
+        err_add_len
     );
-    if rc_add != 0 || !err_add.is_null() {
+    if rc_add != 0 || !err_add.is_null() || err_add_len != 0 {
         fail(format!(
-            "ray_add_local_reference 预期 rc=0 且无错误, 实际 rc={}, err={:?}",
+            "ray_add_local_reference 预期 rc=0 且无错误, 实际 rc={}, len={}, err={:?}",
             rc_add,
+            err_add_len,
             sys::last_error()
         ));
     }
@@ -485,16 +489,20 @@ fn main() {
     sys::clear_error();
     let rc_rem =
         unsafe { sys::ray_remove_local_reference(ref_id.as_ptr() as *const c_char, ref_id.len()) };
-    let err_rem = unsafe { sys::ray_last_error() };
+    let mut err_rem: *const c_char = std::ptr::null();
+    let mut err_rem_len: usize = 0;
+    unsafe { sys::ray_last_error_bytes(&mut err_rem, &mut err_rem_len) };
     println!(
-        "  ray_remove_local_reference -> rc={}, last_error_is_null={}",
+        "  ray_remove_local_reference -> rc={}, last_error_is_null={}, len={}",
         rc_rem,
-        err_rem.is_null()
+        err_rem.is_null(),
+        err_rem_len
     );
-    if rc_rem != 0 || !err_rem.is_null() {
+    if rc_rem != 0 || !err_rem.is_null() || err_rem_len != 0 {
         fail(format!(
-            "ray_remove_local_reference 预期 rc=0 且无错误, 实际 rc={}, err={:?}",
+            "ray_remove_local_reference 预期 rc=0 且无错误, 实际 rc={}, len={}, err={:?}",
             rc_rem,
+            err_rem_len,
             sys::last_error()
         ));
     }
@@ -503,17 +511,21 @@ fn main() {
     println!("\n--- 5. ray_is_local_mode() 保持可读且不报错 ---");
     sys::clear_error();
     let reported_local = unsafe { sys::ray_is_local_mode() };
-    let err_mode = unsafe { sys::ray_last_error() };
+    let mut err_mode: *const c_char = std::ptr::null();
+    let mut err_mode_len: usize = 0;
+    unsafe { sys::ray_last_error_bytes(&mut err_mode, &mut err_mode_len) };
     println!(
-        "  ray_is_local_mode() = {}, last_error_is_null={}",
+        "  ray_is_local_mode() = {}, last_error_is_null={}, len={}",
         reported_local,
-        err_mode.is_null()
+        err_mode.is_null(),
+        err_mode_len
     );
-    if reported_local != is_local || !err_mode.is_null() {
+    if reported_local != is_local || !err_mode.is_null() || err_mode_len != 0 {
         fail(format!(
-            "ray_is_local_mode 预期 {} 且无错误, 实际 {}, err={:?}",
+            "ray_is_local_mode 预期 {} 且无错误, 实际 {}, len={}, err={:?}",
             is_local,
             reported_local,
+            err_mode_len,
             sys::last_error()
         ));
     }

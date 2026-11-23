@@ -64,7 +64,7 @@ static_assert(alignof(RayIntentionalSystemExitException) == alignof(RayException
 
 // ─── Thread-local error storage ─────────────────────────────────
 // Instead of fprintf(stderr), we store the error message in a thread-local
-// string so the Rust side can retrieve it via ray_last_error().
+// string so the Rust side can retrieve it via ray_last_error_bytes().
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -82,10 +82,15 @@ static thread_local int g_last_error_kind = RAY_ERROR_KIND_NONE;
 static constexpr const char *kRuntimeClosingMessage =
     "the Ray runtime is shutting down or has shut down: calls are refused until a new runtime is initialized";
 
-/// Store an error message and its class.
-static void set_last_error_kind(const char *msg, int kind) {
-    g_last_error = msg ? msg : "";
+/// Store an error byte string and its class.
+static void set_last_error_kind(const std::string &msg, int kind) {
+    g_last_error = msg;
     g_last_error_kind = kind;
+}
+
+/// Store a NUL-terminated error message and its class.
+static void set_last_error_kind(const char *msg, int kind) {
+    set_last_error_kind(std::string(msg ? msg : ""), kind);
 }
 
 /// Store an error message (called from catch blocks).
@@ -108,8 +113,18 @@ static int ray_exception_kind(const std::exception &e) {
 }
 
 /// Store an error message from a C++ exception, with its class.
+/// `RayException::what()` returns `msg_.c_str()`, which stops at the first NUL
+/// byte; a failed Python task carries a binary payload whose header padding
+/// holds such a byte a few bytes in, so `what()` keeps almost nothing and the
+/// rest of the message is lost. Read `RayException::msg_`
+/// (`ray/api/ray_exception.h:29`) directly instead.
 static void set_last_error_exception(const std::exception &e) {
-    set_last_error_kind(e.what(), ray_exception_kind(e));
+    const int kind = ray_exception_kind(e);
+    if (const auto *ray_ex = dynamic_cast<const ray::internal::RayException *>(&e)) {
+        set_last_error_kind(ray_ex->msg_, kind);
+        return;
+    }
+    set_last_error_kind(e.what(), kind);
 }
 
 // Macro to reduce boilerplate in catch blocks.
@@ -1022,7 +1037,7 @@ struct RefCountTicket {
 };
 
 /// 取这次调用要用的运行时。没有运行时、或运行时正在关闭时返回空，并写好
-/// ray_last_error()。关闭标志用 RAY_ERROR_KIND_RUNTIME 的类别，Rust 侧据此得到
+/// ray_last_error_bytes()。关闭标志用 RAY_ERROR_KIND_RUNTIME 的类别，Rust 侧据此得到
 /// RayError::Runtime。
 static std::shared_ptr<ray::internal::RayRuntime> runtime_for_call() {
     auto runtime = ray::internal::GetRayRuntime();
@@ -1269,7 +1284,7 @@ bool *ray_wait(const ray_bytes_t *ids, size_t count, size_t num_objects, int tim
 /// 宽度不符的 id 交给 Ray 会在 `ObjectID::FromBinary` 的 RAY_CHECK 终止进程
 /// （src/ray/common/id.h:430-441）；本地模式更早一步用无期限的 `runtime->Get(id)`
 /// 读值，0 字节在那里永久等待。所以每个引用参数都要在构造 TaskArg 之前拒掉，
-/// 抛出的消息由入口的 RAY_CATCH 存进 ray_last_error()。
+/// 抛出的消息由入口的 RAY_CATCH 存进 ray_last_error_bytes()。
 static void check_reference_arg_ids(const ray_bytes_t *args, size_t arg_count,
                                     const bool *is_ref) {
     if (!is_ref) return;
@@ -1469,7 +1484,8 @@ static ray_bytes_t submit_python_task(const char *module_name,
                 "(python/ray/_private/function_manager.py:138, importlib.import_module) "
                 "and importlib raises ValueError: Empty module name for an empty "
                 "string, so the task fails inside the worker and the worker exits with "
-                "SYSTEM_ERROR; the caller reads only an unknown FFI error. This entry "
+                "SYSTEM_ERROR; the caller's first read gets a worker error carrying "
+                "the SDK's binary payload. This entry "
                 "refuses the name before submission instead.");
             return ray_bytes_t{nullptr, 0};
         }
@@ -1570,8 +1586,8 @@ ray_bytes_t ray_task_call_python_with_options(const char *module_name,
 /// worker 在自己的进程里解析这个名字：空名字在
 /// `cpp/src/ray/util/function_helper.cc:163-168` 抛 `RayFunctionNotFound`，
 /// `task_executor.cc:101-111` 把它转成 `Status::Invalid`，actor worker 停在
-/// `src/ray/core_worker/core_worker_shutdown_executor.cc:40`，驱动读到
-/// `Actor error ... unknown FFI error`。
+/// `src/ray/core_worker/core_worker_shutdown_executor.cc:40`，驱动第一次读值得到
+/// `RAY_ERROR_KIND_ACTOR` 错误。
 ray_bytes_t ray_actor_create_with_options(const char *func_name,
                                             const ray_bytes_t *args,
                                             size_t arg_count,
@@ -1597,8 +1613,8 @@ ray_bytes_t ray_actor_create_with_options(const char *func_name,
             "creation task is submitted, and the worker fails it with RayFunctionNotFound "
             "(cpp/src/ray/util/function_helper.cc:163-168, caught at "
             "task_executor.cc:101-111): the actor worker stops at "
-            "src/ray/core_worker/core_worker_shutdown_executor.cc:40 and the driver reads "
-            "only \"Actor error ... unknown FFI error\". A name with an interior NUL byte "
+            "src/ray/core_worker/core_worker_shutdown_executor.cc:40 and the driver's "
+            "first read fails with an actor error carrying the SDK's payload. A name with an interior NUL byte "
             "arrives here as an empty C string as well (#27). A whitespace-only name is "
             "not trimmed and is submitted as it is, as ray_get_actor does; a "
             "non-empty name nobody registered keeps Ray's asynchronous semantics, "
@@ -1658,8 +1674,8 @@ ray_bytes_t ray_actor_create_python_with_options(const char *module_name,
             "(load_function_or_class_from_local), where "
             "importlib.import_module(module_name) raises \"ValueError: Empty module "
             "name\"; the worker exits with SYSTEM_ERROR and the 16-byte id the caller "
-            "already got answers its first read only with \"Actor error ... unknown "
-            "FFI error\". Either empty name is refused here. Local mode refuses "
+            "already got fails on its first read with an actor error carrying the "
+            "SDK's payload. Either empty name is refused here. Local mode refuses "
             "every Python actor creation, and these checks run before that refusal, "
             "so an empty name reports this error in both modes. A name with an "
             "interior NUL byte arrives here as an empty C "
@@ -1678,8 +1694,8 @@ ray_bytes_t ray_actor_create_python_with_options(const char *module_name,
             "\"TypeError: module.__new__(X): X is not a type object (module)\" before "
             "load_actor_class is reached (the measured traceback holds only "
             "_raylet.pyx:2432 and :2253); the worker exits with SYSTEM_ERROR and the "
-            "16-byte id the caller already got answers its first read only with "
-            "\"Actor error ... unknown FFI error\". Either empty name is refused "
+            "16-byte id the caller already got fails on its first read with an actor "
+            "error carrying the SDK's payload. Either empty name is refused "
             "here. Local mode refuses every Python actor creation, and these checks "
             "run before that refusal, so an empty name reports this error in both "
             "modes. A name with an interior NUL byte "
@@ -1803,8 +1819,8 @@ ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len
                 "execute_task) and :1873, where execute_task runs "
                 "function_name = execution_info.function_name and raises "
                 "\"AttributeError: 'dict' object has no attribute "
-                "'function_name'\"; the caller's first read then answers only "
-                "\"Actor error ... unknown FFI error\" and that actor cannot be "
+                "'function_name'\"; the caller's first read then fails with an actor "
+                "error carrying the SDK's payload and that actor cannot be "
                 "called again. The C++ entry ray_actor_call refuses an empty name in "
                 "the driver as well: its single-argument RemoteFunctionHolder "
                 "constructor throws \"Function not found. Please use RAY_REMOTE to "
@@ -2850,18 +2866,29 @@ ray_bytes_t *ray_get_many(const ray_bytes_t *ids, size_t count, int timeout_ms) 
             return nullptr;
         }
 
-        for (size_t i = 0; i < count && i < results.size(); i++) {
-            if (results[i]) {
+        const char *element_error = nullptr;
+        for (size_t i = 0; i < count; i++) {
+            if (i < results.size() && results[i]) {
                 char *data = static_cast<char *>(std::malloc(results[i]->size()));
                 if (data) {
                     std::memcpy(data, results[i]->data(), results[i]->size());
                     out[i] = ray_bytes_t{data, results[i]->size()};
                 } else {
                     out[i] = ray_bytes_t{nullptr, 0};
+                    if (!element_error) {
+                        element_error = "out of memory copying an object in the batch";
+                    }
                 }
             } else {
                 out[i] = ray_bytes_t{nullptr, 0};
+                if (!element_error) {
+                    element_error =
+                        "the object store returned no buffer for an object in the batch";
+                }
             }
+        }
+        if (element_error) {
+            set_last_error(element_error);
         }
         return out;
     } catch (const std::exception &e) {
@@ -2894,8 +2921,14 @@ void ray_free_bools(bool *ptr) {
 
 // ─── Error Handling ───────────────────────────────────────────
 
-const char *ray_last_error(void) {
-    return g_last_error.empty() ? nullptr : g_last_error.c_str();
+void ray_last_error_bytes(const char **data, size_t *len) {
+    if (g_last_error_kind == RAY_ERROR_KIND_NONE) {
+        if (data) *data = nullptr;
+        if (len) *len = 0;
+        return;
+    }
+    if (data) *data = g_last_error.data();
+    if (len) *len = g_last_error.size();
 }
 
 int ray_last_error_kind(void) {

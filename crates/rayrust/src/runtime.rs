@@ -33,15 +33,16 @@ fn error_from_kind(kind: ErrorKind, msg: String) -> RayError {
 
 /// Build an FFI error with the C-side last_error message if available.
 fn ffi_error(context: &str) -> RayError {
-    let msg = rayrust_sys::last_error()
-        .unwrap_or_else(|| "unknown FFI error".to_string());
-    error_from_kind(rayrust_sys::last_error_kind(), format!("{}: {}", context, msg))
+    let msg = rayrust_sys::last_error().unwrap_or_else(|| "unknown FFI error".to_string());
+    error_from_kind(
+        rayrust_sys::last_error_kind(),
+        format!("{}: {}", context, msg),
+    )
 }
 
 /// Build an FFI error with context and a formatted detail string.
 fn ffi_error_detail(context: &str, detail: impl std::fmt::Display) -> RayError {
-    let msg = rayrust_sys::last_error()
-        .unwrap_or_else(|| "unknown FFI error".to_string());
+    let msg = rayrust_sys::last_error().unwrap_or_else(|| "unknown FFI error".to_string());
     error_from_kind(
         rayrust_sys::last_error_kind(),
         format!("{} ({}): {}", context, detail, msg),
@@ -424,7 +425,10 @@ impl Ray {
     }
 
     /// Get an object from the object store (blocks until ready).
-    pub fn get<T: serde::de::DeserializeOwned>(&self, obj_ref: &ObjectRef<T>) -> Result<T, RayError> {
+    pub fn get<T: serde::de::DeserializeOwned>(
+        &self,
+        obj_ref: &ObjectRef<T>,
+    ) -> Result<T, RayError> {
         obj_ref.get()
     }
 
@@ -642,15 +646,15 @@ impl Ray {
     /// and importlib raises `ValueError: Empty module name` for an empty string —
     /// it raises before any lookup, so a module planted in `sys.modules` under the
     /// empty name does not change that — and the worker exits with `SYSTEM_ERROR`.
-    /// The first read answers only an unknown FFI error and the worker pool starts
-    /// a replacement worker.
+    /// The first read returns [`RayError::Worker`] with the SDK's payload
+    /// lossily decoded as UTF-8, and the worker pool starts a replacement worker.
     /// `function` is not checked. The loader splits it on dots and throws the empty
     /// pieces away (`function_manager.py:139`), so an empty name resolves to the
     /// module object itself, which the loader registers as the task's function
     /// (`:391-395`). An ordinary module is not callable, so the task then fails
     /// with `TypeError: 'module' object is not callable`: an ordinary task failure,
-    /// where the worker stays alive and the first read answers only an unknown FFI
-    /// error. A module object can be callable, though — a `types.ModuleType`
+    /// where the worker stays alive and the first read returns [`RayError::Task`]
+    /// with the SDK's payload lossily decoded as UTF-8. A module object can be callable, though — a `types.ModuleType`
     /// subclass with `__call__` assigned to the module's `__class__`, or any
     /// callable placed in `sys.modules` under that name — and then the task runs
     /// and returns that object's result (measured on 2.51.1: such a module
@@ -759,8 +763,9 @@ impl Ray {
     /// creation task is submitted, and the worker fails it with `RayFunctionNotFound`
     /// (`cpp/src/ray/util/function_helper.cc:163-168`, caught at
     /// `task_executor.cc:101-111`): the actor worker stops at
-    /// `src/ray/core_worker/core_worker_shutdown_executor.cc:40` and the driver reads
-    /// only `Actor error ... unknown FFI error`. A name with an interior NUL byte
+    /// `src/ray/core_worker/core_worker_shutdown_executor.cc:40` and the driver's
+    /// first read returns [`RayError::Actor`] with the SDK's payload lossily decoded
+    /// as UTF-8. A name with an interior NUL byte
     /// reaches the C entry as an empty C string, the same as in [`Ray::get_actor`],
     /// and is refused with it.
     ///
@@ -785,8 +790,8 @@ impl Ray {
     /// [`RayError::Ffi`] before any task is submitted. A Python actor is named by
     /// both and the worker resolves them in Python, so an empty name hands out an
     /// actor that never runs: the driver only submits the creation task and the
-    /// caller gets `Ok` with a 16-byte id whose first read answers only
-    /// `Actor error ... unknown FFI error`. An empty module name fails in
+    /// caller gets `Ok` with a 16-byte id whose first read returns
+    /// [`RayError::Actor`] with the SDK's payload lossily decoded as UTF-8. An empty module name fails in
     /// `python/ray/_private/function_manager.py:531` (`load_actor_class`) → `:589`
     /// (`_load_actor_class_from_local`) → `:138`
     /// (`load_function_or_class_from_local`), where
@@ -994,8 +999,8 @@ impl Ray {
     /// `:2291` (which calls `execute_task`) and `:1873`, where `execute_task` runs
     /// `function_name = execution_info.function_name` and raises
     /// `AttributeError: 'dict' object has no attribute 'function_name'`; the first
-    /// read answers only `Actor error ... unknown FFI error` and that actor cannot be
-    /// called again. The empty name is refused in both cases, including the one where
+    /// read returns [`RayError::Actor`] with the SDK's payload lossily decoded as
+    /// UTF-8 and that actor cannot be called again. The empty name is refused in both cases, including the one where
     /// the method exists. A method name with an interior NUL byte is refused by the
     /// same check, because `to_cstring` (`crates/rayrust-sys/src/lib.rs:253-255`,
     /// #27) turns it into an empty C string.
@@ -1058,8 +1063,10 @@ impl Ray {
         check_registered_actor("ray_actor_kill", handle.id())?;
         rayrust_sys::clear_error();
         actor_kill_inner(handle.id(), no_restart);
-        // The C ABI returns void and reports both the local mode rejection and
-        // exceptions through last_error, so this check is the designed path.
+        // `ray_actor_kill` 返回 void，通过线程局部错误通道报告本地模式拒绝与 C++ 异常；
+        // 这里用 `last_error().is_some()` 判定成败，依赖「失败一定记录消息，且二进制
+        // 或非 UTF-8 载荷仍经 `ray_last_error_bytes` 返回 `Some`，只有未记录错误时才是
+        // `None`」。
         if rayrust_sys::last_error().is_some() {
             return Err(ffi_error("ray_actor_kill"));
         }
@@ -1233,11 +1240,7 @@ impl Ray {
     /// empty-name check runs before the mode decision, so local mode returns
     /// [`RayError::Ffi`] for an empty name as well; before the check it answered
     /// `Ok(None)` there.
-    pub fn get_actor(
-        &self,
-        name: &str,
-        namespace: &str,
-    ) -> Result<Option<ActorHandle>, RayError> {
+    pub fn get_actor(&self, name: &str, namespace: &str) -> Result<Option<ActorHandle>, RayError> {
         get_actor(name, namespace)
     }
 
@@ -1372,22 +1375,20 @@ pub(crate) fn init_with_config(config: &RayConfig) -> Result<(), RayError> {
 /// 检查本机候选 Ray C++ SDK 目录下是否存在 `default_worker`。
 /// 找到或无法确定候选目录时静默返回；候选目录存在却缺少 `default_worker` 时打印一次警告。
 fn check_cpp_sdk() {
-    let candidates: Vec<std::path::PathBuf> = match std::env::var("RAY_CPP_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
-        Some(dir) => vec![std::path::PathBuf::from(dir)],
-        None => std::process::Command::new("python3")
-            .args(["-c", "import ray, os; print(os.path.dirname(ray.__file__))"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .map(|ray_dir| vec![std::path::PathBuf::from(ray_dir).join("cpp")])
-            .unwrap_or_default(),
-    };
+    let candidates: Vec<std::path::PathBuf> =
+        match std::env::var("RAY_CPP_DIR").ok().filter(|s| !s.is_empty()) {
+            Some(dir) => vec![std::path::PathBuf::from(dir)],
+            None => std::process::Command::new("python3")
+                .args(["-c", "import ray, os; print(os.path.dirname(ray.__file__))"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(|ray_dir| vec![std::path::PathBuf::from(ray_dir).join("cpp")])
+                .unwrap_or_default(),
+        };
 
     if candidates.is_empty() {
         return;
@@ -1409,7 +1410,9 @@ fn check_cpp_sdk() {
         checked.join(", ")
     );
     eprintln!("  Install it on this node with 'pip install ray[cpp]'.");
-    eprintln!("  Without default_worker, actor_create() succeeds but actor_call() hangs (NODE_DIED).");
+    eprintln!(
+        "  Without default_worker, actor_create() succeeds but actor_call() hangs (NODE_DIED)."
+    );
     eprintln!("  Use local mode (RayConfig::local()) to run without ray[cpp].");
 }
 
@@ -1546,11 +1549,9 @@ pub(crate) fn wait<T>(
 
 /// Put raw bytes into the object store. Returns the binary object ID.
 pub(crate) fn put_raw(data: &[u8]) -> Result<Vec<u8>, RayError> {
-    let bytes = unsafe {
-        rayrust_sys::ray_put(data.as_ptr() as *const std::os::raw::c_char, data.len())
-    };
-    let guard = CBytesGuard::from(bytes)
-        .ok_or_else(|| ffi_error("ray_put"))?;
+    let bytes =
+        unsafe { rayrust_sys::ray_put(data.as_ptr() as *const std::os::raw::c_char, data.len()) };
+    let guard = CBytesGuard::from(bytes).ok_or_else(|| ffi_error("ray_put"))?;
     Ok(guard.as_slice().to_vec())
 }
 
@@ -1736,8 +1737,9 @@ pub(crate) fn task_call_python_json_inner(
         )
     };
 
-    let guard = CBytesGuard::from(bytes)
-        .ok_or_else(|| ffi_error_detail("ray_task_call_python", format!("{}.{}", module, function)))?;
+    let guard = CBytesGuard::from(bytes).ok_or_else(|| {
+        ffi_error_detail("ray_task_call_python", format!("{}.{}", module, function))
+    })?;
     Ok(guard.as_slice().to_vec())
 }
 
@@ -1901,14 +1903,17 @@ fn resources_to_json(resources: &[(String, f64)]) -> String {
     if resources.is_empty() {
         return String::new();
     }
-    let parts: Vec<String> = resources.iter().map(|(n, v)| {
-        let val = if *v == v.trunc() {
-            format!("{}", *v as i64)
-        } else {
-            format!("{}", v)
-        };
-        format!("\"{}\":{}", json_escape(n), val)
-    }).collect();
+    let parts: Vec<String> = resources
+        .iter()
+        .map(|(n, v)| {
+            let val = if *v == v.trunc() {
+                format!("{}", *v as i64)
+            } else {
+                format!("{}", v)
+            };
+            format!("\"{}\":{}", json_escape(n), val)
+        })
+        .collect();
     format!("{{{}}}", parts.join(","))
 }
 
@@ -2299,10 +2304,16 @@ impl ActorOptions {
             parts.push(format!("\"name\":\"{}\"", json_escape(&self.name)));
         }
         if !self.ray_namespace.is_empty() {
-            parts.push(format!("\"ray_namespace\":\"{}\"", json_escape(&self.ray_namespace)));
+            parts.push(format!(
+                "\"ray_namespace\":\"{}\"",
+                json_escape(&self.ray_namespace)
+            ));
         }
         if !self.resources.is_empty() {
-            parts.push(format!("\"resources\":{}", resources_to_json(&self.resources)));
+            parts.push(format!(
+                "\"resources\":{}",
+                resources_to_json(&self.resources)
+            ));
         }
         if self.max_restarts != 0 {
             parts.push(format!("\"max_restarts\":{}", self.max_restarts));
@@ -2382,7 +2393,9 @@ pub(crate) fn actor_create_with_options_inner(
         ActorLanguage::Cpp,
         actor_registry::CREATION_DESCRIPTOR_CPP,
     );
-    Ok(ActorHandle { id: guard.as_slice().to_vec() })
+    Ok(ActorHandle {
+        id: guard.as_slice().to_vec(),
+    })
 }
 
 /// Create a Python actor with full creation options.
@@ -2413,17 +2426,20 @@ pub(crate) fn actor_create_python_with_options_inner(
         )
     };
 
-    let guard = CBytesGuard::from(bytes)
-        .ok_or_else(|| ffi_error_detail(
+    let guard = CBytesGuard::from(bytes).ok_or_else(|| {
+        ffi_error_detail(
             "ray_actor_create_python_with_options",
             format!("{}.{}", module, class),
-        ))?;
+        )
+    })?;
     actor_registry::record(
         guard.as_slice(),
         ActorLanguage::Python,
         actor_registry::CREATION_DESCRIPTOR_PYTHON,
     );
-    Ok(ActorHandle { id: guard.as_slice().to_vec() })
+    Ok(ActorHandle {
+        id: guard.as_slice().to_vec(),
+    })
 }
 
 /// actor id 的宽度与登记状态，返回登记项（语言码与创建描述符类型）。
@@ -2586,8 +2602,8 @@ pub(crate) fn actor_call_inner(
         )
     };
 
-    let guard = CBytesGuard::from(bytes)
-        .ok_or_else(|| ffi_error_detail("ray_actor_call", func_name))?;
+    let guard =
+        CBytesGuard::from(bytes).ok_or_else(|| ffi_error_detail("ray_actor_call", func_name))?;
     Ok(ObjectRef::from_call_id(guard.as_slice().to_vec()))
 }
 
@@ -2846,14 +2862,9 @@ pub(crate) fn placement_group_create_inner(
     let name_c = to_cstring(name);
     let json_c = to_cstring(bundles_json);
     let bytes = unsafe {
-        rayrust_sys::ray_placement_group_create(
-            name_c.as_ptr(),
-            json_c.as_ptr(),
-            strategy,
-        )
+        rayrust_sys::ray_placement_group_create(name_c.as_ptr(), json_c.as_ptr(), strategy)
     };
-    let guard = CBytesGuard::from(bytes)
-        .ok_or_else(|| ffi_error("ray_placement_group_create"))?;
+    let guard = CBytesGuard::from(bytes).ok_or_else(|| ffi_error("ray_placement_group_create"))?;
     Ok(guard.as_slice().to_vec())
 }
 
@@ -2966,8 +2977,7 @@ pub(crate) fn get_namespace() -> Result<String, RayError> {
         return Ok(String::new());
     }
     let bytes = unsafe { rayrust_sys::ray_get_namespace() };
-    let guard = CBytesGuard::from(bytes)
-        .ok_or_else(|| ffi_error("ray_get_namespace"))?;
+    let guard = CBytesGuard::from(bytes).ok_or_else(|| ffi_error("ray_get_namespace"))?;
     String::from_utf8(guard.as_slice().to_vec())
         .map_err(|e| RayError::Ffi(format!("namespace not valid UTF-8: {}", e)))
 }
@@ -2998,8 +3008,9 @@ pub(crate) fn get_actor(name: &str, namespace: &str) -> Result<Option<ActorHandl
             }
         }
         None => {
-            // C returns null both for "not found" and "error".
-            // Check last_error to distinguish.
+            // C 侧对「查不到」与「出错」都返回空指针；这里用 `last_error().is_some()`
+            // 区分两者，依赖「出错一定记录消息，且二进制或非 UTF-8 载荷仍经
+            // `ray_last_error_bytes` 返回 `Some`，只有未记录错误时才是 `None`」。
             if rayrust_sys::last_error().is_some() {
                 return Err(ffi_error("ray_get_actor"));
             }
@@ -3077,19 +3088,30 @@ pub(crate) fn get_many_with_timeout<T: serde::de::DeserializeOwned>(
         return Ok(Vec::new());
     }
 
-    let ids: Vec<RayBytes> = refs.iter().map(|r| RayBytes {
-        data: r.id().as_ptr() as *const std::os::raw::c_char,
-        len: r.id().len(),
-    }).collect();
+    let ids: Vec<RayBytes> = refs
+        .iter()
+        .map(|r| RayBytes {
+            data: r.id().as_ptr() as *const std::os::raw::c_char,
+            len: r.id().len(),
+        })
+        .collect();
 
     let array = unsafe { rayrust_sys::ray_get_many(ids.as_ptr(), ids.len(), timeout_ms) };
+    decode_batch_array(refs, array)
+}
+
+/// 解码 `ray_get_many` 返回的 `ray_bytes_t` 数组；元素为空指针时按错误通道加上下标报错。
+fn decode_batch_array<T: serde::de::DeserializeOwned>(
+    refs: &[ObjectRef<T>],
+    array: *mut RayBytes,
+) -> Result<Vec<T>, RayError> {
     let array = CBytesArrayGuard::from_raw(array, refs.len())?;
 
     let mut results = Vec::with_capacity(refs.len());
     for (i, obj_ref) in refs.iter().enumerate() {
         let bytes = array.get(i);
         if bytes.data.is_null() {
-            return Err(RayError::ObjectNotFound(format!("object {} not found", i)));
+            return Err(ffi_error_detail("ray_get_many", i));
         }
         let slice = unsafe { std::slice::from_raw_parts(bytes.data as *const u8, bytes.len) };
         let val = if obj_ref.is_xlang {
@@ -3104,7 +3126,9 @@ pub(crate) fn get_many_with_timeout<T: serde::de::DeserializeOwned>(
 
 /// Get multiple objects from the object store.
 /// Blocks until all objects are available.
-pub(crate) fn get_many<T: serde::de::DeserializeOwned>(refs: &[ObjectRef<T>]) -> Result<Vec<T>, RayError> {
+pub(crate) fn get_many<T: serde::de::DeserializeOwned>(
+    refs: &[ObjectRef<T>],
+) -> Result<Vec<T>, RayError> {
     get_many_with_timeout(refs, -1)
 }
 
@@ -4407,6 +4431,78 @@ mod tests {
                 Err(other) => panic!("{} 返回了别的错误变体: {}", label, other),
                 Ok(_) => panic!("{} 在没有运行时的进程里被提交了", label),
             }
+        }
+    }
+
+    /// 分配一个供 `CBytesArrayGuard`（内部调 `std::free`）释放的 `RayBytes` 数组。
+    fn alloc_batch_array(first: &[u8], second_is_null: bool) -> *mut RayBytes {
+        let array = unsafe { libc::malloc(2 * std::mem::size_of::<RayBytes>()) as *mut RayBytes };
+        assert!(!array.is_null(), "malloc RayBytes array failed");
+        let first_buf = unsafe { libc::malloc(first.len().max(1)) as *mut u8 };
+        assert!(!first_buf.is_null(), "malloc element buffer failed");
+        unsafe {
+            std::ptr::copy_nonoverlapping(first.as_ptr(), first_buf, first.len());
+            *array.add(0) = RayBytes {
+                data: first_buf as *const std::os::raw::c_char,
+                len: first.len(),
+            };
+            *array.add(1) = if second_is_null {
+                RayBytes {
+                    data: std::ptr::null(),
+                    len: 0,
+                }
+            } else {
+                let second_buf = libc::malloc(first.len().max(1)) as *mut u8;
+                assert!(!second_buf.is_null(), "malloc second buffer failed");
+                std::ptr::copy_nonoverlapping(first.as_ptr(), second_buf, first.len());
+                RayBytes {
+                    data: second_buf as *const std::os::raw::c_char,
+                    len: first.len(),
+                }
+            };
+        }
+        array
+    }
+
+    /// 批量取遇到空元素时通过 `ffi_error_detail("ray_get_many", i)` 读取当前线程的错误通道，
+    /// 带上下标 `i`、错误类别与通道文本。
+    #[test]
+    fn batch_null_element_reads_the_error_channel() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let refs: [ObjectRef<i32>; 2] = [
+            ObjectRef::from(vec![0x31u8; 28]),
+            ObjectRef::from(vec![0x32u8; 28]),
+        ];
+        let encoded = crate::serialize::serialize(&7i32).expect("serialize 7");
+
+        // 对照：两个元素都非空时正常解出两个值。
+        let ok_array = alloc_batch_array(&encoded, false);
+        let values = decode_batch_array(&refs, ok_array).expect("两个有效元素");
+        assert_eq!(values, vec![7, 7]);
+
+        // 触发一次 C 侧错误记录（未初始化运行时写入 RAY_ERROR_KIND_GENERIC 与消息）。
+        let _ = unsafe { rayrust_sys::ray_put(std::ptr::null(), 0) };
+        let err_array = alloc_batch_array(&encoded, true);
+        match decode_batch_array(&refs, err_array) {
+            Err(RayError::Ffi(message)) => assert_eq!(
+                message, "ray_get_many (1): Ray runtime is not initialized",
+                "空元素没有读到通道里的消息与下标"
+            ),
+            other => panic!("第 1 项为空指针时返回了 {:?}", other),
+        }
+
+        // 清空通道后，兜底消息仍是带下标的 Ffi 错误。
+        rayrust_sys::clear_error();
+        let cleared_array = alloc_batch_array(&encoded, true);
+        match decode_batch_array(&refs, cleared_array) {
+            Err(RayError::Ffi(message)) => assert_eq!(
+                message, "ray_get_many (1): unknown FFI error",
+                "清空通道后的兜底文本不符"
+            ),
+            other => panic!("清空通道后第 1 项为空指针返回了 {:?}", other),
         }
     }
 }

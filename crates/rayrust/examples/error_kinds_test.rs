@@ -1,14 +1,16 @@
 //! Example: Ray's error classes survive the C ABI as distinct RayError variants.
 //!
-//! Two failures are triggered on the driver and their variants compared:
+//! Three failures are triggered on the driver and their variants compared:
 //!   - a get_timeout on a ref that never resolves → RayError::Timeout
 //!   - a task whose function name no worker registers → RayError::Task
+//!   - a Python task that raises ValueError → RayError::Task carrying the text
 //!
-//! The cluster needs the same setup as cancel_test:
-//!   ray start --head --port=6399 --num-cpus=1 --include-dashboard=false
+//! Cluster setup:
+//!   PYTHONPATH=tests/python ray start --head --port=6399 --num-cpus=2 --include-dashboard=false
 //!
 //! Environment: RAY_ADDRESS, RAY_NODE_IP, RAY_WORKER_SO.
 
+use std::os::raw::c_char;
 use std::time::Duration;
 
 use rayrust::prelude::*;
@@ -22,6 +24,20 @@ const PROBE_TIMEOUT_MS: i32 = 200;
 
 /// No worker registers a function by this name.
 const MISSING_FUNCTION: &str = "error_kinds_test_unregistered_function";
+
+/// Python module and failing remote function in `tests/python/rayrust_test.py`.
+const PYTHON_MODULE: &str = "rayrust_test";
+const PYTHON_FAIL_FUNCTION: &str = "fail";
+const PYTHON_FAIL_MESSAGE: &str = "python-task-boom-t37";
+
+fn hex_prefix(bytes: &[u8], limit: usize) -> String {
+    bytes
+        .iter()
+        .take(limit)
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Cross-language call to `time.sleep`, which needs no result from any worker.
 fn submit_long_task(ray: &Ray) -> ObjectRef<()> {
@@ -94,6 +110,8 @@ fn main() {
             other
         ),
     }
+    ray.cancel(long_task.id(), true, true)
+        .expect("cancel the sleeping task after the timeout check");
 
     // ── A task whose function does not exist ───────────────
     println!("\n--- Task failure: unregistered function name ---");
@@ -125,7 +143,71 @@ fn main() {
         ),
     }
 
-    // ── The two failures stay distinguishable ──────────────
+    // ── A Python task that raises ValueError ───────────────
+    println!("\n--- Python task failure: binary payload preserves class and text ---");
+    let fail_arg = serialize(&PYTHON_FAIL_MESSAGE).expect("serialize the failure message");
+    let py_failed = ray
+        .task_call_python(PYTHON_MODULE, PYTHON_FAIL_FUNCTION, &[&fail_arg], &[])
+        .expect("submit rayrust_test.fail");
+    println!(
+        "  submitted '{}.{}({:?})' → {}",
+        PYTHON_MODULE,
+        PYTHON_FAIL_FUNCTION,
+        PYTHON_FAIL_MESSAGE,
+        py_failed.id_hex()
+    );
+
+    let py_err = match py_failed.get() {
+        Ok(()) => panic!(
+            "'{}.{}' returned a value instead of raising ValueError",
+            PYTHON_MODULE, PYTHON_FAIL_FUNCTION
+        ),
+        Err(e) => e,
+    };
+    let mut raw_ptr: *const c_char = std::ptr::null();
+    let mut raw_len: usize = 0;
+    unsafe { rayrust::sys::ray_last_error_bytes(&mut raw_ptr, &mut raw_len) };
+    let raw_prefix = if raw_ptr.is_null() {
+        String::new()
+    } else {
+        let raw_slice = unsafe { std::slice::from_raw_parts(raw_ptr as *const u8, raw_len) };
+        hex_prefix(raw_slice, 32)
+    };
+    match &py_err {
+        RayError::Task(msg) => {
+            println!("  get() → RayError::Task");
+            println!(
+                "    raw C payload: len={} bytes, first 32 bytes hex: {}",
+                raw_len, raw_prefix
+            );
+            println!(
+                "    RayError::Task message: len={} bytes, first 32 bytes hex: {}",
+                msg.len(),
+                hex_prefix(msg.as_bytes(), 32)
+            );
+            assert!(
+                !msg.trim().is_empty(),
+                "the Python task error carries an empty message"
+            );
+            assert!(
+                !msg.contains("unknown FFI error"),
+                "the Python task error fell back to 'unknown FFI error': {}",
+                msg
+            );
+            assert!(
+                msg.contains(PYTHON_FAIL_MESSAGE),
+                "the Python task error does not contain {:?}: {}",
+                PYTHON_FAIL_MESSAGE,
+                msg
+            );
+        }
+        other => panic!(
+            "a failing Python task returned {:?}, expected RayError::Task",
+            other
+        ),
+    }
+
+    // ── The failures stay distinguishable ──────────────────
     println!("\n--- Distinct classes ---");
     println!("  RayError::Timeout and RayError::Task are distinct variants");
 

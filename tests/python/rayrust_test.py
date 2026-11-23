@@ -35,6 +35,11 @@ def sleep_for(seconds):
     return 0
 
 
+@ray.remote
+def fail(message):
+    raise ValueError(message)
+
+
 # ── Complex type return functions ────────────────────────────────
 
 @ray.remote

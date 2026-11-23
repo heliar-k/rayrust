@@ -81,7 +81,7 @@ typedef struct {
 ///   host, a non-empty host, and a decimal port in 0..=65535. An address that does
 ///   not match, and a `RAY_ADDRESS` that does not match while `address` is empty
 ///   (an empty value counts as set, and is refused the same way), both return -1
-///   with the reason in ray_last_error() before the SDK is entered.
+///   with the reason in ray_last_error_bytes() before the SDK is entered.
 /// What upstream did with each shape this entry refuses: the ones `ParseAddress`
 ///   cannot split (no `:`, an IPv6 host without brackets) and the ones whose port
 ///   is empty or does not start with decimal digits stopped the process in the
@@ -107,10 +107,10 @@ typedef struct {
 ///   Pass NULL or empty string for default (no namespace).
 /// Returns 0 on success, -1 on failure.
 /// The address checks run before the shutdown check: when an address is refused,
-/// ray_last_error() carries that message and not
+/// ray_last_error_bytes() carries that message and not
 /// `a ray_shutdown is still in progress`.
 /// A local-mode shutdown that is still running reports -1 with
-/// `a ray_shutdown is still in progress` in ray_last_error(), and
+/// `a ray_shutdown is still in progress` in ray_last_error_bytes(), and
 /// leaves the runtime and the bookkeeping of the running shutdown untouched.
 /// A call while Ray is already initialized is a no-op that keeps the pending
 /// local-mode task list: the runtime does not change, so the tasks still have to
@@ -167,7 +167,7 @@ void ray_shutdown(void);
 ///   `ray_placement_group_get_all`、`ray_placement_group_get_by_id`、
 ///   `ray_placement_group_get_by_name`、`ray_was_current_actor_restarted`、
 ///   `ray_get_namespace`、`ray_get_actor`、`ray_cancel`。被拒绝时返回各自的空值或
-///   错误码，错误类别为 `RAY_ERROR_KIND_RUNTIME`，`ray_last_error()` 消息原文为：
+///   错误码，错误类别为 `RAY_ERROR_KIND_RUNTIME`，`ray_last_error_bytes()` 消息原文为：
 ///   `the Ray runtime is shutting down or has shut down: calls are refused until a new runtime is initialized`。
 /// - 判定次序：名字、id 宽度与引用参数 id 在取运行时之前检查，所以它们与关闭状态同时
 ///   不合法时报的是参数错误；选项 JSON 以及其中 `placement_group_id` 的查表在取运行时
@@ -228,7 +228,7 @@ ray_bytes_t ray_get(const char *id_data, size_t id_len, int timeout_ms);
 /// other length is rejected without touching Ray. `ObjectID::FromBinary`
 /// terminates the process on a non-empty length mismatch, and returns the nil
 /// ID for an empty string (src/ray/common/id.h:430-440).
-/// Returns 0 on success, -1 on error with the message in ray_last_error().
+/// Returns 0 on success, -1 on error with the message in ray_last_error_bytes().
 /// Once `ray_shutdown` has started the call returns 0 without touching Ray:
 /// the core worker is going away, so there is no count left to change.
 int ray_add_local_reference(const char *id_data, size_t id_len);
@@ -286,7 +286,7 @@ bool *ray_wait(const ray_bytes_t *ids, size_t count, size_t num_objects, int tim
 ///   Rust side; this function itself does not know arg_count's relation to it.
 ///   A reference argument must be exactly 28 bytes (the Ray 2.51.1 ObjectID
 ///   length); any other length is rejected before the TaskArg is built, with the
-///   argument index in ray_last_error(). A length mismatch would hit a RAY_CHECK
+///   argument index in ray_last_error_bytes(). A length mismatch would hit a RAY_CHECK
 ///   in `ObjectID::FromBinary` (`src/ray/common/id.h:430-441`), and in local mode
 ///   an empty id waits forever in the undeadlined `runtime->Get(id)` that
 ///   `build_task_args_cpp` performs.
@@ -367,15 +367,15 @@ ray_bytes_t ray_task_call_with_options(const char *func_name,
 /// importlib raises `ValueError: Empty module name` for an empty string — it
 /// raises before any lookup, so a module planted in `sys.modules` under the empty
 /// name does not change that. The exception escapes `task_execution_handler`, the
-/// worker exits with `SYSTEM_ERROR`, the caller's first read answers only an
-/// unknown FFI error, and the worker pool starts a replacement worker afterwards.
+/// worker exits with `SYSTEM_ERROR`, the caller's first read gets a worker
+/// error (`RAY_ERROR_KIND_WORKER`) carrying the SDK's binary payload, and the
+/// worker pool starts a replacement worker afterwards.
 /// `function_name` is not checked. The loader splits it on dots and throws the
 /// empty pieces away (`function_manager.py:139`), so an empty name resolves to the
 /// module object itself, which `_load_function_from_local` registers as the task's
 /// function (`:391-395`). An ordinary module is not callable, so the task then
 /// fails with `TypeError: 'module' object is not callable`: an ordinary task
-/// failure, where the worker stays alive and the caller reads only an unknown FFI
-/// error. A module object can be callable, though — a `types.ModuleType` subclass
+/// failure (`RAY_ERROR_KIND_TASK`), where the worker stays alive. A module object can be callable, though — a `types.ModuleType` subclass
 /// with `__call__` assigned to the module's `__class__`, or any callable placed in
 /// `sys.modules` under that name — and then the task runs and returns that
 /// object's result (measured on 2.51.1: such a module returned 3 for a call with
@@ -520,8 +520,8 @@ ray_bytes_t ray_task_call_python_with_options(const char *module_name,
 /// creation task is submitted, and the worker fails it with `RayFunctionNotFound`
 /// (`cpp/src/ray/util/function_helper.cc:163-168`, caught at
 /// `task_executor.cc:101-111`): the actor worker stops at
-/// `src/ray/core_worker/core_worker_shutdown_executor.cc:40` and the driver reads
-/// only `Actor error ... unknown FFI error`. A whitespace-only name is not trimmed
+/// `src/ray/core_worker/core_worker_shutdown_executor.cc:40` and the driver's
+/// first read fails with `RAY_ERROR_KIND_ACTOR` carrying the SDK's payload. A whitespace-only name is not trimmed
 /// and is submitted as it is, as `ray_get_actor` does; a non-empty
 /// name nobody registered keeps Ray's asynchronous semantics, because the driver has
 /// no way to learn which names are registered.
@@ -537,8 +537,8 @@ ray_bytes_t ray_actor_create_with_options(const char *func_name,
 /// `module_name` and `class_name` must be non-empty. A Python actor is named by
 /// both, and the worker resolves them in Python, so either one empty hands out
 /// an actor that never runs: the driver only submits the creation task and the
-/// caller gets `Ok` with a 16-byte id whose first read answers only
-/// `Actor error ... unknown FFI error`. An empty module name fails in
+/// caller gets `Ok` with a 16-byte id whose first read fails with
+/// `RAY_ERROR_KIND_ACTOR` carrying the SDK's payload. An empty module name fails in
 /// `python/ray/_private/function_manager.py:531` (`load_actor_class`) → `:589`
 /// (`_load_actor_class_from_local`) → `:138`
 /// (`load_function_or_class_from_local`), where
@@ -641,8 +641,8 @@ ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
 /// calls `execute_task`) and `:1873`, where `execute_task` runs
 /// `function_name = execution_info.function_name` and raises
 /// `AttributeError: 'dict' object has no attribute 'function_name'`; the caller's
-/// first read then answers only `Actor error ... unknown FFI error` and that actor
-/// cannot be called again. This entry refuses the empty name in both cases, including
+/// first read then fails with `RAY_ERROR_KIND_ACTOR` carrying the SDK's payload
+/// and that actor cannot be called again. This entry refuses the empty name in both cases, including
 /// the one where the method exists. The C++ entry `ray_actor_call` refuses an
 /// empty name in the driver as well: its single-argument `RemoteFunctionHolder`
 /// constructor throws `Function not found. Please use RAY_REMOTE to register this
@@ -686,7 +686,7 @@ ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len
 /// bytes, the same requirement and the same rejection as ray_actor_call. The
 /// width check runs before the local mode rejection below, so local mode with a
 /// short actor id reports the width error, in the same order as ray_cancel.
-/// Returns nothing: an error is reported through ray_last_error().
+/// Returns nothing: an error is reported through ray_last_error_bytes().
 /// Local mode returns an error: `AbstractRayRuntime::KillActor` starts with
 /// `CoreWorkerProcess::GetCoreWorker()`, whose `EnsureInitialized` calls
 /// `QuickExit()` (`_Exit(1)`, `src/ray/util/process.cc:845-848`) because local
@@ -835,7 +835,7 @@ ray_bytes_t ray_placement_group_create(const char *name,
 /// length are rejected without touching Ray, because
 /// `PlacementGroupID::FromBinary` RAY_CHECKs the length (`src/ray/common/id.h:435`)
 /// and that check ends the process instead of throwing.
-/// Returns 0 on success, -1 on error with the message in ray_last_error().
+/// Returns 0 on success, -1 on error with the message in ray_last_error_bytes().
 /// An id that names no group, and one that was already removed, both return 0:
 /// upstream treats them as "already removed" and does nothing
 /// (`src/ray/gcs/gcs_placement_group_manager.cc:404-408` answers `Status::OK()`
@@ -874,7 +874,7 @@ int ray_placement_group_remove(const char *group_id_data, size_t group_id_len);
 /// while a **negative value returns 0 without looking at the group**, even when
 /// the group is ready. An unready group returns 0 when the deadline passes.
 /// Returns 1 = ready, 0 = not ready, -1 = error with the message in
-/// ray_last_error().
+/// ray_last_error_bytes().
 /// Local mode returns -1: `LocalModeTaskSubmitter` does not override the
 /// interface default `return true` (`cpp/src/ray/runtime/task/task_submitter.h:49-52`),
 /// so the SDK would answer "ready" without waiting for anything.
@@ -920,9 +920,10 @@ ray_bytes_t ray_placement_group_get_by_name(const char *name);
 /// Returns true if the current actor was restarted.
 ///
 /// The return type has no error channel, so a failure reads as `false`; the
-/// reason is only visible to C callers through `ray_last_error()`. Failures are
+/// reason is only visible to C callers through `ray_last_error_bytes()`. Failures are
 /// a missing runtime (`"Ray runtime is not initialized"`), an SDK exception
-/// (its `what()`), and a non-`std::exception` throw (`"unknown exception"`).
+/// (its `RayException::msg_` payload, or `what()` for other exceptions), and a
+/// non-`std::exception` throw (`"unknown exception"`).
 /// In local mode this returns `false` without touching the core worker
 /// (`AbstractRayRuntime::WasCurrentActorRestarted` takes its SINGLE_PROCESS
 /// branch, `cpp/src/ray/runtime/abstract_ray_runtime.cc:288-291`).
@@ -1006,7 +1007,9 @@ int ray_cancel(const char *id_data, size_t id_len, bool force_kill, bool recursi
 /// `timeout_ms` is -1 for infinite wait.
 /// Returns a heap-allocated array of ray_bytes_t (one per input ID).
 /// 关闭期间同样拒绝（返回 NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
-/// On error for a specific ID, that element will have data=NULL.
+/// When the object store returns no buffer for an element or copying it fails,
+/// that element has data=NULL and len=0, and a RAY_ERROR_KIND_GENERIC message
+/// is recorded for ray_last_error_bytes().
 /// Caller must free each element with ray_free_bytes, then free the array.
 ray_bytes_t *ray_get_many(const ray_bytes_t *ids, size_t count, int timeout_ms);
 
@@ -1078,14 +1081,17 @@ typedef enum {
     RAY_ERROR_KIND_RUNTIME = 8,
 } ray_error_kind_t;
 
-/// Get the last error message (thread-local).
-/// Returns NULL if no error. The returned pointer is valid until the next
-/// ray_* call on the same thread.
-const char *ray_last_error(void);
+/// Get the last error message bytes (thread-local) and their byte length.
+/// Points directly into the thread-local `g_last_error` without copying; the
+/// pointer remains valid until the next error write or `ray_clear_error` on
+/// the same thread. Writes `*data = NULL` and `*len = 0` when no error is
+/// recorded on this thread.
+void ray_last_error_bytes(const char **data, size_t *len);
 
 /// Get the class of the last error (thread-local), one of ray_error_kind_t
 /// （0..=8，含关闭闸门写入的 `RAY_ERROR_KIND_RUNTIME`）。
-/// Returns RAY_ERROR_KIND_NONE when ray_last_error() returns NULL.
+/// Returns RAY_ERROR_KIND_NONE when no error is recorded on this thread
+/// (`ray_last_error_bytes` writes `*data = NULL, *len = 0`).
 int ray_last_error_kind(void);
 
 /// Clear the last error message and its kind.
