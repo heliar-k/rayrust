@@ -56,9 +56,16 @@ async fn main() {
         r3.get_async(),
     );
 
-    println!("add(10, 32) = {} ✓", v1.unwrap());
-    println!("add(100, 200) = {} ✓", v2.unwrap());
-    println!("greet(\"Tokio\") = {} ✓", v3.unwrap());
+    let v1: i32 = v1.expect("add(10, 32) failed");
+    let v2: i32 = v2.expect("add(100, 200) failed");
+    let v3: String = v3.expect("greet(Tokio) failed");
+
+    println!("add(10, 32) = {} ✓", v1);
+    println!("add(100, 200) = {} ✓", v2);
+    println!("greet(\"Tokio\") = {} ✓", v3);
+    assert_eq!(v1, 42, "add(10, 32)");
+    assert_eq!(v2, 300, "add(100, 200)");
+    assert_eq!(v3, "Hello, Tokio from Rust worker!");
 
     // ── Batch Concurrent Tasks (10 tasks) ───────────────────
     println!("\n--- Batch Concurrent (10 tasks) ---");
@@ -76,7 +83,7 @@ async fn main() {
         get_futs.push(async move { obj_ref.get_async().await });
     }
     let results: Vec<i32> = join_all(get_futs).await
-        .into_iter().map(|r| r.unwrap_or(0)).collect();
+        .into_iter().map(|r| r.expect("task result failed")).collect();
 
     let mut sum = 0i32;
     for (i, val) in results.iter().enumerate() {

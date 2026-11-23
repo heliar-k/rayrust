@@ -1,0 +1,110 @@
+name: CI
+
+"on":
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Test (Ray ${{ matrix.ray }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        ray:
+          - "2.49.0"
+          - "2.51.1"
+          - "2.55.0"
+          - "2.60.0"
+    env:
+      RAY_VERSION: ${{ matrix.ray }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Download and extract Ray C++ SDK
+        run: |
+          python3 -m pip download --no-deps --only-binary=:all: -d "$RUNNER_TEMP/wheels" "ray-cpp==$RAY_VERSION"
+          unzip -q "$RUNNER_TEMP/wheels"/ray_cpp-*.whl "ray/cpp/*" -d "$RUNNER_TEMP/ray-sdk"
+          echo "RAY_CPP_DIR=$RUNNER_TEMP/ray-sdk/ray/cpp" >> "$GITHUB_ENV"
+
+      - name: Build all targets
+        run: cargo build --release --all-targets
+
+      - name: Run unit and integration tests
+        run: cargo test
+
+      - name: Run unit and integration tests (release)
+        run: cargo test --release
+
+      - name: Run doc tests
+        run: cargo test --doc
+
+      - name: Build documentation
+        run: cargo doc --no-deps
+
+      - name: Resolve the SDK through the download branch
+        if: matrix.ray == '2.60.0'
+        env:
+          RAYRUST_CACHE_DIR: ${{ runner.temp }}/sdk-cache
+        run: |
+          set -o pipefail
+          cargo clean -p rayrust-sys
+          first="$(env -u RAY_CPP_DIR cargo build -p rayrust-sys -v 2>&1)"
+          printf '%s\n' "$first"
+          grep -q '(from download)' <<< "$first"
+          cargo clean -p rayrust-sys
+          second="$(env -u RAY_CPP_DIR cargo build -p rayrust-sys -v 2>&1)"
+          printf '%s\n' "$second"
+          grep -q '(from cache)' <<< "$second"
+
+  cluster:
+    name: Cluster E2E (Ray 2.51.1)
+    runs-on: ubuntu-24.04
+    needs: build
+    timeout-minutes: 30
+    env:
+      PYTHONPATH: ${{ github.workspace }}/tests/python
+      RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE: '1'
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install ray[cpp]
+        run: python3 -m pip install "ray[cpp]==2.51.1"
+
+      - name: Build all targets
+        run: cargo build --release --all-targets
+
+      - name: Start Ray cluster
+        run: ray start --head --num-cpus=2
+
+      - name: Run cluster examples
+        run: |
+          export RAY_NODE_IP="$(python3 -c 'import ray._private.services as s; print(s.get_node_ip_address())')"
+          export RAY_ADDRESS="${RAY_NODE_IP}:6379"
+          export RAY_WORKER_SO="$PWD/target/release/librayrust_worker.so"
+          cargo run --release --example full_test
+          cargo run --release --example actor_e2e
+          cargo run --release --example async_demo
+
+      - name: Stop Ray cluster
+        if: always()
+        run: ray stop --force

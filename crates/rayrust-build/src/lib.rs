@@ -411,15 +411,22 @@ fn fetch_wheel_url(version: &str, platform: &str) -> Result<String, String> {
     }
 
     let json = String::from_utf8_lossy(&output.stdout);
-    for pytag in ["cp312", "cp311", "cp310"] {
-        let filename = format!("ray_cpp-{version}-{pytag}-{pytag}-{platform}.whl");
-        if let Some(url) = extract_url_for_filename(&json, &filename) {
+    select_wheel_url(&json, version, platform)
+}
+
+const WHEEL_TAGS: &[&str] = &["py3-none", "cp312-cp312", "cp311-cp311", "cp310-cp310"];
+
+fn select_wheel_url(json: &str, version: &str, platform: &str) -> Result<String, String> {
+    for tag in WHEEL_TAGS {
+        let filename = format!("ray_cpp-{version}-{tag}-{platform}.whl");
+        if let Some(url) = extract_url_for_filename(json, &filename) {
             return Ok(url);
         }
     }
 
     Err(format!(
-        "no ray_cpp wheel found for version {version} on platform {platform} (tried cp312, cp311, cp310)"
+        "no ray_cpp wheel found for version {version} on platform {platform} (tried {})",
+        WHEEL_TAGS.join(", ")
     ))
 }
 
@@ -739,5 +746,43 @@ mod tests {
         assert!(!version_matches("", ""));
         assert!(!version_matches("   ", "2.51.1"));
         assert!(version_matches("  2.51.1\n", "2.51.1  "));
+    }
+
+    #[test]
+    fn select_wheel_url_matches_py3_none_and_cp_wheels() {
+        let pypi_255 = concat!(
+            r#"{"urls":["#,
+            r#"{"filename":"ray_cpp-2.55.0-py3-none-macosx_12_0_arm64.whl","url":"https://files.pythonhosted.org/packages/arm64/ray_cpp-2.55.0-py3-none-macosx_12_0_arm64.whl"},"#,
+            r#"{"filename":"ray_cpp-2.55.0-py3-none-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/61/64/4de4ad58dd50532aa2774462af8531395af55ff54c19e6d270c643611823/ray_cpp-2.55.0-py3-none-manylinux2014_x86_64.whl"}"#,
+            r#"]}"#,
+        );
+        assert_eq!(
+            select_wheel_url(pypi_255, "2.55.0", "manylinux2014_x86_64").unwrap(),
+            "https://files.pythonhosted.org/packages/61/64/4de4ad58dd50532aa2774462af8531395af55ff54c19e6d270c643611823/ray_cpp-2.55.0-py3-none-manylinux2014_x86_64.whl"
+        );
+
+        let pypi_260 = concat!(
+            r#"{"urls":["#,
+            r#"{"filename":"ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/97/e0/099d1ea4558d3d7115a0b4143f25c20830d36dfd3e0f8200868d63a2aadf/ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl"}"#,
+            r#"]}"#,
+        );
+        assert_eq!(
+            select_wheel_url(pypi_260, "2.60.0", "manylinux2014_x86_64").unwrap(),
+            "https://files.pythonhosted.org/packages/97/e0/099d1ea4558d3d7115a0b4143f25c20830d36dfd3e0f8200868d63a2aadf/ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl"
+        );
+
+        let pypi_2511 = concat!(
+            r#"{"urls":["#,
+            r#"{"filename":"ray_cpp-2.51.1-cp310-cp310-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/cp310/ray_cpp-2.51.1-cp310-cp310-manylinux2014_x86_64.whl"},"#,
+            r#"{"filename":"ray_cpp-2.51.1-cp312-cp312-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/1c/84/c7aecb7867ca3b85dbcfa20808f698727c35163b76ad2baae94fcad9531c/ray_cpp-2.51.1-cp312-cp312-manylinux2014_x86_64.whl"}"#,
+            r#"]}"#,
+        );
+        assert_eq!(
+            select_wheel_url(pypi_2511, "2.51.1", "manylinux2014_x86_64").unwrap(),
+            "https://files.pythonhosted.org/packages/1c/84/c7aecb7867ca3b85dbcfa20808f698727c35163b76ad2baae94fcad9531c/ray_cpp-2.51.1-cp312-cp312-manylinux2014_x86_64.whl"
+        );
+
+        let err = select_wheel_url(pypi_260, "2.60.0", "win_amd64").unwrap_err();
+        assert!(err.contains("py3-none"), "err was: {err}");
     }
 }
