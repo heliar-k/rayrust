@@ -218,6 +218,9 @@ pub enum ErrorKind {
     Timeout = 7,
     /// 运行时正在关闭：`ray_shutdown` 已经开始或已经结束，等下一次 `ray_init`。
     Runtime = 8,
+    /// Ray 判定该对象失败，且错误类型不在 C++ SDK 翻译的七种之内；由 `ray_get` 与
+    /// `ray_get_many` 在收到零长度缓冲区时写入。
+    Unclassified = 9,
 }
 
 impl ErrorKind {
@@ -234,6 +237,7 @@ impl ErrorKind {
             6 => ErrorKind::Unreconstructable,
             7 => ErrorKind::Timeout,
             8 => ErrorKind::Runtime,
+            9 => ErrorKind::Unclassified,
             _ => ErrorKind::Generic,
         }
     }

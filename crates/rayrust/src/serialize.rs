@@ -37,6 +37,15 @@
 //!   `ObjectRef::get_raw_bytes`；
 //! - 声明长度大于剩余字节：同样返回 [`RayError::Serialization`]。
 //!
+//! 对象读取入口在解码之前先用 `rayrust_sys::error_payload::extract` 判定载荷是否为
+//! 未翻译错误对象的帧（`9 + N` 字节的 protobuf）：命中即返回携带该错误文本的
+//! [`RayError::Unclassified`]，未命中才解码，解码失败仍是 [`RayError::Serialization`]。
+//! 判定必须前置：帧本身是合法 msgpack（跨语言路径剥掉 9 字节头后是 `bin`，非跨语言
+//! 路径首值是正文长度），对 `Vec<u8>`、`rmpv::Value` 与非跨语言的整数类型都能解出
+//! 成功值。帧规则（总长恰为 `9 + N`、正文是 msgpack `bin`、protobuf 顶层字段号与
+//! wire type 都在允许集合内、文本非空且是合法 UTF-8）之外的字节不会被判成帧；恰好
+//! 拼成这些规则的载荷会被报成 [`RayError::Unclassified`]，代价是该载荷不再参与解码。
+//!
 //! For dynamic/generic deserialization (when the Rust caller doesn't know the
 //! exact Python return type), use `rmpv::Value` which is msgpack's equivalent
 //! of `serde_json::Value`.
@@ -255,7 +264,10 @@ mod tests {
 
     /// 构造一个带 XLANG 头的载荷：声明长度用正 fixint 写，后面跟 `body`。
     fn xlang_payload(declared: usize, body: &[u8]) -> Vec<u8> {
-        assert!(declared <= 0x7f, "these fixtures write the length as a positive fixint");
+        assert!(
+            declared <= 0x7f,
+            "these fixtures write the length as a positive fixint"
+        );
         let mut data = vec![declared as u8];
         data.extend_from_slice(&[0u8; XLANG_HEADER_LEN - 1]);
         data.extend_from_slice(body);
@@ -430,7 +442,10 @@ mod tests {
         data.extend_from_slice(&5i64.to_be_bytes());
         assert_eq!(data.len(), XLANG_HEADER_LEN);
         assert_eq!(xlang_declared_msgpack_len(&data), Some(5));
-        assert!(matches!(split_xlang(&data), Err(RayError::Serialization(_))));
+        assert!(matches!(
+            split_xlang(&data),
+            Err(RayError::Serialization(_))
+        ));
         assert!(matches!(
             deserialize_xlang::<i64>(&data),
             Err(RayError::Serialization(_))
@@ -464,8 +479,11 @@ mod tests {
         // 载荷 128-255 字节：头部用 uint8 编码（0xcc + 1 字节）
         let payload_str = "x".repeat(200);
         let payload = serialize(&payload_str).unwrap();
-        assert!(payload.len() > 127 && payload.len() <= 255,
-            "payload len = {}, expected 128-255", payload.len());
+        assert!(
+            payload.len() > 127 && payload.len() <= 255,
+            "payload len = {}, expected 128-255",
+            payload.len()
+        );
         let xlang = serialize_xlang(&payload_str).unwrap();
         let (msgpack, tail) = split_xlang(&xlang).unwrap().expect("an XLANG header");
         assert_eq!(msgpack.len(), payload.len());
@@ -479,8 +497,11 @@ mod tests {
         // 载荷超过 255 字节：头部用 uint16 编码（0xcd + 2 字节）
         let payload_str = "x".repeat(1000);
         let payload = serialize(&payload_str).unwrap();
-        assert!(payload.len() > 255,
-            "payload len = {}, expected > 255", payload.len());
+        assert!(
+            payload.len() > 255,
+            "payload len = {}, expected > 255",
+            payload.len()
+        );
         let xlang = serialize_xlang(&payload_str).unwrap();
         let (msgpack, tail) = split_xlang(&xlang).unwrap().expect("an XLANG header");
         assert_eq!(msgpack.len(), payload.len());
@@ -649,21 +670,29 @@ mod tests {
     #[test]
     fn test_deserialize_xlang_value_dict() {
         let map_value = rmpv::Value::Map(vec![
-            (rmpv::Value::String("name".into()), rmpv::Value::String("alice".into())),
-            (rmpv::Value::String("age".into()), rmpv::Value::Integer(30.into())),
+            (
+                rmpv::Value::String("name".into()),
+                rmpv::Value::String("alice".into()),
+            ),
+            (
+                rmpv::Value::String("age".into()),
+                rmpv::Value::Integer(30.into()),
+            ),
         ]);
         let xlang_bytes = serialize_xlang(&map_value).unwrap();
         let value = deserialize_xlang_value(&xlang_bytes).unwrap();
         assert!(value.is_map());
 
         let entries = value.as_map().unwrap();
-        let name_val = entries.iter()
+        let name_val = entries
+            .iter()
             .find(|(k, _)| k.as_str() == Some("name"))
             .map(|(_, v)| v)
             .unwrap();
         assert_eq!(name_val.as_str().unwrap(), "alice");
 
-        let age_val = entries.iter()
+        let age_val = entries
+            .iter()
             .find(|(k, _)| k.as_str() == Some("age"))
             .map(|(_, v)| v)
             .unwrap();
@@ -692,7 +721,8 @@ mod tests {
         assert!(value.is_map());
 
         let entries = value.as_map().unwrap();
-        let items = entries.iter()
+        let items = entries
+            .iter()
             .find(|(k, _)| k.as_str() == Some("items"))
             .map(|(_, v)| v)
             .unwrap();

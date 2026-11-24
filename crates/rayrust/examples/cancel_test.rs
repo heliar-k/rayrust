@@ -3,7 +3,8 @@
 //! The long task is a Python `time.sleep` call that never finishes by itself and
 //! now requests the default one CPU, so on a `--num-cpus=1` node it holds the only
 //! CPU while it runs; the task queued behind it waits for the CPU and for its
-//! result.
+//! result. Once cancelled, reading either ref resolves to `RayError::Unclassified`
+//! carrying the `TASK_CANCELLED` explanation.
 //!   ray start --head --port=6399 --num-cpus=1 --include-dashboard=false
 //!
 //! Environment: RAY_ADDRESS, RAY_NODE_IP, RAY_WORKER_SO.
@@ -90,9 +91,9 @@ fn expect_refused(ray: &Ray) {
     }
 }
 
-/// A cancelled ref must resolve to a failure on its own and quickly. An expired
-/// get_timeout is the failure an unresolved object gives, so that variant is
-/// what this rejects. Elapsed time is checked separately against the timeout.
+/// A cancelled ref must resolve quickly to `RayError::Unclassified`, because
+/// `TASK_CANCELLED` is outside the seven `ErrorType` values the C++ SDK
+/// translates and therefore reaches `ray_get` as a zero-length buffer.
 fn expect_fast_failure<T: DeserializeOwned>(obj_ref: &ObjectRef<T>, label: &str) {
     let start = Instant::now();
     let result = obj_ref.get_timeout(GET_TIMEOUT_MS);
@@ -103,8 +104,35 @@ fn expect_fast_failure<T: DeserializeOwned>(obj_ref: &ObjectRef<T>, label: &str)
             "{}: get_timeout expired ({}) instead of the ref failing",
             label, detail
         ),
-        Err(e) => {
+        Err(e @ RayError::Unclassified(_)) => {
             println!("  {} failed after {} ms: {}", label, elapsed, e);
+            let RayError::Unclassified(ref msg) = e else {
+                unreachable!()
+            };
+            assert!(
+                msg.contains("ray_get"),
+                "{}: message does not name ray_get: {}",
+                label,
+                msg
+            );
+            assert!(
+                msg.contains("TASK_CANCELLED"),
+                "{}: message does not name TASK_CANCELLED: {}",
+                label,
+                msg
+            );
+            assert!(
+                msg.contains("does not translate"),
+                "{}: message does not state that the SDK does not translate the error type: {}",
+                label,
+                msg
+            );
+            assert!(
+                msg.contains("records no error text"),
+                "{}: message does not explain the absence of error text: {}",
+                label,
+                msg
+            );
             assert!(
                 elapsed < FAST_FAIL_MS,
                 "{}: failure took {} ms, not well under the {} ms timeout",
@@ -113,6 +141,10 @@ fn expect_fast_failure<T: DeserializeOwned>(obj_ref: &ObjectRef<T>, label: &str)
                 GET_TIMEOUT_MS
             );
         }
+        Err(other) => panic!(
+            "{}: expected RayError::Unclassified after {} ms, got {}",
+            label, elapsed, other
+        ),
     }
 }
 

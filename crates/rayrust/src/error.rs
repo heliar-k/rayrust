@@ -32,6 +32,12 @@ pub enum RayError {
     #[error("Unreconstructable object: {0}")]
     Unreconstructable(String),
 
+    /// Ray failed the object with an error type the C++ SDK does not
+    /// translate: either a zero-length object that records no error text, or an
+    /// error frame whose recorded text is extracted before decoding.
+    #[error("Unclassified error: {0}")]
+    Unclassified(String),
+
     #[error("Timed out: {0}")]
     Timeout(String),
 

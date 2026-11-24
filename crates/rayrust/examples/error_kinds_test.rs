@@ -1,7 +1,14 @@
 //! Example: Ray's error classes survive the C ABI as distinct RayError variants.
 //!
-//! Three failures are triggered on the driver and their variants compared:
+//! Nine failures are triggered on the driver and their variants compared, plus
+//! one control that a normal `bytes` value still decodes:
 //!   - a get_timeout on a ref that never resolves → RayError::Timeout
+//!   - a get_timeout on that ref after cancel → RayError::Unclassified (zero-length object)
+//!   - a get_many_timeout on a cancelled ref → RayError::Unclassified carrying the index
+//!   - a task whose runtime_env fails to set up → RayError::Unclassified carrying the decoded text
+//!   - the same frame read as `Vec<u8>` → RayError::Unclassified
+//!   - the same frame read as `rmpv::Value` → RayError::Unclassified
+//!   - the same frame on a Rust task read as `i64` → RayError::Unclassified
 //!   - a task whose function name no worker registers → RayError::Task
 //!   - a Python task that raises ValueError → RayError::Task carrying the text
 //!
@@ -29,6 +36,10 @@ const MISSING_FUNCTION: &str = "error_kinds_test_unregistered_function";
 const PYTHON_MODULE: &str = "rayrust_test";
 const PYTHON_FAIL_FUNCTION: &str = "fail";
 const PYTHON_FAIL_MESSAGE: &str = "python-task-boom-t37";
+
+/// A `working_dir` the runtime env agent rejects: it must be a URI, so any bare
+/// path fails setup and the task's object carries `RUNTIME_ENV_SETUP_FAILED`.
+const NOT_A_URI_WORKING_DIR: &str = "nonexistent-t39-dir";
 
 fn hex_prefix(bytes: &[u8], limit: usize) -> String {
     bytes
@@ -112,6 +123,254 @@ fn main() {
     }
     ray.cancel(long_task.id(), true, true)
         .expect("cancel the sleeping task after the timeout check");
+
+    // ── A cancelled task read through get_timeout ──────────
+    println!("\n--- Unclassified (single object): cancelled task carries no data ---");
+    let single_cancel_err = match long_task.get_timeout(10_000) {
+        Ok(()) => panic!("the cancelled task still delivered a value"),
+        Err(e) => e,
+    };
+    match &single_cancel_err {
+        RayError::Unclassified(msg) => {
+            println!("  get_timeout(10000 ms) → RayError::Unclassified");
+            println!("    message: {}", msg);
+            assert!(
+                msg.contains("ray_get:"),
+                "the single-object unclassified error does not carry the ray_get prefix: {:?}",
+                msg
+            );
+            assert!(
+                msg.contains("TASK_CANCELLED"),
+                "the single-object unclassified error does not name TASK_CANCELLED: {:?}",
+                msg
+            );
+            assert!(
+                msg.contains("does not translate"),
+                "the single-object unclassified error does not state that the SDK does not translate the error type: {:?}",
+                msg
+            );
+            assert!(
+                !msg.contains('\u{FFFD}'),
+                "the single-object unclassified error contains replacement characters: {:?}",
+                msg
+            );
+        }
+        other => panic!(
+            "get_timeout on a cancelled ref returned {:?}, expected RayError::Unclassified",
+            other
+        ),
+    }
+
+    // ── A cancelled task read through get_many_timeout ─────
+    println!("\n--- Unclassified (batch): cancelled task in get_many_timeout ---");
+    let batch_cancelled = submit_long_task(&ray);
+    println!(
+        "  submitted time.sleep({}) → {}",
+        LONG_TASK_SLEEP_S,
+        batch_cancelled.id_hex()
+    );
+    ray.cancel(batch_cancelled.id(), true, true)
+        .expect("cancel the sleeping task for the batch check");
+    let batch_cancel_err =
+        match ray.get_many_timeout(std::slice::from_ref(&batch_cancelled), 10_000) {
+            Ok(_) => panic!("get_many_timeout on a cancelled task returned Ok"),
+            Err(e) => e,
+        };
+    match &batch_cancel_err {
+        RayError::Unclassified(msg) => {
+            println!("  get_many_timeout([cancelled], 10000 ms) → RayError::Unclassified");
+            println!("    message: {}", msg);
+            assert!(
+                msg.contains("ray_get_many (0)"),
+                "the batch unclassified error does not carry 'ray_get_many (0)': {:?}",
+                msg
+            );
+            assert!(
+                msg.contains("TASK_CANCELLED"),
+                "the batch unclassified error does not name TASK_CANCELLED: {:?}",
+                msg
+            );
+            assert!(
+                msg.contains("does not translate"),
+                "the batch unclassified error does not state that the SDK does not translate the error type: {:?}",
+                msg
+            );
+            assert!(
+                !msg.contains('\u{FFFD}'),
+                "the batch unclassified error contains replacement characters: {:?}",
+                msg
+            );
+        }
+        other => panic!(
+            "get_many_timeout on a cancelled ref returned {:?}, expected RayError::Unclassified",
+            other
+        ),
+    }
+
+    // ── A runtime_env that fails to set up: non-empty error frame ──
+    println!("\n--- Unclassified (payload): runtime_env setup failure ---");
+    let arg1 = serialize(&1i64).expect("serialize 1");
+    let bad_env_json = format!(r#"{{"working_dir":"{}"}}"#, NOT_A_URI_WORKING_DIR);
+    let bad_env_opts = TaskOptions::new().runtime_env(bad_env_json);
+    let bad_env: ObjectRef<i64> = ray
+        .task_call_python_with_options(PYTHON_MODULE, "add", &[&arg1, &arg1], &[], &bad_env_opts)
+        .expect("submit a task with a bad runtime_env")
+        .cast();
+    println!(
+        "  submitted '{}.add(1, 1)' with bad runtime_env → {}",
+        PYTHON_MODULE,
+        bad_env.id_hex()
+    );
+    let bad_env_err = match bad_env.get_timeout(120_000) {
+        Ok(val) => panic!(
+            "a task with a bad runtime_env returned {} instead of failing",
+            val
+        ),
+        Err(e) => e,
+    };
+    match &bad_env_err {
+        RayError::Unclassified(msg) => {
+            println!("  get_timeout(120000 ms) → RayError::Unclassified");
+            println!("    message:\n{}", msg);
+            assert!(
+                msg.contains("does not translate"),
+                "the runtime_env unclassified error does not state that the SDK does not translate the error type: {:?}",
+                msg
+            );
+            assert!(
+                msg.contains(&format!(
+                    "Expected URI but received path {}",
+                    NOT_A_URI_WORKING_DIR
+                )),
+                "the runtime_env unclassified error does not contain the ValueError path message: {:?}",
+                msg
+            );
+            assert!(
+                msg.contains("Traceback"),
+                "the runtime_env unclassified error does not contain 'Traceback': {:?}",
+                msg
+            );
+            assert!(
+                !msg.contains('\u{FFFD}'),
+                "the runtime_env unclassified error contains replacement characters: {:?}",
+                msg
+            );
+        }
+        other => panic!(
+            "get_timeout on a failed runtime_env task returned {}, expected RayError::Unclassified",
+            other
+        ),
+    }
+
+    // ── The same frame is never decoded into a value ───────
+    println!("\n--- Unclassified (payload): the frame is checked before decoding ---");
+    let bad_env_as_bytes = bad_env.clone().cast::<Vec<u8>>();
+    match bad_env_as_bytes.get_timeout(10_000) {
+        Ok(bytes) => panic!(
+            "the runtime_env frame read as Vec<u8> returned {} bytes instead of failing",
+            bytes.len()
+        ),
+        Err(RayError::Unclassified(msg)) => {
+            println!("  get_timeout::<Vec<u8>> → RayError::Unclassified");
+            println!(
+                "    message: {} bytes, first line: {}",
+                msg.len(),
+                msg.lines().next().unwrap_or("")
+            );
+            assert!(
+                msg.contains("does not translate"),
+                "the Vec<u8> unclassified error does not state that the SDK does not translate the error type: {:?}",
+                msg
+            );
+            assert!(
+                msg.contains("Traceback"),
+                "the Vec<u8> unclassified error does not contain 'Traceback': {:?}",
+                msg
+            );
+        }
+        other => panic!(
+            "the runtime_env frame read as Vec<u8> returned {:?}, expected RayError::Unclassified",
+            other
+        ),
+    }
+
+    match bad_env.get_value() {
+        Ok(value) => panic!(
+            "the runtime_env frame read as rmpv::Value returned {:?} instead of failing",
+            value
+        ),
+        Err(RayError::Unclassified(msg)) => {
+            println!("  get_value() → RayError::Unclassified");
+            assert!(
+                msg.contains("does not translate"),
+                "the rmpv::Value unclassified error does not state that the SDK does not translate the error type: {:?}",
+                msg
+            );
+        }
+        other => panic!(
+            "the runtime_env frame read as rmpv::Value returned {:?}, expected RayError::Unclassified",
+            other
+        ),
+    }
+
+    // 非跨语言任务（`is_xlang = false`）：帧首值是正文长度，按整数读会得到伪造的成功值。
+    let bad_env_rust: ObjectRef<i64> = ray
+        .task_call("add", &[&arg1, &arg1], &[], &bad_env_opts)
+        .expect("submit a Rust task with a bad runtime_env")
+        .cast();
+    println!(
+        "  submitted Rust add(1, 1) with bad runtime_env → {}",
+        bad_env_rust.id_hex()
+    );
+    match bad_env_rust.get_timeout(120_000) {
+        Ok(val) => panic!(
+            "the non-xlang runtime_env frame read as i64 returned {} instead of failing",
+            val
+        ),
+        Err(RayError::Unclassified(msg)) => {
+            println!("  get_timeout::<i64>() on the Rust task → RayError::Unclassified");
+            assert!(
+                msg.contains("does not translate"),
+                "the non-xlang unclassified error does not state that the SDK does not translate the error type: {:?}",
+                msg
+            );
+            assert!(
+                msg.contains("Traceback"),
+                "the non-xlang unclassified error does not contain 'Traceback': {:?}",
+                msg
+            );
+        }
+        other => panic!(
+            "the non-xlang runtime_env frame read as i64 returned {:?}, expected RayError::Unclassified",
+            other
+        ),
+    }
+
+    // ── Control: a normal bytes value still decodes ────────
+    println!("\n--- Control: normal bytes values decode, they are not classified ---");
+    for (label, text) in [("non-empty", "t39-bytes"), ("empty", "")] {
+        let arg = serialize(&text).expect("serialize the os.fsencode argument");
+        let bytes_ref: ObjectRef<Vec<u8>> = ray
+            .task_call_python("os", "fsencode", &[&arg], &[])
+            .expect("submit os.fsencode")
+            .cast();
+        let got = match bytes_ref.get_timeout(10_000) {
+            Ok(got) => got,
+            Err(e) => panic!("os.fsencode({:?}) failed: {}", text, e),
+        };
+        println!(
+            "  os.fsencode({:?}) ({}) → Ok(Vec<u8> len={})",
+            text,
+            label,
+            got.len()
+        );
+        assert_eq!(
+            got,
+            text.as_bytes(),
+            "os.fsencode({:?}) did not round-trip",
+            text
+        );
+    }
 
     // ── A task whose function does not exist ───────────────
     println!("\n--- Task failure: unregistered function name ---");
@@ -223,8 +482,10 @@ fn main() {
 
     // ── The failures stay distinguishable ──────────────────
     println!("\n--- Distinct classes ---");
-    println!("  RayError::Timeout and RayError::Task are distinct variants");
-
+    println!(
+        "  RayError::Timeout, RayError::Task, and RayError::Unclassified are distinct variants"
+    );
+    println!("  RayError::Unclassified covers zero-length objects and untranslated error frames");
     println!("\n--- Shutdown ---");
     drop(ray);
     println!("✓ All error-kind checks passed");

@@ -28,6 +28,7 @@ fn error_from_kind(kind: ErrorKind, msg: String) -> RayError {
         ErrorKind::Unreconstructable => RayError::Unreconstructable(msg),
         ErrorKind::Timeout => RayError::Timeout(msg),
         ErrorKind::Runtime => RayError::Runtime(msg),
+        ErrorKind::Unclassified => RayError::Unclassified(msg),
     }
 }
 
@@ -47,6 +48,21 @@ fn ffi_error_detail(context: &str, detail: impl std::fmt::Display) -> RayError {
         rayrust_sys::last_error_kind(),
         format!("{} ({}): {}", context, detail, msg),
     )
+}
+
+/// 载荷是 C++ SDK 未翻译的错误对象的帧（`9 + N` 的 protobuf）时，构造带 Ray 记录
+/// 文本的 `RayError::Unclassified`；不是帧时返回 `None`。
+///
+/// 判定必须在解码之前完成：`9 + N` 的帧本身是合法 msgpack（跨语言路径剥掉 9 字节头
+/// 后是 `bin`，非跨语言路径首值是正文长度），解码可能返回成功值，因此解码结果不能
+/// 作为判据。
+pub(crate) fn untranslated_error(context: &str, bytes: &[u8]) -> Option<RayError> {
+    rayrust_sys::error_payload::extract(bytes).map(|text| {
+        RayError::Unclassified(format!(
+            "{}: the object carries an error the C++ SDK does not translate: {}",
+            context, text
+        ))
+    })
 }
 
 // ─── Config ───────────────────────────────────────────────────
@@ -499,7 +515,10 @@ impl Ray {
     /// If any element's cross-language payload carries a pickle5 section, the
     /// whole batch returns `RayError::Serialization`: the plain values already
     /// read from the same batch are dropped too, because
-    /// `get_many_with_timeout` returns on the first error.
+    /// `get_many_with_timeout` returns on the first error. An element that Ray
+    /// failed with an untranslated error type (zero-length, or carrying an
+    /// error frame, which is recognised before decoding) fails the batch with
+    /// `RayError::Unclassified` carrying its index.
     pub fn get_many<T: serde::de::DeserializeOwned>(
         &self,
         refs: &[ObjectRef<T>],
@@ -512,7 +531,9 @@ impl Ray {
     /// `timeout_ms` 是 `-1`（永久等待）或非负的毫秒数，其他值返回
     /// `RayError::Ffi`。每个引用必须正好 28 字节，其他长度（包括 0 字节）同样返回
     /// `RayError::Ffi`，进程存活。批里任一元素的载荷带 pickle5 段时整批返回
-    /// `RayError::Serialization`，同一批里已经取到的普通值也拿不到
+    /// `RayError::Serialization`，任一元素属于 C++ SDK 未翻译的错误类型（零长度对象
+    /// 或未翻译错误帧，帧的判定在解码之前完成）时整批返回带下标的
+    /// `RayError::Unclassified`，同一批里已经取到的普通值也拿不到
     /// （`get_many_with_timeout` 用 `?` 直接返回）。
     pub fn get_many_timeout<T: serde::de::DeserializeOwned>(
         &self,
@@ -526,7 +547,8 @@ impl Ray {
     ///
     /// 默认期限 300 秒，自定义期限用 `get_many_timeout_async`。整批是 blocking
     /// pool 上的一次 `Get`。批里任一元素的载荷带 pickle5 段时整批返回
-    /// `RayError::Serialization`，同一批里已经取到的普通值也拿不到。
+    /// `RayError::Serialization`，属于未翻译错误类型时返回带下标的
+    /// `RayError::Unclassified`，同一批里已经取到的普通值也拿不到。
     pub async fn get_many_async<T>(&self, refs: &[ObjectRef<T>]) -> Result<Vec<T>, RayError>
     where
         T: serde::de::DeserializeOwned + Send + 'static,
@@ -541,7 +563,8 @@ impl Ray {
     /// `get_timeout_async` 一样，期限从 blocking pool 的线程接到这次调用时开始计时。
     /// 每个引用必须正好 28 字节，其他长度（包括 0 字节）返回 `RayError::Ffi`。
     /// 批里任一元素的载荷带 pickle5 段时整批返回 `RayError::Serialization`，
-    /// 同一批里已经取到的普通值也拿不到。
+    /// 属于未翻译错误类型时返回带下标的 `RayError::Unclassified`，同一批里已经
+    /// 取到的普通值也拿不到。
     pub async fn get_many_timeout_async<T>(
         &self,
         refs: &[ObjectRef<T>],
@@ -1566,6 +1589,10 @@ pub(crate) fn get_raw(id: &[u8]) -> Result<Vec<u8>, RayError> {
 }
 
 /// Get raw bytes from the object store by binary ID with timeout.
+///
+/// 收到零长度缓冲区（不带错误文本的未翻译失败对象）时由 C 侧记录并返回
+/// `RayError::Unclassified`；携带未翻译错误帧的对象有非空载荷，这里原样返回字节，
+/// 由上层读取入口在解码之前识别为 `RayError::Unclassified`。
 pub(crate) fn get_raw_timeout(id: &[u8], timeout_ms: i32) -> Result<Vec<u8>, RayError> {
     validate_timeout(timeout_ms)?;
 
@@ -3105,7 +3132,8 @@ pub(crate) fn get_many_with_timeout<T: serde::de::DeserializeOwned>(
     decode_batch_array(refs, array)
 }
 
-/// 解码 `ray_get_many` 返回的 `ray_bytes_t` 数组；元素为空指针时按错误通道加上下标报错。
+/// 解码 `ray_get_many` 返回的 `ray_bytes_t` 数组；元素为空指针时按错误通道加上下标报错，
+/// 元素载荷是未翻译错误帧时返回带下标的 `RayError::Unclassified`（判定在解码之前）。
 fn decode_batch_array<T: serde::de::DeserializeOwned>(
     refs: &[ObjectRef<T>],
     array: *mut RayBytes,
@@ -3119,6 +3147,9 @@ fn decode_batch_array<T: serde::de::DeserializeOwned>(
             return Err(ffi_error_detail("ray_get_many", i));
         }
         let slice = unsafe { std::slice::from_raw_parts(bytes.data as *const u8, bytes.len) };
+        if let Some(err) = untranslated_error(&format!("ray_get_many ({})", i), slice) {
+            return Err(err);
+        }
         let val = if obj_ref.is_xlang {
             crate::serialize::deserialize_xlang(slice)?
         } else {
@@ -3164,6 +3195,86 @@ mod tests {
             "预期 RayError::Runtime(\"x\"), 实际得到 {:?}",
             err
         );
+    }
+
+    #[test]
+    fn error_from_kind_maps_unclassified_to_ray_error_unclassified() {
+        assert_eq!(ErrorKind::from_raw(9), ErrorKind::Unclassified);
+        let err = error_from_kind(ErrorKind::Unclassified, "x".to_string());
+        assert!(
+            matches!(err, RayError::Unclassified(ref msg) if msg == "x"),
+            "预期 RayError::Unclassified(\"x\"), 得到 {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn untranslated_error_builds_from_frames_and_ignores_other_bytes() {
+        let text = b"ValueError: Expected URI but received path /nonexistent\n";
+        let mut pb = Vec::with_capacity(2 + text.len() + 2);
+        pb.push((5 << 3) | 2);
+        pb.push(text.len() as u8);
+        pb.extend_from_slice(text);
+        pb.push((11 << 3) | 0);
+        pb.push(7);
+
+        let mut body = vec![0xc4, pb.len() as u8];
+        body.extend_from_slice(&pb);
+        let mut frame = vec![body.len() as u8];
+        frame.extend_from_slice(&[0u8; 8]);
+        frame.extend_from_slice(&body);
+
+        match untranslated_error("ray_get", &frame) {
+            Some(RayError::Unclassified(msg)) => {
+                assert!(
+                    msg.starts_with(
+                        "ray_get: the object carries an error the C++ SDK does not translate: "
+                    ),
+                    "前缀不符: {:?}",
+                    msg
+                );
+                assert!(
+                    msg.ends_with("ValueError: Expected URI but received path /nonexistent"),
+                    "未提取出末尾去除空白后的错误文本: {:?}",
+                    msg
+                );
+            }
+            Some(other) => panic!("合法错误帧返回了 {:?}", other),
+            None => panic!("合法错误帧没有被识别"),
+        }
+
+        for plain in [
+            b"not an error frame".as_slice(),
+            b"\xc0".as_slice(),
+            b"\x2a".as_slice(),
+            b"\x93\x01\x02\x03".as_slice(),
+            b"".as_slice(),
+        ] {
+            assert!(
+                untranslated_error("ray_get", plain).is_none(),
+                "普通字节被当成错误帧: {:?}",
+                String::from_utf8_lossy(plain)
+            );
+        }
+    }
+
+    /// `ray_put` 的零长度守卫：进入 SDK 之前就被拒，不会撞上
+    /// `LocalMemoryBuffer` 的 `RAY_CHECK(data != nullptr)`
+    /// （`src/ray/common/buffer.h:77`）。
+    #[test]
+    fn ray_put_rejects_a_zero_length_value() {
+        rayrust_sys::clear_error();
+        let byte = [0u8; 1];
+        let out = unsafe { rayrust_sys::ray_put(byte.as_ptr() as *const std::os::raw::c_char, 0) };
+        assert!(out.data.is_null(), "零长度写入没有返回空指针");
+        assert_eq!(out.len, 0);
+        let msg = rayrust_sys::last_error().unwrap_or_default();
+        assert!(
+            msg.contains("zero-length"),
+            "错误消息没有说明零长度: {}",
+            msg
+        );
+        assert_eq!(rayrust_sys::last_error_kind(), ErrorKind::Generic);
     }
 
     /// 引用参数 id 的宽度检查排在取运行时之前：没有运行时也报宽度那一条，对应四个入口
@@ -4488,12 +4599,16 @@ mod tests {
         let values = decode_batch_array(&refs, ok_array).expect("两个有效元素");
         assert_eq!(values, vec![7, 7]);
 
-        // 触发一次 C 侧错误记录（未初始化运行时写入 RAY_ERROR_KIND_GENERIC 与消息）。
-        let _ = unsafe { rayrust_sys::ray_put(std::ptr::null(), 0) };
+        // 触发一次 C 侧错误记录（宽度检查在取运行时之前，写入 RAY_ERROR_KIND_GENERIC 与
+        // 消息，进程存活）。
+        let short_id = [0u8; 4];
+        let _ = unsafe {
+            rayrust_sys::ray_get(short_id.as_ptr() as *const std::os::raw::c_char, 0, -1)
+        };
         let err_array = alloc_batch_array(&encoded, true);
         match decode_batch_array(&refs, err_array) {
             Err(RayError::Ffi(message)) => assert_eq!(
-                message, "ray_get_many (1): Ray runtime is not initialized",
+                message, "ray_get_many (1): object id must be 28 bytes, got 0 bytes",
                 "空元素没有读到通道里的消息与下标"
             ),
             other => panic!("第 1 项为空指针时返回了 {:?}", other),

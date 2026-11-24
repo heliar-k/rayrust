@@ -16,7 +16,10 @@
 //!   a `Get` that already entered C++ runs to its own deadline, and one with no
 //!   deadline never returns
 //! - a failed task surfaces as `RayError::Task`/`Actor`/`Worker`/
-//!   `Unreconstructable`, an expired wait as `RayError::Timeout`
+//!   `Unreconstructable`/`Unclassified`, an expired wait as `RayError::Timeout`;
+//!   `Unclassified` covers a zero-length object and an untranslated error frame
+//!   (the frame is recognised before decoding, so the read entries return the
+//!   text Ray recorded instead of the frame bytes)
 //!
 //! ## Runtime generation
 //!
@@ -267,6 +270,37 @@ impl<T> Drop for ObjectRef<T> {
     }
 }
 
+/// 解码一个值；载荷是未翻译错误对象的帧时返回 `RayError::Unclassified`。
+///
+/// 判定排在解码之前：帧本身是合法 msgpack，对 `Vec<u8>` 这类目标类型解码会成功，
+/// 只看解码结果会把它当成正常值返回。
+fn decode_value<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    is_xlang: bool,
+) -> Result<T, RayError> {
+    if let Some(err) = crate::runtime::untranslated_error("ray_get", bytes) {
+        return Err(err);
+    }
+    if is_xlang {
+        deserialize_xlang(bytes)
+    } else {
+        deserialize(bytes)
+    }
+}
+
+/// 解码通用 msgpack `Value`；载荷是未翻译错误对象的帧时返回 `RayError::Unclassified`。
+/// 判定同样排在解码之前：剥掉 9 字节头后的 `bin` 能解成 `Value::Binary`。
+fn decode_value_generic(bytes: &[u8], is_xlang: bool) -> Result<rmpv::Value, RayError> {
+    if let Some(err) = crate::runtime::untranslated_error("ray_get", bytes) {
+        return Err(err);
+    }
+    if is_xlang {
+        crate::serialize::deserialize_xlang_value(bytes)
+    } else {
+        crate::serialize::deserialize_value(bytes)
+    }
+}
+
 impl<T> ObjectRef<T> {
     /// 这个引用是否要在增减时调用 Ray 的引用计数接口。
     ///
@@ -354,11 +388,7 @@ impl<T> ObjectRef<T> {
     {
         check_epoch(self.epoch)?;
         let bytes = crate::runtime::get_raw(&self.id)?;
-        if self.is_xlang {
-            deserialize_xlang(&bytes)
-        } else {
-            deserialize(&bytes)
-        }
+        decode_value(&bytes, self.is_xlang)
     }
 
     /// Retrieve the object as a generic msgpack Value (blocks until ready).
@@ -372,11 +402,7 @@ impl<T> ObjectRef<T> {
     pub fn get_value(&self) -> Result<rmpv::Value, RayError> {
         check_epoch(self.epoch)?;
         let bytes = crate::runtime::get_raw(&self.id)?;
-        if self.is_xlang {
-            crate::serialize::deserialize_xlang_value(&bytes)
-        } else {
-            crate::serialize::deserialize_value(&bytes)
-        }
+        decode_value_generic(&bytes, self.is_xlang)
     }
 
     /// Retrieve the object value with a timeout (in milliseconds).
@@ -390,11 +416,7 @@ impl<T> ObjectRef<T> {
     {
         check_epoch(self.epoch)?;
         let bytes = crate::runtime::get_raw_timeout(&self.id, timeout_ms)?;
-        if self.is_xlang {
-            deserialize_xlang(&bytes)
-        } else {
-            deserialize(&bytes)
-        }
+        decode_value(&bytes, self.is_xlang)
     }
 
     /// Asynchronously retrieve the object value.
@@ -406,7 +428,8 @@ impl<T> ObjectRef<T> {
     where
         T: serde::de::DeserializeOwned + Send + 'static,
     {
-        self.get_timeout_async(std::time::Duration::from_secs(300)).await
+        self.get_timeout_async(std::time::Duration::from_secs(300))
+            .await
     }
 
     /// Asynchronously retrieve the object value with a custom timeout.
@@ -434,11 +457,7 @@ impl<T> ObjectRef<T> {
         .await
         .map_err(|e| RayError::Runtime(format!("spawn_blocking join error: {}", e)))??;
 
-        if self.is_xlang {
-            deserialize_xlang(&bytes)
-        } else {
-            deserialize(&bytes)
-        }
+        decode_value(&bytes, self.is_xlang)
     }
 
     /// Asynchronously retrieve the object as a generic msgpack Value.
@@ -446,11 +465,15 @@ impl<T> ObjectRef<T> {
     /// Same blocking-pool `Get` as `get_async()`.
     /// Useful for Python cross-language calls with unknown return types.
     pub async fn get_value_async(&self) -> Result<rmpv::Value, RayError> {
-        self.get_value_timeout_async(std::time::Duration::from_secs(300)).await
+        self.get_value_timeout_async(std::time::Duration::from_secs(300))
+            .await
     }
 
     /// Asynchronously retrieve the object as a generic msgpack Value with timeout.
-    pub async fn get_value_timeout_async(&self, timeout: std::time::Duration) -> Result<rmpv::Value, RayError> {
+    pub async fn get_value_timeout_async(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<rmpv::Value, RayError> {
         let id = self.id.clone();
         let epoch = self.epoch;
         let timeout_ms = crate::runtime::duration_to_ms(timeout);
@@ -461,11 +484,7 @@ impl<T> ObjectRef<T> {
         .await
         .map_err(|e| RayError::Runtime(format!("spawn_blocking join error: {}", e)))??;
 
-        if self.is_xlang {
-            crate::serialize::deserialize_xlang_value(&bytes)
-        } else {
-            crate::serialize::deserialize_value(&bytes)
-        }
+        decode_value_generic(&bytes, self.is_xlang)
     }
 
     /// Get raw bytes from the object store (for debugging).
@@ -546,5 +565,85 @@ mod tests {
             assert!(ok, "{}", what);
         }
         assert!(after_retract, "撤掉代次之后不计数");
+    }
+
+    #[test]
+    fn decode_value_checks_the_frame_before_decoding() {
+        // 1. 正常跨语言值：剥头后是 msgpack 数组，按 `Vec<u8>` 读出原值。
+        let ok_bytes =
+            crate::serialize::serialize_xlang(&vec![1u8, 2, 3]).expect("serialize bytes");
+        assert_eq!(
+            decode_value::<Vec<u8>>(&ok_bytes, true).expect("decode bytes"),
+            vec![1, 2, 3]
+        );
+
+        let text = b"ValueError: runtime_env failed";
+        let mut pb = Vec::new();
+        pb.push((5 << 3) | 2);
+        pb.push(text.len() as u8);
+        pb.extend_from_slice(text);
+        pb.push((11 << 3) | 0);
+        pb.push(7);
+        let mut body = vec![0xc4, pb.len() as u8];
+        body.extend_from_slice(&pb);
+        let mut frame = vec![body.len() as u8];
+        frame.extend_from_slice(&[0u8; 8]);
+        frame.extend_from_slice(&body);
+
+        // 2. 错误帧按 `Vec<u8>` 读：剥头后的 `bin` 本身可解，判定必须在解码之前。
+        match decode_value::<Vec<u8>>(&frame, true) {
+            Err(RayError::Unclassified(msg)) => {
+                assert!(msg.starts_with(
+                    "ray_get: the object carries an error the C++ SDK does not translate: "
+                ));
+                assert!(msg.ends_with("ValueError: runtime_env failed"));
+            }
+            other => panic!("xlang 错误帧按 Vec<u8> 读出 {:?}", other),
+        }
+
+        // 3. 同一个帧按 `rmpv::Value` 读，同样不得返回 `Value::Binary`。
+        assert!(matches!(
+            decode_value_generic(&frame, true),
+            Err(RayError::Unclassified(_))
+        ));
+
+        // 4. 截断的 `bin8`：不是帧，仍是反序列化错误。
+        let broken = [0xc4u8]; // 截断的 bin8：解码失败且不满足 9 + N 错误帧
+        assert!(matches!(
+            decode_value::<i64>(&broken, false),
+            Err(RayError::Serialization(_))
+        ));
+        assert!(matches!(
+            decode_value_generic(&broken, false),
+            Err(RayError::Serialization(_))
+        ));
+    }
+
+    #[test]
+    fn decode_value_rejects_a_non_xlang_frame_before_reading_the_length() {
+        // 非跨语言读：帧首值是 msgpack 整数 N（正文长度），`rmp_serde` 读完它就返回，
+        // 目标类型是整数时得到伪造的成功值。判定必须在解码之前。
+        let text = b"ValueError: unschedulable";
+        let mut pb = Vec::new();
+        pb.push((5 << 3) | 2);
+        pb.push(text.len() as u8);
+        pb.extend_from_slice(text);
+        let mut body = vec![0xc4, pb.len() as u8];
+        body.extend_from_slice(&pb);
+        let mut frame = vec![body.len() as u8];
+        frame.extend_from_slice(&[0u8; 8]);
+        frame.extend_from_slice(&body);
+
+        match decode_value::<i64>(&frame, false) {
+            Err(RayError::Unclassified(msg)) => {
+                assert!(msg.contains("ray_get: the object carries an error"));
+                assert!(msg.ends_with("ValueError: unschedulable"));
+            }
+            other => panic!("非跨语言错误帧按 i64 读出 {:?}", other),
+        }
+        assert!(matches!(
+            decode_value_generic(&frame, false),
+            Err(RayError::Unclassified(_))
+        ));
     }
 }

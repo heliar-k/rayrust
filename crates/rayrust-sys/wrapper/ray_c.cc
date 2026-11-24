@@ -1135,9 +1135,46 @@ void ray_shutdown(void) {
 
 // ─── Object Store ─────────────────────────────────────────────
 
+/// 零长度结果：Ray 将该对象标记为失败，其错误类型不在 C++ SDK 翻译的七种之内且未附带错误文本。
+///
+/// 上游 `MakeErrorMetadataBuffer`（`src/ray/common/ray_object.cc:36-40`）将 `ErrorType`
+/// 写成十进制元数据字符串；无 `RayErrorInfo` 的失败对象由
+/// `RayObject::RayObject(rpc::ErrorType, const rpc::RayErrorInfo *)`
+/// （`src/ray/common/ray_object.cc:97-106`，无载荷分支在 `:98-101`）构造，只有元数据、
+/// 没有数据缓冲区。`NativeObjectStore::CheckException`
+/// （`cpp/src/ray/runtime/object/native_object_store.cc:70-88`）只把 27 种 `ErrorType`
+/// 中的七种翻译成 C++ 异常，其余不抛出异常；随后 `NativeObjectStore::GetRaw`
+/// （同文件 `:90-134`，逐元素处理在 `:104-132`）把空数据缓冲区复制成长度为 0 的
+/// `msgpack::sbuffer` 并丢弃元数据。公开运行时接口（`ray/api/ray_runtime.h:58-68`）的
+/// `Get` 只返回 `msgpack::sbuffer`，没有读取对象元数据的入口。
+/// 本 crate 写入对象存储的每个值都经过 msgpack 序列化，至少占一字节（`nil` 为 `0xc0`），
+/// 因此 `Get` 成功返回零字节缓冲区只来自这类无错误文本的未翻译失败对象。
+/// 携带 `RayErrorInfo` 的未翻译类型（如 `RUNTIME_ENV_SETUP_FAILED`、
+/// `TASK_UNSCHEDULABLE_ERROR` 与 actor 任务取消，见 `ray_object.cc:103-105`、
+/// `src/ray/core_worker/task_submission/normal_task_submitter.cc:371-386` 及
+/// `src/ray/core_worker/task_submission/actor_task_submitter.cc:846-853`、`:982-990`）
+/// 载荷为 `9 + N` 字节的 protobuf 帧，由 Rust 侧 `error_payload::extract` 在读取时
+/// （解码之前）识别并转为 `RayError::Unclassified`，不进入零长度分支。
+static const char *kUntranslatedObjectError =
+    "the object carries no data and Ray raised no exception: Ray failed it with an "
+    "error type the C++ SDK does not translate and that records no error text "
+    "(TASK_CANCELLED of a task is the common case; the SDK translates seven of the 27 "
+    "rpc::ErrorType values)";
+
 ray_bytes_t ray_put(const char *data, size_t len) {
     ray_clear_error();
     try {
+        // 零长度在进入 SDK 之前就被拒：`msgpack::sbuffer(0).data()` 是空指针，
+        // `LocalMemoryBuffer` 对空指针 RAY_CHECK（`src/ray/common/buffer.h:77`），
+        // 两种模式都会终止进程。读侧的「零长度只可能是未翻译失败对象」这条前提
+        // 因此有了写侧保证。
+        if (len == 0) {
+            set_last_error("the object store cannot store a zero-length value: Ray's "
+                           "LocalMemoryBuffer requires a non-null data pointer "
+                           "(src/ray/common/buffer.h:77), and every serialized value is "
+                           "at least one byte");
+            return ray_bytes_t{nullptr, 0};
+        }
         auto runtime = runtime_for_call();
         if (!runtime) return ray_bytes_t{nullptr, 0};
 
@@ -1171,13 +1208,18 @@ ray_bytes_t ray_get(const char *id_data, size_t id_len, int timeout_ms) {
             return ray_bytes_t{nullptr, 0};
         }
 
-        char *data = static_cast<char *>(std::malloc(buffer->size()));
+        const size_t size = buffer->size();
+        if (size == 0) {
+            set_last_error_kind(kUntranslatedObjectError, RAY_ERROR_KIND_UNCLASSIFIED);
+            return ray_bytes_t{nullptr, 0};
+        }
+        char *data = static_cast<char *>(std::malloc(size));
         if (!data) {
             set_last_error("out of memory copying the object");
             return ray_bytes_t{nullptr, 0};
         }
-        std::memcpy(data, buffer->data(), buffer->size());
-        return ray_bytes_t{data, buffer->size()};
+        std::memcpy(data, buffer->data(), size);
+        return ray_bytes_t{data, size};
     } catch (const std::exception &e) {
         set_last_error_exception(e);
         return ray_bytes_t{nullptr, 0};
@@ -2872,12 +2914,22 @@ ray_bytes_t *ray_get_many(const ray_bytes_t *ids, size_t count, int timeout_ms) 
         }
 
         const char *element_error = nullptr;
+        int element_kind = RAY_ERROR_KIND_GENERIC;
         for (size_t i = 0; i < count; i++) {
             if (i < results.size() && results[i]) {
-                char *data = static_cast<char *>(std::malloc(results[i]->size()));
+                const size_t size = results[i]->size();
+                if (size == 0) {
+                    out[i] = ray_bytes_t{nullptr, 0};
+                    if (!element_error) {
+                        element_error = kUntranslatedObjectError;
+                        element_kind = RAY_ERROR_KIND_UNCLASSIFIED;
+                    }
+                    continue;
+                }
+                char *data = static_cast<char *>(std::malloc(size));
                 if (data) {
-                    std::memcpy(data, results[i]->data(), results[i]->size());
-                    out[i] = ray_bytes_t{data, results[i]->size()};
+                    std::memcpy(data, results[i]->data(), size);
+                    out[i] = ray_bytes_t{data, size};
                 } else {
                     out[i] = ray_bytes_t{nullptr, 0};
                     if (!element_error) {
@@ -2893,7 +2945,7 @@ ray_bytes_t *ray_get_many(const ray_bytes_t *ids, size_t count, int timeout_ms) 
             }
         }
         if (element_error) {
-            set_last_error(element_error);
+            set_last_error_kind(element_error, element_kind);
         }
         return out;
     } catch (const std::exception &e) {
