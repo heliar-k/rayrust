@@ -7,18 +7,20 @@
 //! `ExecuteTask` 见到该状态直接返回（同文件 209-211），core worker 据此关掉 actor 且
 //! 不按 `max_restarts` 重启。
 //!
-//! Rust 帧里抛不了这个异常，C 的 trampoline 捕获它又会掐掉机制。所以
-//! [`exit_actor`] 只置一个线程局部标志并返回；宏生成的三个回调在用户代码返回之后
-//! 读这个标志，置位时返回 `rayrust_sys` 的哨兵长度，C 侧在 Rust 帧退出之后再抛对应
-//! 的异常。详见 `crates/rayrust-sys/wrapper/ray_c.h` 里两个哨兵的说明。
+//! Rust 帧里无法抛出这个异常，C 的 trampoline 捕获它又会掐掉机制。所以
+//! [`exit_actor`] 只置一个线程局部标志并返回；宏回调通过 [`crate::callback`]
+//! 在用户代码返回之后读这个标志，置位时返回 `rayrust_sys` 对应的退出状态
+//! （`RAY_CALLBACK_INTENTIONAL_EXIT` 或 `RAY_CALLBACK_EXIT_OUTSIDE_ACTOR`），C 侧在
+//! Rust 帧退出之后再抛出对应的异常。详见 `crates/rayrust-sys/wrapper/ray_c.h` 里
+//! `ray_callback_status_t` 的说明。
 //!
 //! ## 本地模式
 //!
 //! 本地模式（[`RayConfig::local`](crate::RayConfig)）没有 core worker，actor 方法在
 //! 驱动进程里直接执行，退出语义没有承接方：`TaskExecutor::Invoke` 的
 //! `catch (std::exception &)`（`cpp/src/ray/runtime/task/task_executor.cc:336-341`）会把
-//! 哨兵抛出的异常当成普通失败打包成错误载荷（`abstract_ray_runtime.cc:31-36`）。所以
-//! [`exit_actor`] 在本地模式**不置标志、直接返回**，是一个明确的空操作——让哨兵抛出
+//! 退出状态抛出的异常当成普通失败打包成错误载荷（`abstract_ray_runtime.cc:31-36`）。所以
+//! [`exit_actor`] 在本地模式**不置标志、直接返回**，是一个明确的空操作——让退出状态抛出
 //! 去只会得到与退出无关的结果（返回 `()` 的方法看到 `Ok(())`，返回值的方法看到
 //! `Serialization` 解码错误），比空操作更难理解。
 
@@ -47,7 +49,7 @@ thread_local! {
 /// - `#[rayrust::remote]` 任务里调用：任务照常返回它自己的值；
 /// - `new()` 里调用：actor 正常创建。
 ///
-/// 空操作是刻意选的。本地模式里让哨兵照旧抛出去，异常会被 `TaskExecutor::Invoke` 的
+/// 空操作是刻意选的。本地模式里让退出状态照旧抛出去，异常会被 `TaskExecutor::Invoke` 的
 /// `catch (std::exception &)`（`cpp/src/ray/runtime/task/task_executor.cc:336-341`）当成
 /// 普通失败打包成错误载荷；返回 `()` 的方法看到 `Ok(())`（看起来像退出成功），返回值
 /// 的方法看到一条与退出无关的 `Serialization("invalid type: unit value, ...")` 解码错误

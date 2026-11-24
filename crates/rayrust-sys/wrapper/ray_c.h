@@ -43,28 +43,69 @@ typedef struct {
     int creation_descriptor;
 } ray_actor_handle_meta_t;
 
-/// Rust 回调返回的哨兵长度（`data` 为空指针），配合 `ray_func_callback_t` 与
-/// `ray_member_callback_t` 使用。真实结果不可能有这么长（`std::malloc` 申请不到
-/// 2^64-1 字节），所以它们不会与合法结果相撞。
+/// Rust 回调返回状态与结果结构体，配合 `ray_func_callback_t` 与
+/// `ray_member_callback_t` 使用。所有非空 `data` 缓冲区一律由 C 侧调用 `free()` 释放。
 ///
-/// - `RAY_INTENTIONAL_EXIT_SENTINEL`：actor 方法里调用了 `exit_actor()`。C 侧在
-///   Rust 帧返回之后抛 `ray::internal::RayIntentionalSystemExitException`，与
-///   `AbstractRayRuntime::ExitActor` 抛的是同一个类；`GetExecuteResult` 把它变成
-///   `Status::IntentionalSystemExit`（`cpp/src/ray/runtime/task/task_executor.cc:97-100`），
-///   `ExecuteTask` 见到该状态直接返回、不写 meta buffer（同文件 209-211），actor
-///   因此被关闭、不会被 `max_restarts` 重启。
-/// - `RAY_EXIT_OUTSIDE_ACTOR_SENTINEL`：在任务或 actor 构造函数里调用了
-///   `exit_actor()`。C 侧抛 `ray::internal::RayException`，`GetExecuteResult` 的
-///   `catch (const std::exception &)` 把它变成该次调用的失败。
+/// 四个状态在集群模式与本地模式下的传播路径：
+/// - `RAY_CALLBACK_OK`（0）：正常返回，`data`/`len` 为 msgpack 序列化的返回值，C 侧
+///   拷入 `msgpack::sbuffer` 返回。
+/// - `RAY_CALLBACK_ERROR`（1）：回调失败（参数个数不符、参数反序列化失败、空指针
+///   参数或空 actor 指针、用户代码 `panic!`、actor 互斥锁中毒、返回值序列化失败），
+///   `data`/`len` 为不含内部 NUL 字节的 UTF-8 错误文本；C 侧抛出
+///   `ray::internal::RayException`。
+///   - 集群模式下 `GetExecuteResult`（`cpp/src/ray/runtime/task/task_executor.cc:80-118`）
+///     在 `:101-111` 捕获 `const std::exception &` 返回 `Status::Invalid`：普通任务与
+///     actor 方法在 `ExecuteTask`（同文件 `:120-291`，`:207-237`）写入
+///     `TASK_EXECUTION_EXCEPTION` 元数据，驱动在 `NativeObjectStore::GetRaw`
+///     （`cpp/src/ray/runtime/object/native_object_store.cc:90-134`）经 `CheckException`
+///     （同文件 `:70-88`）收到 `RayTaskException`；actor 创建任务在 `:191-193`、`:285-288`
+///     使 `current_actor_` 为空，并返回空消息 `Status::CreationTaskError("")` 且未填充
+///     `creation_task_exception_pb_bytes`（同文件 `:132, 286-288`），因此驱动在首次方法
+///     调用的 `GetRaw` 处收到 `ACTOR_DIED` 抛出的 `RayActorException` 报告工人退出类型为
+///     `USER_ERROR`（初始化异常），内层异常文本记录在工人日志（同文件 `:110`、`:216`）。
+///   - 本地模式下 `TaskExecutor::Invoke`（`cpp/src/ray/runtime/task/task_executor.cc:293-341`）
+///     在 `:336-340` 捕获 `std::exception &` 并调用 `PackError(e.what())`
+///     （`cpp/src/ray/runtime/abstract_ray_runtime.cc:31-39`），将 msgpack `nil` 与
+///     `(TASK_EXECUTION_EXCEPTION, err_msg)` 二元组写入 `LocalModeObjectStore`
+///     （`cpp/src/ray/runtime/object/local_mode_object_store.cc:40-46`）；actor 创建任务
+///     抛出异常时跳过 `:327-331` 的 `actor_contexts.emplace`，后续 `actor_call` 在
+///     `cpp/src/ray/runtime/task/local_mode_task_submitter.cc:109-113` 的
+///     `actor_contexts_.at` 抛出 `std::out_of_range`。
+/// - `RAY_CALLBACK_INTENTIONAL_EXIT`（2）：在 actor 方法里调用了 `exit_actor()`
+///   （`data = NULL, len = 0`）。C 侧在 Rust 帧返回之后抛出
+///   `ray::internal::RayIntentionalSystemExitException`，与 `AbstractRayRuntime::ExitActor`
+///   同属一类；`GetExecuteResult`（`task_executor.cc:97-100`）把它变成
+///   `Status::IntentionalSystemExit`，`ExecuteTask`（`:209-211`）见到该状态直接返回、
+///   不写 meta buffer，actor 因此关闭且不按 `max_restarts` 重启。
+/// - `RAY_CALLBACK_EXIT_OUTSIDE_ACTOR`（3）：在远程任务或 actor 构造函数里调用了
+///   `exit_actor()`（`data = NULL, len = 0`）。C 侧抛出 `ray::internal::RayException`，
+///   `GetExecuteResult` 的 `catch (const std::exception &)` 把它变成该次调用的失败。
 ///
-/// 本地模式（`ray::RayConfig::local_mode`）不会走到这两个哨兵：本地模式没有 core worker，
-/// 退出语义没有承接方，Rust 侧的 `exit_actor()` 在那里是空操作（不置标志），见
-/// `crates/rayrust/src/actor_exit.rs` 的模块文档。
+/// 本地模式（`ray::RayConfig::local_mode`）没有 core worker，Rust 侧的
+/// `exit_actor()` 在那里为空操作（不置标志），见 `crates/rayrust/src/actor_exit.rs`
+/// 的模块文档。
 ///
-/// 必须与 `crates/rayrust-sys/src/lib.rs` 的 `RAY_INTENTIONAL_EXIT_SENTINEL` 与
-/// `RAY_EXIT_OUTSIDE_ACTOR_SENTINEL` 一致。
-#define RAY_INTENTIONAL_EXIT_SENTINEL ((size_t)-1)
-#define RAY_EXIT_OUTSIDE_ACTOR_SENTINEL ((size_t)-1 - 1)
+/// 必须与 `crates/rayrust-sys/src/lib.rs` 的 `RAY_CALLBACK_*` 常量及
+/// `RayCallbackResult` 布局一致。
+typedef enum {
+    /// Normal return: `data`/`len` hold the msgpack-serialized return value.
+    RAY_CALLBACK_OK = 0,
+    /// Callback failure (argument count mismatch, argument deserialization failure,
+    /// null argument/actor pointer, panic in user code, poisoned actor mutex, or
+    /// return-value serialization failure): `data`/`len` hold the UTF-8 error text
+    /// without interior NUL bytes.
+    RAY_CALLBACK_ERROR = 1,
+    /// `exit_actor()` called inside an actor method (`data = NULL, len = 0`).
+    RAY_CALLBACK_INTENTIONAL_EXIT = 2,
+    /// `exit_actor()` called inside a remote task or actor constructor (`data = NULL, len = 0`).
+    RAY_CALLBACK_EXIT_OUTSIDE_ACTOR = 3,
+} ray_callback_status_t;
+
+typedef struct {
+    int status;
+    const char *data;
+    size_t len;
+} ray_callback_result_t;
 
 // ─── Lifecycle ────────────────────────────────────────────────
 
@@ -1116,9 +1157,9 @@ void ray_free_bytes_array(ray_bytes_t *array, size_t count);
 
 /// Callback type for a Rust remote function.
 /// Receives an array of msgpack-serialized argument buffers.
-/// Returns a heap-allocated ray_bytes_t containing the msgpack-serialized result.
-/// The caller (C wrapper) will free the returned data with free().
-typedef ray_bytes_t (*ray_func_callback_t)(const ray_bytes_t *args, size_t arg_count);
+/// Returns a `ray_callback_result_t` whose non-NULL `data` buffer is allocated on the
+/// heap and will be freed by the C wrapper with `free()`.
+typedef ray_callback_result_t (*ray_func_callback_t)(const ray_bytes_t *args, size_t arg_count);
 
 /// Register a Rust function as a Ray remote task.
 /// Must be called before ray_init (or at least before the first task call).
@@ -1129,12 +1170,13 @@ void ray_register_function(const char *func_name, ray_func_callback_t callback);
 // ─── Actor Member Function Registration ───────────────────────
 
 /// Callback type for a Rust actor member function.
-/// `actor_ptr` is the raw pointer (uint64_t) stored by the factory.
+/// `actor_ptr` is the raw pointer (uint64_t) stored by the factory (`Box<Mutex<T>>`).
 /// `args` / `arg_count` are the msgpack-serialized arguments (without `self`).
-/// Returns a heap-allocated ray_bytes_t containing the msgpack-serialized result.
-typedef ray_bytes_t (*ray_member_callback_t)(uint64_t actor_ptr,
-                                                const ray_bytes_t *args,
-                                                size_t arg_count);
+/// Returns a `ray_callback_result_t` whose non-NULL `data` buffer is allocated on the
+/// heap and will be freed by the C wrapper with `free()`.
+typedef ray_callback_result_t (*ray_member_callback_t)(uint64_t actor_ptr,
+                                                        const ray_bytes_t *args,
+                                                        size_t arg_count);
 
 /// Register a Rust actor member function.
 /// `func_name` is the name used with ray_actor_call.

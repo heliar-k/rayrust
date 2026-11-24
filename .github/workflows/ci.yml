@@ -108,6 +108,8 @@ jobs:
           cargo run --release --example error_kinds_test
           cargo run --release --example mixed_batch_test
           cargo run --release --example worker_runtime_test
+          cargo run --release --example actor_soundness_test
+          cargo run --release --example actor_soundness_test -- local
 
       - name: Stop Ray cluster
         if: always()

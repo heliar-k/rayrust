@@ -207,6 +207,99 @@ pub fn call_actor_in_worker(serialized_handle: Vec<u8>, n: i64) -> Result<(Vec<u
     Ok((id, updated))
 }
 
+// ─── 健全性与回调错误通道测试用任务与 actor ──────────────────
+
+/// 在同步 `#[remote]` 任务体内触发 `panic!`，验证错误回传且工人进程存活。
+#[remote]
+pub fn soundness_panic_sync(msg: String) -> i64 {
+    panic!("{}", msg);
+}
+
+/// 在异步 `#[remote] async fn` 跨越 `.await` 之后触发 `panic!`。
+#[remote]
+pub async fn soundness_panic_async(msg: String) -> i64 {
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    panic!("{}", msg);
+}
+
+/// 回显 `i32`：用于测试错误参数类型/个数与验证工人进程在错误后仍然存活。
+#[remote]
+pub fn soundness_echo_i32(x: i32) -> i32 {
+    x
+}
+
+/// 并发互斥与错误/panic 恢复测试用 actor。
+struct SoundnessActor {
+    value: i64,
+    in_flight: std::sync::atomic::AtomicI64,
+    peak_in_flight: std::sync::atomic::AtomicI64,
+}
+
+#[rayrust::actor]
+impl SoundnessActor {
+    fn new(start: i64) -> Self {
+        SoundnessActor {
+            value: start,
+            in_flight: std::sync::atomic::AtomicI64::new(0),
+            peak_in_flight: std::sync::atomic::AtomicI64::new(0),
+        }
+    }
+
+    fn sleep_and_add(&mut self, n: i64, sleep_ms: u64) -> (i64, i64) {
+        use std::sync::atomic::Ordering;
+        let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak_in_flight.fetch_max(cur, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+        self.value += n;
+        let val = self.value;
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        (val, self.peak_in_flight.load(Ordering::SeqCst))
+    }
+
+    fn read_state(&self) -> (i64, i64) {
+        use std::sync::atomic::Ordering;
+        let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak_in_flight.fetch_max(cur, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let res = (self.value, self.peak_in_flight.load(Ordering::SeqCst));
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        res
+    }
+
+    fn add_and_pid(&mut self, n: i64) -> (i64, u32) {
+        self.value += n;
+        (self.value, std::process::id())
+    }
+
+    fn get_value(&self) -> i64 {
+        self.value
+    }
+
+    fn panic_method(&mut self, msg: String) -> i64 {
+        panic!("{}", msg);
+    }
+
+    fn worker_pid() -> u32 {
+        std::process::id()
+    }
+}
+
+/// 构造函数必然 `panic!` 的 actor，用于测试构造失败时的异常传播与进程存活。
+struct PanickingCtorActor {
+    _unused: i64,
+}
+
+#[rayrust::actor]
+impl PanickingCtorActor {
+    fn new(msg: String) -> Self {
+        panic!("{}", msg);
+    }
+
+    fn ping(&self) -> i64 {
+        1
+    }
+}
+
 // ─── Rust Actor: Counter (using #[rayrust::actor] macro) ───────
 
 /// A simple counter actor.
@@ -280,7 +373,7 @@ impl SelfExiting {
     }
 
     // 返回值的方法里调用 `exit_actor()`：本地模式用它验证「调用是空操作」这条，
-    // 因为方法自己的返回值会被解出来（哨兵路径上那里得到的是 `Serialization` 错误）。
+    // 因为方法自己的返回值会被解出来（退出状态路径上那里得到的是 `Serialization` 错误）。
     fn increment_and_exit(&mut self, n: i64) -> i64 {
         self.value += n;
         rayrust::exit_actor();

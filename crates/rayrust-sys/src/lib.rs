@@ -28,21 +28,23 @@ pub struct RayActorHandleMeta {
     pub creation_descriptor: c_int,
 }
 
-// ─── Rust 回调的哨兵长度 ──────────────────
+// ─── Rust 回调状态与结果结构体 ────────────────────────────────
 
-/// Rust 回调返回「actor 方法里调用了 `exit_actor()`」的长度，`data` 为空指针。
-///
-/// C 侧看到这个值就不读 `data`、也不把它当结果，而是在 Rust 帧返回之后抛
-/// `ray::internal::RayIntentionalSystemExitException("SystemExit")`。真实结果不可能
-/// 这么长（malloc 申请不到 2^64-1 字节）。必须与 `wrapper/ray_c.h` 的
-/// `RAY_INTENTIONAL_EXIT_SENTINEL` 一致。
-pub const RAY_INTENTIONAL_EXIT_SENTINEL: usize = usize::MAX;
+/// 与 `wrapper/ray_c.h` 的 `ray_callback_status_t` 及 `ray_callback_result_t` 一致。
+/// 正常返回时 `data`/`len` 为 msgpack 序列化的返回值；失败时为不含内部 NUL 字节的
+/// UTF-8 错误文本；两种退出状态传 `data = NULL, len = 0`。所有非空 `data` 缓冲区
+/// 由 C 侧调用 `free()` 释放。
+#[repr(C)]
+pub struct RayCallbackResult {
+    pub status: c_int,
+    pub data: *const c_char,
+    pub len: usize,
+}
 
-/// Rust 回调返回「在任务或 actor 构造函数里调用了 `exit_actor()`」的长度，`data`
-/// 为空指针。C 侧看到这个值就抛 `ray::internal::RayException`，`GetExecuteResult`
-/// 把它变成该次调用的失败。必须与 `wrapper/ray_c.h` 的
-/// `RAY_EXIT_OUTSIDE_ACTOR_SENTINEL` 一致。
-pub const RAY_EXIT_OUTSIDE_ACTOR_SENTINEL: usize = usize::MAX - 1;
+pub const RAY_CALLBACK_OK: c_int = 0;
+pub const RAY_CALLBACK_ERROR: c_int = 1;
+pub const RAY_CALLBACK_INTENTIONAL_EXIT: c_int = 2;
+pub const RAY_CALLBACK_EXIT_OUTSIDE_ACTOR: c_int = 3;
 
 // ─── extern "C" function declarations ─────────────────────────
 
@@ -160,7 +162,7 @@ extern "C" {
     // Function Registration
     pub fn ray_register_function(
         func_name: *const c_char,
-        callback: extern "C" fn(args: *const RayBytes, arg_count: usize) -> RayBytes,
+        callback: extern "C" fn(args: *const RayBytes, arg_count: usize) -> RayCallbackResult,
     );
     pub fn ray_register_member_function(
         func_name: *const c_char,
@@ -168,7 +170,7 @@ extern "C" {
             actor_ptr: u64,
             args: *const RayBytes,
             arg_count: usize,
-        ) -> RayBytes,
+        ) -> RayCallbackResult,
     );
 
     // Misc
