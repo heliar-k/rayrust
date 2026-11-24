@@ -327,7 +327,7 @@ static LIVE_CHANGED: Condvar = Condvar::new();
 /// 一个任务，而任务体里可能调用 `Ray::local()`，让任务体去等 `LIVE` 会让两边互等。
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
-fn shutting_down() -> bool {
+pub(crate) fn shutting_down() -> bool {
     SHUTTING_DOWN.load(Ordering::SeqCst)
 }
 
@@ -1490,6 +1490,12 @@ fn check_cpp_sdk() {
 /// Check if Ray is initialized.
 pub(crate) fn is_initialized() -> bool {
     unsafe { rayrust_sys::ray_is_initialized() }
+}
+
+/// 运行时是不是由别的 DSO 建的：本 .so 内联的 `RayRuntimeHolder` 为空，而进程里已有
+/// 别人建的运行时。工人进程满足这条，驱动（含直接调 `ray_init` 的原始 C 驱动）不满足。
+pub(crate) fn runtime_is_borrowed() -> bool {
+    unsafe { rayrust_sys::ray_runtime_is_borrowed() != 0 }
 }
 
 /// Shutdown Ray runtime.
@@ -4011,8 +4017,8 @@ mod tests {
 
     #[test]
     fn placement_group_remove_reports_the_c_entry_error() {
-        // 单元测试进程不 connect，所以进程里没有 Ray runtime：C 入口在
-        // `GetRayRuntime()` 为空时返回 -1，错误经 Result 报出来，消息由 C 侧写入。
+        // 单元测试进程不 connect，所以进程里没有 Ray runtime：C 入口的
+        // `process_runtime()` 交回空指针时返回 -1，错误经 Result 报出来，消息由 C 侧写入。
         assert!(
             !unsafe { rayrust_sys::ray_is_initialized() },
             "这个测试要求进程里没有 Ray runtime"

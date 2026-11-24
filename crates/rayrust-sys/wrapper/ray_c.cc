@@ -1,6 +1,6 @@
 /// C ABI wrapper implementation — bridges Ray C++ SDK to plain C functions.
 ///
-/// This file wraps `ray::internal::GetRayRuntime()` methods directly,
+/// This file wraps `RayRuntime` methods through `process_runtime()`,
 /// bypassing the C++ template API. Serialization uses msgpack.
 ///
 /// IMPORTANT: Ray object/actor IDs are binary strings that may contain
@@ -203,6 +203,15 @@ namespace ray::core {
     class CoreWorkerProcess {
     public:
         static CoreWorker& GetCoreWorker();
+    };
+}
+namespace ray::internal {
+    /// 上游 `abstract_ray_runtime.h` 不在 wheel 里。这里按上游定义重述一遍：
+    /// `AbstractRayRuntime` 继承 `RayRuntime`，`GetInstance()` 读的是 `libray_api.so`
+    /// 里进程唯一的那份。
+    class AbstractRayRuntime : public RayRuntime {
+    public:
+        static std::shared_ptr<AbstractRayRuntime> GetInstance();
     };
 }
 
@@ -572,6 +581,8 @@ static int parse_bundle_index(const nlohmann::json &j) {
 /// 成员都没有默认成员初始化器（cpp/include/ray/api/task_options.h:100、:111），而
 /// `GetBundleID`（cpp/src/ray/runtime/task/native_task_submitter.cc:57-65）在组非空时
 /// 会读它。JSON 里没有这个键时就保持 -1。
+static std::shared_ptr<ray::internal::RayRuntime> process_runtime();
+
 static void parse_placement_group_fields(const nlohmann::json &j,
                                          ray::PlacementGroup &group,
                                          int &bundle_index) {
@@ -608,7 +619,7 @@ static void parse_placement_group_fields(const nlohmann::json &j,
             std::to_string(kPlacementGroupIdLength) + " bytes, got " +
             std::to_string(pg_id.size()));
     }
-    auto runtime = ray::internal::GetRayRuntime();
+    auto runtime = process_runtime();
     if (!runtime) {
         // 现有调用点都先判过 runtime，这条分支走不到；留着是给以后新增的调用点
         // 兜底，避免它拿着空 runtime 进 GetPlacementGroupById。
@@ -1051,11 +1062,36 @@ struct RefCountTicket {
     bool entered;
 };
 
+/// 取当前进程的运行时。工人进程里本 .so 内联的 `RayRuntimeHolder` 是独立的一份
+/// （#38）：`RayRuntimeHolder::Instance()` 的函数内静态变量在 cdylib 里被链接成局部
+/// 符号（rustc 给 cdylib 的 version script 只放行 `#[no_mangle]` 的导出），无法与
+/// `libray_api.so` 的同一符号统一；上游 `function_helper.cc` 那次 `InitRayRuntime`
+/// 调用命中的也是 `libray_api.so` 的定义。所以自建的那份为空时改问
+/// `AbstractRayRuntime::GetInstance()`：它是 `libray_api.so` 导出的函数，`DoInit()`
+/// 把两个位置都设成同一个指针。
+static std::shared_ptr<ray::internal::RayRuntime> process_runtime() {
+    if (auto runtime = ray::internal::GetRayRuntime()) {
+        return runtime;
+    }
+    return ray::internal::AbstractRayRuntime::GetInstance();
+}
+
+/// 运行时是不是由别的 DSO 建的：本 .so 内联的 `RayRuntimeHolder` 为空，而
+/// `libray_api.so` 里进程唯一的那份有运行时。工人进程满足这条；驱动（含直接调
+/// `ray_init` 的原始 C 驱动）不满足，因为 `ray::Init` 填的就是本 .so 的 holder。
+/// 只给 Rust 侧的代次检查（`object_ref::check_epoch`）用。
+int ray_runtime_is_borrowed(void) {
+    return ray::internal::GetRayRuntime() == nullptr &&
+                   ray::internal::AbstractRayRuntime::GetInstance() != nullptr
+               ? 1
+               : 0;
+}
+
 /// 取这次调用要用的运行时。没有运行时、或运行时正在关闭时返回空，并写好
 /// ray_last_error_bytes()。关闭标志用 RAY_ERROR_KIND_RUNTIME 的类别，Rust 侧据此得到
 /// RayError::Runtime。
 static std::shared_ptr<ray::internal::RayRuntime> runtime_for_call() {
-    auto runtime = ray::internal::GetRayRuntime();
+    auto runtime = process_runtime();
     if (!runtime) {
         set_last_error("Ray runtime is not initialized");
         return nullptr;
@@ -1089,7 +1125,7 @@ ray_bytes_t submit_task_and_record(
         // 或关闭之后又建了另一个运行时）。两种情况都不能再用这条运行时：它的线程池
         // 已经 join 过，再投递任务会让进程在退出析构时崩溃。
         if (local_tasks().shutting_down || !ray::IsInitialized() ||
-            ray::internal::GetRayRuntime().get() != &runtime) {
+            process_runtime().get() != &runtime) {
             set_last_error("Ray runtime is shutting down; refusing new local-mode task");
             return ray_bytes_t{nullptr, 0};
         }
@@ -1121,7 +1157,7 @@ void ray_shutdown(void) {
         close_runtime_gate();
         pending.swap(local_tasks().ids);
         // 与快照同一把锁：排空的 id 一定属于这个运行时；这条引用也让它在排空期间活下来。
-        runtime = ray::internal::GetRayRuntime();
+        runtime = process_runtime();
     }
     if (runtime && runtime->IsLocalMode() && !pending.empty()) {
         try {
@@ -1255,7 +1291,7 @@ int ray_add_local_reference(const char *id_data, size_t id_len) {
     if (!ticket.entered) return 0;  // 关闭已经开始：core worker 即将消失，无需计数
     try {
         if (check_object_id(id_data, id_len) != 0) return -1;
-        auto runtime = ray::internal::GetRayRuntime();
+        auto runtime = process_runtime();
         if (!runtime) {
             set_last_error("Ray runtime is not initialized");
             return -1;
@@ -1272,7 +1308,7 @@ int ray_remove_local_reference(const char *id_data, size_t id_len) {
     if (!ticket.entered) return 0;  // 关闭已经开始：core worker 即将消失，无需计数
     try {
         if (check_object_id(id_data, id_len) != 0) return -1;
-        auto runtime = ray::internal::GetRayRuntime();
+        auto runtime = process_runtime();
         if (!runtime) {
             set_last_error("Ray runtime is not initialized");
             return -1;
@@ -2763,7 +2799,7 @@ bool ray_was_current_actor_restarted(void) {
 }
 
 bool ray_is_local_mode(void) {
-    auto runtime = ray::internal::GetRayRuntime();
+    auto runtime = process_runtime();
     return runtime ? runtime->IsLocalMode() : false;
 }
 

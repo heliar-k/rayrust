@@ -65,7 +65,7 @@
 //! 与关闭之间的互斥在 C 包装层（`crates/rayrust-sys/wrapper/ray_c.cc` 的引用
 //! 计数闸门）：关闭开始时闸门拒绝新的调用，并等已经进入的那些退出（微秒级），
 //! 所以关闭一定能推进。闸门不覆盖 `get`/`put`/`wait` 这些阻塞调用。
-//! 工人进程里代次恒为 0，工人侧的引用不计数（#38）。
+//! 工人进程不经过 `Ray::connect`，代次恒为 0，工人侧的引用不参与引用计数。
 //!
 //! 嵌套引用（返回的对象里装着别的对象引用）在 Rust 侧不可见：Ray 的
 //! `RayObject::GetNestedRefs()` 不在 wheel 附带的头文件里，`RayRuntime::Get`
@@ -170,18 +170,23 @@ fn remove_local_reference(id: &[u8]) {
 
 /// 拒绝没有活着的运行时、或者属于已经关闭的运行时的引用。
 ///
-/// 工人进程（`librayrust_worker.so`）不经过 `init_with_config`，`LIVE_EPOCH`
-/// 恒为 0。宏生成的 `#[remote]` 与 actor 回调只做序列化，不构造 `ObjectRef`，
-/// 所以它们不受影响；用户函数里自己调用 `ObjectRef::from` 重建引用时，这个
-/// 引用拿到的代次是 0，会被这里拒成 `RayError::Runtime`。那条调用在基线版本
-/// 上同样失败（工人进程里 `GetRayRuntime()` 是 per-DSO 副本，#38），区别只是
-/// 错误变体。
+/// 工人进程（`librayrust_worker.so`）由 `default_worker` 调用 `ray::Init` 初始化，
+/// 不经过 `init_with_config`，`LIVE_EPOCH` 恒为 0。当 `LIVE_EPOCH` 为 0、没有正在
+/// 进行的关闭，且 `runtime_is_borrowed()` 为真（本 .so 内联的 `RayRuntimeHolder`
+/// 为空而进程里已有别人建的运行时，也就是工人进程）时，代次为 0 的重建引用放行
+/// 进入 C 包装层。
+/// 其他进程里的代次 0 引用仍被拒：直接调 `ray_init` 的原始 C 驱动里
+/// `ray::IsInitialized()` 同样为真，但那份运行时就是本 .so 的 holder 填的，
+/// `runtime_is_borrowed()` 在那里为假。
 pub(crate) fn check_epoch(epoch: u64) -> Result<(), RayError> {
     let live = live_epoch();
     if epoch != 0 && epoch == live {
         return Ok(());
     }
     if live == 0 {
+        if epoch == 0 && !crate::runtime::shutting_down() && crate::runtime::runtime_is_borrowed() {
+            return Ok(());
+        }
         return Err(RayError::Runtime(format!(
             "object ref belongs to Ray runtime epoch {} and no runtime is alive",
             epoch
@@ -616,6 +621,65 @@ mod tests {
         assert!(matches!(
             decode_value_generic(&broken, false),
             Err(RayError::Serialization(_))
+        ));
+    }
+
+    #[test]
+    fn check_epoch_rejects_uninitialized_rebuilt_and_stale_refs() {
+        let _guard = EPOCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "测试进程未启动 Ray runtime"
+        );
+        assert_eq!(live_epoch(), 0);
+        assert!(
+            !crate::runtime::runtime_is_borrowed(),
+            "单元测试进程里没有别人建的运行时，谓词却为真"
+        );
+
+        // 1. LIVE_EPOCH == 0、谓词为假时，重建引用仍被拒成 RayError::Runtime
+        let rebuilt_before_init: ObjectRef<i64> = ObjectRef::from(vec![0x11u8; OBJECT_ID_LEN]);
+        let before_init_res = rebuilt_before_init.get_timeout(50);
+
+        // 2. 发布代次后模拟驱动关闭（retract_live_epoch）：旧代次引用与关闭后重建引用均被拒
+        let epoch1 = publish_live_epoch();
+        let ref_epoch1: ObjectRef<i64> = ObjectRef::from(vec![0x22u8; OBJECT_ID_LEN]);
+        let live_ok = check_epoch(ref_epoch1.epoch);
+        let zero_while_live = check_epoch(0);
+
+        retract_live_epoch();
+        let stale_after_shutdown = ref_epoch1.get_timeout(50);
+        let rebuilt_after_shutdown: ObjectRef<i64> = ObjectRef::from(vec![0x22u8; OBJECT_ID_LEN]);
+        let after_shutdown_res = rebuilt_after_shutdown.get_timeout(50);
+
+        // 3. 再次发布新代次后，第一代的旧引用仍被拒
+        let epoch2 = publish_live_epoch();
+        let stale_in_new_epoch = ref_epoch1.get_timeout(50);
+        retract_live_epoch();
+
+        assert!(epoch1 != 0 && epoch2 > epoch1);
+        assert!(live_ok.is_ok(), "当前活跃代次检查未通过: {:?}", live_ok);
+        assert!(matches!(
+            before_init_res,
+            Err(RayError::Runtime(ref msg)) if msg.contains("epoch 0 and no runtime is alive")
+        ));
+        assert!(matches!(
+            zero_while_live,
+            Err(RayError::Runtime(ref msg)) if msg.contains("epoch 0 which has been shut down")
+        ));
+        assert!(matches!(
+            stale_after_shutdown,
+            Err(RayError::Runtime(ref msg)) if msg.contains("no runtime is alive")
+        ));
+        assert!(matches!(
+            after_shutdown_res,
+            Err(RayError::Runtime(ref msg)) if msg.contains("epoch 0 and no runtime is alive")
+        ));
+        assert!(matches!(
+            stale_in_new_epoch,
+            Err(RayError::Runtime(ref msg)) if msg.contains("has been shut down")
         ));
     }
 

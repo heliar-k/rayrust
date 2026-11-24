@@ -174,6 +174,9 @@ extern "C" {
     // Misc
     pub fn ray_was_current_actor_restarted() -> bool;
     pub fn ray_is_local_mode() -> bool;
+    /// 运行时是不是由别的 DSO 建的（`wrapper/ray_c.h` 的 `ray_runtime_is_borrowed`）。
+    /// 1 表示本 .so 内联的 holder 为空而进程里已有别人建的运行时，也就是工人进程。
+    pub fn ray_runtime_is_borrowed() -> c_int;
     pub fn ray_get_namespace() -> RayBytes;
     pub fn ray_get_actor(
         name: *const c_char,

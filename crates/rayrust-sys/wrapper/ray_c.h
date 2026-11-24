@@ -2,7 +2,9 @@
 ///
 /// The Ray C++ SDK uses heavy C++ templates (Put<T>, Task<F>, etc.) that have no
 /// stable ABI. This header exposes a minimal C interface that the Rust FFI layer
-/// can call. The C++ source (ray_c.cc) wraps `ray::internal::GetRayRuntime()` directly,
+/// can call. The C++ source (ray_c.cc) wraps `RayRuntime` directly via
+/// `process_runtime()` (`GetRayRuntime()` in the driver, falling back to the
+/// exported `AbstractRayRuntime::GetInstance()` inside a cdylib worker),
 /// bypassing the template API.
 ///
 /// IMPORTANT: Ray object IDs are binary strings that may contain null bytes.
@@ -969,6 +971,19 @@ bool ray_was_current_actor_restarted(void);
 /// Returns true if this process is in local mode.
 /// Returns false before `ray_init`: there is no runtime to ask.
 bool ray_is_local_mode(void);
+
+/// 运行时是不是由别的 DSO 建的。
+///
+/// 返回 1 的条件是：本 .so 内联的 `RayRuntimeHolder::Instance()::instance`（`ray_c.cc`
+/// 通过 `GetRayRuntime()` 读到的那份）为空，而 `libray_api.so` 里进程唯一的那份
+/// （`AbstractRayRuntime::GetInstance()`）有运行时。
+/// 工人进程（`ray/cpp/default_worker` dlopen 本 .so）满足这条：运行时由
+/// `default_worker` 里的 `ray::Init` 建在 `libray_api.so` 的那份上。
+/// 驱动不满足，包括直接调本入口 `ray_init` 的原始 C 驱动：`ray::Init` 填的就是本
+/// .so 的 holder。
+/// 只给 Rust 侧的代次检查（`object_ref::check_epoch`）用：它决定代次 0 的重建引用
+/// 能不能进入包装层。没有错误通道，也不需要：每个分支都是一个可读的布尔结果。
+int ray_runtime_is_borrowed(void);
 
 /// Get the namespace of this job.
 /// Returns a ray_bytes_t containing the namespace string.

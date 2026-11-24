@@ -79,10 +79,9 @@
 //!   `Ffi` 出口在正常集群上不会被这两种输入触发。
 //! - actor id 是 16 字节（12 个唯一字节 + 4 字节 JobID，`src/ray/common/id.h:124-142`），
 //!   不是 ObjectID 的 28 字节。
-//! - 工人进程里 `ActorHandle::from_serialized` 与裸 id 的调用都返回
-//!   `Ffi("... Ray runtime is not initialized")`：`GetRayRuntime()` 在工人 `.so` 里
-//!   是一份没有初始化的 per-DSO 副本（#38）。所以第 6 项的数值断言在驱动侧做，
-//!   工人侧只作为观察打印。
+//! - 工人进程里 `ActorHandle::from_serialized` 把 handle 登记进本工人的
+//!   `ActorManager`，紧接着按同一个裸 id 调用 `ray_actor_call` 也能提交成功；第 6 项同
+//!   时断言工人侧两条路径都返回 `Ok(...)` 以及驱动侧复原后的调用结果。
 //! - `from_serialized` 的载荷里只有 `actor_id`（字段 1，16 字节）与
 //!   `creation_job_id`（字段 4，4 字节）是定长 id，载荷里就这两个尺寸会被上游按
 //!   `RAY_CHECK` 检查：`actor_id` 不对在登记阶段终止（`actor_manager.cc:33` →
@@ -1112,6 +1111,14 @@ async fn handle_handoff_check(ray: &Ray) {
     );
     println!("  工人侧 from_serialized → {}", restored_in_worker);
     println!("  工人侧裸 id 调用 → {}", called_in_worker);
+    assert_eq!(
+        restored_in_worker, "Ok(16 字节 id)",
+        "工人侧复原 handle 失败"
+    );
+    assert_eq!(
+        called_in_worker, "Ok(28 字节 object id)",
+        "工人侧裸 id 调用失败"
+    );
 
     let restored = ActorHandle::from_serialized(&back_serialized).expect("驱动侧复原 handle");
     assert_eq!(
@@ -1130,8 +1137,7 @@ async fn handle_handoff_check(ray: &Ray) {
     assert_eq!(value, 25, "复原的 handle 拿到的值不对");
     println!("  复原的 handle 调 get() → {}", value);
 
-    // 对照：同一个 actor 的裸 id 在驱动侧也能调用——驱动进程登记过这个 handle。
-    // 工人进程里两条路都过不去（上面两行），所以这个对照只在驱动侧有区分力。
+    // 对照：同一个 actor 的裸 id 在驱动侧同样能调用——驱动进程登记过这个 handle。
     let by_raw_id: i64 = ray
         .actor_call(handle.id(), COUNTER_GET, &[], &[])
         .expect("用裸 id 提交")

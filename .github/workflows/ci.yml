@@ -107,6 +107,7 @@ jobs:
           cargo run --release --example async_demo
           cargo run --release --example error_kinds_test
           cargo run --release --example mixed_batch_test
+          cargo run --release --example worker_runtime_test
 
       - name: Stop Ray cluster
         if: always()
