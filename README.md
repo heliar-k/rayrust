@@ -12,8 +12,8 @@ rayrust wraps the Ray C++ SDK (`libray_api.so`) via a C ABI layer, providing idi
 |---|:---:|:---:|
 | `Ray::connect` / `drop` (RAII lifecycle) | ✅ | ✅ |
 | `put` / `get` / `wait` | ✅ | ✅ |
-| `get_many` / `get_many_timeout` (batch get, optional deadline) | ✅ | ✅ |
-| `get_many_async` / `get_many_timeout_async` / `wait_async` (batch `Get` and `Wait` on the tokio blocking pool) | ✅ | ✅ |
+| `get_many` / `get_many_timeout` (batch get, optional deadline; one `Wait` + per-element `Get`, see #41) | ✅ | ✅ |
+| `get_many_async` / `get_many_timeout_async` / `wait_async` (batch get and `Wait` on the tokio blocking pool) | ✅ | ✅ |
 | `#[remote]` sync task | ✅ | ✅ |
 | `#[remote]` async task (persistent runtime) | ✅ | ✅ |
 | `#[actor]` macro (auto-generate factory + methods) | ✅ | ✅ |
@@ -239,6 +239,15 @@ let vals = ray.get_many(&[obj1, obj2, obj3])?;
 // Wait for readiness
 let (ready, unready) = ray.wait(&[obj1, obj2], 2, 5000)?;
 ```
+
+`get_many*` deduplicates IDs for a single `Wait` and then runs one single-object
+`Get` per ready element (at most one per input slot), because upstream's batch
+`Get` leaves null `RayObject` entries on mixed batches containing an exception
+object and dereferences them in `NativeObjectStore::GetRaw` (#41). That `Wait`
+does not return early when the batch already holds a failed object, so a batch
+with several elements waits for all of them or for the deadline: undeadlined
+`get_many` blocks until every element is ready, and the deadline-carrying entries
+report the first failing element only after the deadline expires.
 
 In cluster mode (the core worker is initialized) the `ObjectRef` returned by
 `put` and by a task or actor call holds one Ray local reference for its id:

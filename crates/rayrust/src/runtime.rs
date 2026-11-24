@@ -512,6 +512,17 @@ impl Ray {
     /// 每个引用必须正好 28 字节，其他长度（包括 0 字节）返回 `RayError::Ffi`，
     /// 进程存活。
     ///
+    /// Every non-empty batch deduplicates IDs for one `Wait` call and then issues one
+    /// single-object `Get` per ready element (at most one per input slot), because
+    /// upstream's batch `Get` dereferences a null `RayObject` and crashes with
+    /// SIGSEGV on mixed batches containing an exception object. The `Wait` runs
+    /// with `abort_if_any_object_is_exception = false` and does not return early
+    /// when the batch already holds a failed object, so this undeadlined entry
+    /// blocks until every element is ready: a batch holding a ref that never
+    /// resolves never returns. A deadline is what bounds that wait; use
+    /// [`Ray::get_many_timeout`]. A single-element batch whose element is already
+    /// failed returns that element's error at once.
+    ///
     /// If any element's cross-language payload carries a pickle5 section, the
     /// whole batch returns `RayError::Serialization`: the plain values already
     /// read from the same batch are dropped too, because
@@ -530,11 +541,15 @@ impl Ray {
     ///
     /// `timeout_ms` 是 `-1`（永久等待）或非负的毫秒数，其他值返回
     /// `RayError::Ffi`。每个引用必须正好 28 字节，其他长度（包括 0 字节）同样返回
-    /// `RayError::Ffi`，进程存活。批里任一元素的载荷带 pickle5 段时整批返回
-    /// `RayError::Serialization`，任一元素属于 C++ SDK 未翻译的错误类型（零长度对象
-    /// 或未翻译错误帧，帧的判定在解码之前完成）时整批返回带下标的
-    /// `RayError::Unclassified`，同一批里已经取到的普通值也拿不到
-    /// （`get_many_with_timeout` 用 `?` 直接返回）。
+    /// `RayError::Ffi`，进程存活。非空批次先按去重后的 ID 调用一次 `Wait` 确定整批
+    /// 截止时间，再对每个就绪元素执行一次单对象 `Get`（最多每个输入槽位一次，因上游
+    /// 批量 `Get` 在含异常对象的混合批次上会触发 SIGSEGV）。`Wait` 不会因为批次里已有
+    /// 失败对象而提前返回，所以整批等到全部就绪或期限到期才报告首个失败元素；期限到期
+    /// 仍不就绪的元素报带下标的 `RayError::Timeout`。
+    /// 批里任一元素的载荷带 pickle5 段时整批返回 `RayError::Serialization`，任一元素
+    /// 属于 C++ SDK 未翻译的错误类型（零长度对象或未翻译错误帧，帧的判定在解码之前
+    /// 完成）时整批返回带下标的 `RayError::Unclassified`，同一批里已经取到的普通值也
+    /// 拿不到（`get_many_with_timeout` 用 `?` 直接返回）。
     pub fn get_many_timeout<T: serde::de::DeserializeOwned>(
         &self,
         refs: &[ObjectRef<T>],
@@ -545,10 +560,14 @@ impl Ray {
 
     /// 异步批量取。
     ///
-    /// 默认期限 300 秒，自定义期限用 `get_many_timeout_async`。整批是 blocking
-    /// pool 上的一次 `Get`。批里任一元素的载荷带 pickle5 段时整批返回
-    /// `RayError::Serialization`，属于未翻译错误类型时返回带下标的
-    /// `RayError::Unclassified`，同一批里已经取到的普通值也拿不到。
+    /// 默认期限 300 秒，自定义期限用 `get_many_timeout_async`。整批在 blocking
+    /// pool 上先经一次去重 `Wait` 确定截止时间，再对每个就绪元素执行一次单对象 `Get`
+    /// （最多每个输入槽位一次，因上游批量 `Get` 在含异常对象的混合批次上会触发
+    /// SIGSEGV）。`Wait` 不会因为批次里已有失败对象而提前返回，所以整批等到全部就绪或
+    /// 300 秒到期才报告首个失败元素；到期仍不就绪的元素报带下标的 `RayError::Timeout`。
+    /// 批里任一元素的载荷带 pickle5 段时整批返回 `RayError::Serialization`，属于未翻译
+    /// 错误类型时返回带下标的 `RayError::Unclassified`，同一批里已经取到的普通值也拿
+    /// 不到。
     pub async fn get_many_async<T>(&self, refs: &[ObjectRef<T>]) -> Result<Vec<T>, RayError>
     where
         T: serde::de::DeserializeOwned + Send + 'static,
@@ -559,12 +578,15 @@ impl Ray {
 
     /// 异步批量取，带自定义期限。
     ///
-    /// Ray 在一次 `Get` 内部限制整批的等待，期限覆盖每一个元素。与
-    /// `get_timeout_async` 一样，期限从 blocking pool 的线程接到这次调用时开始计时。
-    /// 每个引用必须正好 28 字节，其他长度（包括 0 字节）返回 `RayError::Ffi`。
-    /// 批里任一元素的载荷带 pickle5 段时整批返回 `RayError::Serialization`，
-    /// 属于未翻译错误类型时返回带下标的 `RayError::Unclassified`，同一批里已经
-    /// 取到的普通值也拿不到。
+    /// 非空批次先经一次去重 `Wait` 确定整批截止时间，再对每个就绪元素执行一次单对象
+    /// `Get`（最多每个输入槽位一次，因上游批量 `Get` 在含异常对象的混合批次上会触发
+    /// SIGSEGV），期限覆盖每一个元素；`Wait` 不会因为批次里已有失败对象而提前返回，
+    /// 所以整批等到全部就绪或期限到期才报告首个失败元素，到期仍不就绪的元素报带下标的
+    /// `RayError::Timeout`。与 `get_timeout_async` 一样，期限从 blocking pool 的线程
+    /// 接到这次调用时开始计时。每个引用必须正好 28 字节，其他长度（包括 0 字节）返回
+    /// `RayError::Ffi`。批里任一元素的载荷带 pickle5 段时整批返回
+    /// `RayError::Serialization`，属于未翻译错误类型时返回带下标的
+    /// `RayError::Unclassified`，同一批里已经取到的普通值也拿不到。
     pub async fn get_many_timeout_async<T>(
         &self,
         refs: &[ObjectRef<T>],
@@ -3105,6 +3127,10 @@ impl Drop for CBytesArrayGuard {
 /// 批量取，超过 `timeout_ms` 毫秒就返回。
 ///
 /// `timeout_ms` 是 `-1`（永久等待）或非负的毫秒数，其他值返回 `RayError::Ffi`。
+/// 非空批次先经一次去重 `Wait` 确定截止时间，再对每个就绪元素执行一次单对象 `Get`
+/// （最多每个输入槽位一次，因上游批量 `Get` 在含异常对象的混合批次上会触发 SIGSEGV）；
+/// `Wait` 不会因为批次里已有失败对象而提前返回，期限到期仍不就绪的元素报带下标的
+/// `RayError::Timeout`。
 pub(crate) fn get_many_with_timeout<T: serde::de::DeserializeOwned>(
     refs: &[ObjectRef<T>],
     timeout_ms: i32,
@@ -3132,8 +3158,10 @@ pub(crate) fn get_many_with_timeout<T: serde::de::DeserializeOwned>(
     decode_batch_array(refs, array)
 }
 
-/// 解码 `ray_get_many` 返回的 `ray_bytes_t` 数组；元素为空指针时按错误通道加上下标报错，
-/// 元素载荷是未翻译错误帧时返回带下标的 `RayError::Unclassified`（判定在解码之前）。
+/// 解码 `ray_get_many` 返回的 `ray_bytes_t` 数组；元素为空指针时按错误通道加上下标报错
+/// （涵盖 `Wait` 判定未就绪写入的 `RayError::Timeout`、单对象 `Get` 捕获的异常与零长度
+/// 未翻译对象），元素载荷是未翻译错误帧时返回带下标的 `RayError::Unclassified`（判定在
+/// 解码之前）。
 fn decode_batch_array<T: serde::de::DeserializeOwned>(
     refs: &[ObjectRef<T>],
     array: *mut RayBytes,
@@ -3161,7 +3189,10 @@ fn decode_batch_array<T: serde::de::DeserializeOwned>(
 }
 
 /// Get multiple objects from the object store.
-/// Blocks until all objects are available.
+/// Blocks until all objects are available: the single deduplicated `Wait` runs
+/// undeadlined and does not return early on a failed element, so nothing bounds
+/// the wait. Implemented as that `Wait` plus one single-object `Get` per element
+/// because upstream's batch `Get` crashes with SIGSEGV on mixed batches.
 pub(crate) fn get_many<T: serde::de::DeserializeOwned>(
     refs: &[ObjectRef<T>],
 ) -> Result<Vec<T>, RayError> {
@@ -4624,5 +4655,102 @@ mod tests {
             ),
             other => panic!("清空通道后第 1 项为空指针返回了 {:?}", other),
         }
+    }
+
+    /// `timeout_ms < -1` 在三个 C 入口取运行时之前就被拒：上游
+    /// `memory_store.cc:97` 的 `RAY_CHECK(timeout_ms >= 0 || timeout_ms == -1)` 会终止进程。
+    #[test]
+    fn c_entries_reject_timeout_below_minus_one() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let id = [0x31u8; 28];
+        let id_ptr = id.as_ptr() as *const std::os::raw::c_char;
+
+        rayrust_sys::clear_error();
+        let got = unsafe { rayrust_sys::ray_get(id_ptr, id.len(), -2) };
+        assert!(
+            got.data.is_null() && got.len == 0,
+            "ray_get(timeout_ms = -2) 返回了非空缓冲区"
+        );
+        assert_eq!(
+            rayrust_sys::last_error_kind(),
+            rayrust_sys::ErrorKind::Generic,
+            "ray_get 的期限拒绝没有写成 RAY_ERROR_KIND_GENERIC"
+        );
+        let message = rayrust_sys::last_error().unwrap_or_default();
+        assert!(
+            message.contains("timeout_ms"),
+            "ray_get 的期限拒绝消息没有提到 timeout_ms: {:?}",
+            message
+        );
+
+        let ids = [RayBytes {
+            data: id_ptr,
+            len: id.len(),
+        }];
+        rayrust_sys::clear_error();
+        let waited = unsafe { rayrust_sys::ray_wait(ids.as_ptr(), 1, 1, -2) };
+        assert!(waited.is_null(), "ray_wait(timeout_ms = -2) 返回了非空数组");
+        assert_eq!(
+            rayrust_sys::last_error_kind(),
+            rayrust_sys::ErrorKind::Generic,
+            "ray_wait 的期限拒绝没有写成 RAY_ERROR_KIND_GENERIC"
+        );
+        let message = rayrust_sys::last_error().unwrap_or_default();
+        assert!(
+            message.contains("timeout_ms"),
+            "ray_wait 的期限拒绝消息没有提到 timeout_ms: {:?}",
+            message
+        );
+
+        rayrust_sys::clear_error();
+        let array = unsafe { rayrust_sys::ray_get_many(ids.as_ptr(), 1, -2) };
+        assert!(
+            array.is_null(),
+            "ray_get_many(timeout_ms = -2) 返回了非空数组"
+        );
+        assert_eq!(
+            rayrust_sys::last_error_kind(),
+            rayrust_sys::ErrorKind::Generic,
+            "ray_get_many 的期限拒绝没有写成 RAY_ERROR_KIND_GENERIC"
+        );
+        let message = rayrust_sys::last_error().unwrap_or_default();
+        assert!(
+            message.contains("timeout_ms"),
+            "ray_get_many 的期限拒绝消息没有提到 timeout_ms: {:?}",
+            message
+        );
+    }
+
+    /// `count > INT_MAX` 在遍历 ID 与任何 `reserve(count)` 之前就被拒：数组只有 1 个元素，
+    /// 若先遍历就会越界。
+    #[test]
+    fn batch_count_above_int_max_is_rejected_before_the_id_walk() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let id = [0x31u8; 28];
+        let ids = [RayBytes {
+            data: id.as_ptr() as *const std::os::raw::c_char,
+            len: id.len(),
+        }];
+        let too_many = usize::try_from(i32::MAX).unwrap() + 1;
+        rayrust_sys::clear_error();
+        let array = unsafe { rayrust_sys::ray_get_many(ids.as_ptr(), too_many, -1) };
+        assert!(array.is_null(), "count 超过 INT_MAX 时返回了非空数组");
+        assert_eq!(
+            rayrust_sys::last_error_kind(),
+            rayrust_sys::ErrorKind::Generic,
+            "数量拒绝没有写成 RAY_ERROR_KIND_GENERIC"
+        );
+        let message = rayrust_sys::last_error().unwrap_or_default();
+        assert!(
+            message.contains("more object ids than Ray's Wait accepts"),
+            "数量拒绝消息不符: {:?}",
+            message
+        );
     }
 }

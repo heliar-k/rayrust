@@ -65,7 +65,9 @@ static_assert(alignof(RayIntentionalSystemExitException) == alignof(RayException
 // ─── Thread-local error storage ─────────────────────────────────
 // Instead of fprintf(stderr), we store the error message in a thread-local
 // string so the Rust side can retrieve it via ray_last_error_bytes().
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -1197,6 +1199,12 @@ ray_bytes_t ray_put(const char *data, size_t len) {
 ray_bytes_t ray_get(const char *id_data, size_t id_len, int timeout_ms) {
     ray_clear_error();
     try {
+        // `-1` 表示永久等待，更小的值会让上游 memory_store.cc 的
+        // RAY_CHECK(timeout_ms >= 0 || timeout_ms == -1) 终止进程。
+        if (timeout_ms < -1) {
+            set_last_error("timeout_ms must be -1 or non-negative");
+            return ray_bytes_t{nullptr, 0};
+        }
         if (check_object_id(id_data, id_len) != 0) return ray_bytes_t{nullptr, 0};
         auto runtime = runtime_for_call();
         if (!runtime) return ray_bytes_t{nullptr, 0};
@@ -1265,6 +1273,10 @@ int ray_remove_local_reference(const char *id_data, size_t id_len) {
 bool *ray_wait(const ray_bytes_t *ids, size_t count, size_t num_objects, int timeout_ms) {
     ray_clear_error();
     try {
+        if (timeout_ms < -1) {
+            set_last_error("timeout_ms must be -1 or non-negative");
+            return nullptr;
+        }
         if (count > 0 && !ids) {
             set_last_error("object id array is null");
             return nullptr;
@@ -2886,11 +2898,94 @@ int ray_cancel(const char *id_data, size_t id_len, bool force_kill, bool recursi
     }
 }
 
+/// 单调毫秒时钟，用于计算多元素批次里每个就绪元素的剩余期限。
+static int64_t steady_clock_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+/// 读取单个已就绪对象并填入 `slot`；失败时把 `slot` 置空，且仅在整批首个失败元素上
+/// 写入线程局部错误通道。
+static void fetch_single_element(ray::internal::RayRuntime &runtime,
+                                 const std::string &id,
+                                 int timeout_ms,
+                                 ray_bytes_t &slot,
+                                 bool &failure_recorded) {
+    slot = ray_bytes_t{nullptr, 0};
+    try {
+        auto buffer = runtime.Get(id, timeout_ms);
+        if (!buffer) {
+            if (!failure_recorded) {
+                set_last_error(
+                    "the object store returned no buffer for an object in the batch");
+                failure_recorded = true;
+            }
+            return;
+        }
+        const size_t size = buffer->size();
+        if (size == 0) {
+            if (!failure_recorded) {
+                set_last_error_kind(kUntranslatedObjectError,
+                                    RAY_ERROR_KIND_UNCLASSIFIED);
+                failure_recorded = true;
+            }
+            return;
+        }
+        char *data = static_cast<char *>(std::malloc(size));
+        if (!data) {
+            if (!failure_recorded) {
+                set_last_error("out of memory copying an object in the batch");
+                failure_recorded = true;
+            }
+            return;
+        }
+        std::memcpy(data, buffer->data(), size);
+        slot = ray_bytes_t{data, size};
+    } catch (const std::exception &e) {
+        if (!failure_recorded) {
+            set_last_error_exception(e);
+            failure_recorded = true;
+        }
+    }
+}
+
+/// 上游 C++ SDK 的批量 `Get` 在含有异常对象的混合批次下会留下空 `RayObject` 指针并触发
+/// SIGSEGV：
+/// - `CoreWorkerMemoryStore::GetImpl`
+///   （`src/ray/core_worker/store_provider/memory_store/memory_store.cc:276-419`）在
+///   `:308-333` 发现批次中已有异常对象（`IsException()` 为真且非 plasma 占位错误）时提前
+///   返回 `Status::OK()`，其余尚未就绪的元素在 `results` 中保持 `nullptr`。
+/// - `CoreWorker::GetObjects`（`src/ray/core_worker/core_worker.cc:1337-1426`）在
+///   `:1375-1382` 把已转入 plasma 的元素从 `result_map` 移到 `plasma_object_ids`，`:1384`
+///   的 `if (!got_exception && !plasma_object_ids.empty())` 在批次含有异常对象时跳过
+///   plasma 取数；`:1404-1423` 让未取到的元素在 `results[i]` 保持 `nullptr`，且
+///   `timeout_ms < 0 && will_throw_exception` 时跳过 `RAY_CHECK(!missing_result)`，返回
+///   `Status::OK()` 与空指针。
+/// - `NativeObjectStore::GetRaw`
+///   （`cpp/src/ray/runtime/object/native_object_store.cc:90-134`）在 `:104-105` 未检查空
+///   指针便直接执行 `results[i]->GetMetadata()`，进程收到 SIGSEGV 终止。
+/// - `CoreWorker::Wait`（`src/ray/core_worker/core_worker.cc:1461-1566`）经
+///   `CoreWorkerMemoryStore::Wait`（`memory_store.cc:450-481`，另见 `:315` 注释以及
+///   `memory_store.cc:421-448` 的 `Get`）把 `abort_if_any_object_is_exception` 与
+///   `at_most_num_objects` 均设为 `false`，仅返回就绪标志，不触发上述空指针路径；由于
+///   `CoreWorker::Wait` 在 `:1475-1484` 拒绝重复 ID，非空批次先按 28 字节 ObjectID
+///   去重后调用一次 `Wait` 确定截止时间，再按原顺序对每个就绪元素执行单对象 `Get`。
+///   `Wait` 不因批次里的异常对象提前返回，因此多元素批次会等到全部就绪或期限到期。
 ray_bytes_t *ray_get_many(const ray_bytes_t *ids, size_t count, int timeout_ms) {
     ray_clear_error();
     try {
+        if (timeout_ms < -1) {
+            set_last_error("timeout_ms must be -1 or non-negative");
+            return nullptr;
+        }
         if (count > 0 && !ids) {
             set_last_error("object id array is null");
+            return nullptr;
+        }
+        // 上界在遍历 ID 与任何 reserve(count) 之前拒绝，避免与 count 成正比的工作；
+        // SDK 的 `Wait` 只收 int，后面的 static_cast 因此安全。
+        if (count > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            set_last_error("the batch holds more object ids than Ray's Wait accepts");
             return nullptr;
         }
         for (size_t i = 0; i < count; i++) {
@@ -2899,13 +2994,37 @@ ray_bytes_t *ray_get_many(const ray_bytes_t *ids, size_t count, int timeout_ms) 
         auto runtime = runtime_for_call();
         if (!runtime) return nullptr;
 
-        std::vector<std::string> id_vec;
-        id_vec.reserve(count);
-        for (size_t i = 0; i < count; i++) {
-            id_vec.emplace_back(ids[i].data, ids[i].len);
+        if (count == 0) {
+            auto *out = static_cast<ray_bytes_t *>(std::malloc(sizeof(ray_bytes_t)));
+            if (!out) {
+                set_last_error("out of memory allocating the result array");
+                return nullptr;
+            }
+            return out;
         }
 
-        auto results = runtime->Get(id_vec, timeout_ms);
+        std::vector<std::string> unique_ids;
+        unique_ids.reserve(count);
+        std::vector<size_t> unique_of_element;
+        unique_of_element.reserve(count);
+        std::unordered_map<std::string, size_t> index_by_id;
+        index_by_id.reserve(count);
+        for (size_t i = 0; i < count; i++) {
+            std::string id(ids[i].data, ids[i].len);
+            auto [it, inserted] = index_by_id.emplace(std::move(id), unique_ids.size());
+            if (inserted) {
+                unique_ids.push_back(it->first);
+            }
+            unique_of_element.push_back(it->second);
+        }
+        if (unique_ids.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            set_last_error("too many unique object IDs in batch");
+            return nullptr;
+        }
+
+        const int64_t start = steady_clock_ms();
+        auto ready = runtime->Wait(
+            unique_ids, static_cast<int>(unique_ids.size()), timeout_ms);
 
         auto *out = static_cast<ray_bytes_t *>(std::malloc(count * sizeof(ray_bytes_t)));
         if (!out) {
@@ -2913,39 +3032,25 @@ ray_bytes_t *ray_get_many(const ray_bytes_t *ids, size_t count, int timeout_ms) 
             return nullptr;
         }
 
-        const char *element_error = nullptr;
-        int element_kind = RAY_ERROR_KIND_GENERIC;
+        bool failure_recorded = false;
         for (size_t i = 0; i < count; i++) {
-            if (i < results.size() && results[i]) {
-                const size_t size = results[i]->size();
-                if (size == 0) {
-                    out[i] = ray_bytes_t{nullptr, 0};
-                    if (!element_error) {
-                        element_error = kUntranslatedObjectError;
-                        element_kind = RAY_ERROR_KIND_UNCLASSIFIED;
-                    }
-                    continue;
-                }
-                char *data = static_cast<char *>(std::malloc(size));
-                if (data) {
-                    std::memcpy(data, results[i]->data(), size);
-                    out[i] = ray_bytes_t{data, size};
-                } else {
-                    out[i] = ray_bytes_t{nullptr, 0};
-                    if (!element_error) {
-                        element_error = "out of memory copying an object in the batch";
-                    }
-                }
-            } else {
+            const size_t unique_idx = unique_of_element[i];
+            if (unique_idx >= ready.size() || !ready[unique_idx]) {
                 out[i] = ray_bytes_t{nullptr, 0};
-                if (!element_error) {
-                    element_error =
-                        "the object store returned no buffer for an object in the batch";
+                if (!failure_recorded) {
+                    set_last_error_kind("Get timed out: some object(s) not ready.",
+                                        RAY_ERROR_KIND_TIMEOUT);
+                    failure_recorded = true;
                 }
+                continue;
             }
-        }
-        if (element_error) {
-            set_last_error_kind(element_error, element_kind);
+            int element_timeout = timeout_ms;
+            if (timeout_ms >= 0) {
+                element_timeout = static_cast<int>(
+                    std::max<int64_t>(0, timeout_ms - (steady_clock_ms() - start)));
+            }
+            fetch_single_element(
+                *runtime, unique_ids[unique_idx], element_timeout, out[i], failure_recorded);
         }
         return out;
     } catch (const std::exception &e) {
