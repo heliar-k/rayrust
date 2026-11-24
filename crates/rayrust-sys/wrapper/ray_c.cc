@@ -234,22 +234,54 @@ static std::unordered_map<std::string, ray_func_callback_t> &get_rust_functions(
     return map;
 }
 
-/// Rust 回调用哨兵长度表示「这次调用要按退出处理」。判断必须在
-/// `std::free(result.data)` 之前：哨兵没有 data，长度也不能进 `msgpack::sbuffer`。
-/// 抛出的异常穿过 C++ 帧回到 `GetExecuteResult` 的 try，那里才是决定成败的地方。
-static void throw_for_exit_sentinel(size_t len) {
-    if (len == RAY_INTENTIONAL_EXIT_SENTINEL) {
-        // 与 AbstractRayRuntime::ExitActor 抛的是同一个类：GetExecuteResult 的
-        // `catch (RayIntentionalSystemExitException &)`（cpp/src/ray/runtime/task/task_executor.cc:97，
-        // 日志行 `:98`）用它把「故意退出」与「失败」分开。
-        throw ray::internal::RayIntentionalSystemExitException("SystemExit");
+/// 管理 Rust 回调堆分配缓冲区的 RAII 守卫：离开作用域时释放非空 `data`。
+struct CallbackBufferGuard {
+    const char *data;
+    explicit CallbackBufferGuard(const char *p) : data(p) {}
+    ~CallbackBufferGuard() {
+        if (data != nullptr) {
+            std::free(const_cast<char *>(data));
+        }
     }
-    if (len == RAY_EXIT_OUTSIDE_ACTOR_SENTINEL) {
-        // 任务与 actor 构造函数走这条：GetExecuteResult 的通用
-        // `catch (const std::exception &)`（同文件 `:101`，日志行 `:110`）把它变成该次
-        // 调用的失败。
-        throw ray::internal::RayException(
-            "exit_actor() can only be called from inside an actor method");
+    CallbackBufferGuard(const CallbackBufferGuard &) = delete;
+    CallbackBufferGuard &operator=(const CallbackBufferGuard &) = delete;
+};
+
+/// 解析 Rust 回调返回的 `ray_callback_result_t`：无论成功还是抛出异常，都在返回前
+/// 释放 `result.data`。
+static msgpack::sbuffer unwrap_callback_result(ray_callback_result_t result) {
+    CallbackBufferGuard guard(result.data);
+    switch (result.status) {
+        case RAY_CALLBACK_OK: {
+            if (result.len > 0 && !result.data) {
+                throw ray::internal::RayException(
+                    "Rust callback returned RAY_CALLBACK_OK with null data and non-zero length");
+            }
+            msgpack::sbuffer sbuf(result.len);
+            if (result.len > 0) {
+                sbuf.write(result.data, result.len);
+            }
+            return sbuf;
+        }
+        case RAY_CALLBACK_ERROR: {
+            std::string msg = (result.data && result.len > 0)
+                                  ? std::string(result.data, result.len)
+                                  : std::string("Rust callback failed without an error message");
+            throw ray::internal::RayException(msg);
+        }
+        case RAY_CALLBACK_INTENTIONAL_EXIT:
+            // 与 AbstractRayRuntime::ExitActor 抛出的异常同属一类：GetExecuteResult 的
+            // `catch (RayIntentionalSystemExitException &)`（cpp/src/ray/runtime/task/task_executor.cc:97-100）
+            // 用它把故意退出与普通失败区分开。
+            throw ray::internal::RayIntentionalSystemExitException("SystemExit");
+        case RAY_CALLBACK_EXIT_OUTSIDE_ACTOR:
+            // 任务与 actor 构造函数走这条：GetExecuteResult 的通用
+            // `catch (const std::exception &)`（同文件 `:101-111`）把它变成该次调用的失败。
+            throw ray::internal::RayException(
+                "exit_actor() can only be called from inside an actor method");
+        default:
+            throw ray::internal::RayException(
+                "unknown Rust callback status: " + std::to_string(result.status));
     }
 }
 
@@ -268,18 +300,8 @@ static msgpack::sbuffer invoke_rust_function(const std::string &func_name,
         args_arr.push_back(ray_bytes_t{buf.data(), buf.size()});
     }
 
-    // Call the Rust callback
-    ray_bytes_t result = it->second(args_arr.data(), args_arr.size());
-
-    // actor 构造函数通过这个回调进入（ray_register_function），所以哨兵在这里截住。
-    throw_for_exit_sentinel(result.len);
-
-    // Copy result into msgpack::sbuffer and free the C-allocated data
-    msgpack::sbuffer sbuf(result.len);
-    sbuf.write(result.data, result.len);
-    std::free(const_cast<char *>(result.data));
-
-    return sbuf;
+    ray_callback_result_t result = it->second(args_arr.data(), args_arr.size());
+    return unwrap_callback_result(result);
 }
 
 void ray_register_function(const char *func_name, ray_func_callback_t callback) {
@@ -315,6 +337,11 @@ static msgpack::sbuffer invoke_rust_member_function(
         throw std::runtime_error("Rust member function not found: " + func_name);
     }
 
+    if (!actor_ptr_buf) {
+        throw ray::internal::RayException(
+            "actor pointer buffer is null in Rust member function '" + func_name + "'");
+    }
+
     // Deserialize the actor pointer (uint64_t) from actor_ptr_buf
     uint64_t actor_ptr = ray::internal::Serializer::Deserialize<uint64_t>(
         actor_ptr_buf->data(), actor_ptr_buf->size());
@@ -326,18 +353,8 @@ static msgpack::sbuffer invoke_rust_member_function(
         args_arr.push_back(ray_bytes_t{buf.data(), buf.size()});
     }
 
-    // Call the Rust callback
-    ray_bytes_t result = it->second(actor_ptr, args_arr.data(), args_arr.size());
-
-    // 只有成员回调会返回 RAY_INTENTIONAL_EXIT_SENTINEL。
-    throw_for_exit_sentinel(result.len);
-
-    // Copy result into msgpack::sbuffer and free the C-allocated data
-    msgpack::sbuffer sbuf(result.len);
-    sbuf.write(result.data, result.len);
-    std::free(const_cast<char *>(result.data));
-
-    return sbuf;
+    ray_callback_result_t result = it->second(actor_ptr, args_arr.data(), args_arr.size());
+    return unwrap_callback_result(result);
 }
 
 void ray_register_member_function(const char *func_name, ray_member_callback_t callback) {

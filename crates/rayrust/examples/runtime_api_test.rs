@@ -116,7 +116,7 @@
 //!   终止进程，本地模式则返回 `Ok(None)`；现在两种模式都报 `Ffi`。
 //!   `get_actor(" ", "")` 是合法的未命中，返回 `Ok(None)`。空 namespace 合法：
 //!   `NativeTaskSubmitter::GetActor` 用 job config 的 namespace 顶替它。
-//! - 本地模式没有 core worker，`exit_actor()` 在那里是空操作：哨兵异常会被
+//! - 本地模式没有 core worker，`exit_actor()` 在那里是空操作：退出状态异常会被
 //!   `TaskExecutor::Invoke` 的 `catch (std::exception &)` 打包成错误载荷，返回 `()` 的
 //!   方法看到 `Ok(())`、返回值的方法看到一条与退出无关的 `Serialization` 错误。
 
@@ -197,7 +197,7 @@ impl SelfExiting {
     }
 
     // 返回值的方法里调用 `exit_actor()`：本地模式用它验证「调用是空操作」这条，
-    // 因为方法自己的返回值会被解出来（哨兵路径上那里得到的是 `Serialization` 错误）。
+    // 因为方法自己的返回值会被解出来（退出状态路径上那里得到的是 `Serialization` 错误）。
     fn increment_and_exit(&mut self, n: i64) -> i64 {
         self.value += n;
         rayrust::exit_actor();
@@ -894,7 +894,7 @@ async fn exit_actor_check(ray: &Ray, cluster: bool) {
 
     if !cluster {
         // 本地模式：先给 actor 留下一个可辨认的状态，再证明 exit_actor() 什么都没做。
-        // 用带返回值的方法：哨兵路径上它的返回值会被错误载荷顶掉（`Serialization`），
+        // 用带返回值的方法：退出状态路径上它的返回值会被错误载荷顶掉（`Serialization`），
         // 空操作路径上拿到的就是 9。
         let bumped = selfexiting_increment_and_exit_sync(ray, &handle, 2)
             .expect("调用 increment_and_exit")

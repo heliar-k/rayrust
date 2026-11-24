@@ -3,7 +3,9 @@
 //! ## `#[rayrust::remote]`
 //!
 //! Marks a function as a Ray remote task. Generates:
-//! - A C-compatible callback that deserializes args, calls the function, serializes result
+//! - A C-compatible callback returning `RayCallbackResult` that unpacks and
+//!   deserializes args, runs the function inside `std::panic::catch_unwind`,
+//!   and serializes the result (or returns `RAY_CALLBACK_ERROR` on failure/panic)
 //! - A `register()` function that registers the callback with Ray's FunctionManager
 //! - A `{name}_remote()` sync caller (returns `Result`)
 //! - A `{name}_remote_with_options()` sync caller taking `&TaskOptions`
@@ -20,21 +22,28 @@
 //! ## `#[rayrust::actor]`
 //!
 //! Marks an `impl` block as a Ray actor. Generates:
-//! - A factory callback that calls `new()` and returns a raw pointer
-//! - Member function callbacks for each method (excluding `new`)
+//! - A factory callback returning `RayCallbackResult` that calls `new()` inside
+//!   `catch_unwind` and stores `Box<std::sync::Mutex<T>>` (enforcing `T: Send + 'static`)
+//! - Member function callbacks returning `RayCallbackResult` for each method
+//!   (excluding `new`; by-value `self` methods are rejected at macro expansion time)
 //! - `#[ctor]` auto-registration of all callbacks
 //! - `{Type}_actor_create()` function to create instances (accepts `&ActorOptions`)
 //! - `{Type}_{method}()` async caller to call methods
 //! - `{Type}_{method}_sync()` sync caller to call methods
+//!
+//! 成员方法回调在获取互斥锁之前完成参数解包与反序列化，因此参数解码失败不会使
+//! actor 互斥锁中毒；带 `&self` 或 `&mut self` 接收者的方法通过 `Mutex::lock()`
+//! 串行借用状态并在方法返回后、返回值序列化前释放锁；无 `self` 接收者的关联函数
+//! 不访问实例指针、不取锁。方法体内发生 `panic!` 时会被 `catch_unwind` 捕获并
+//! 通过 `RAY_CALLBACK_ERROR` 传回，同时该实例的互斥锁进入 poisoned 状态，后续
+//! 访问该实例状态的调用会返回包含 `"poisoned"` 的错误。
 //!
 //! 方法调用器的参数与 `#[remote]` 相同：值或 `ObjectRef<T>`/`&ObjectRef<T>`，错误
 //! 都在 `Result` 里。构造参数只接受值。
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{
-    parse_macro_input, FnArg, ImplItem, ItemFn, ItemImpl, ReturnType, Type,
-};
+use syn::{parse_macro_input, FnArg, ImplItem, ItemFn, ItemImpl, ReturnType, Type};
 
 /// 调用器的泛型参数名：名字不可能与用户代码相撞，并且带宏卫生
 /// （`mixed_site`），用户自己定义了同名类型也不会被它遮住。
@@ -68,28 +77,35 @@ pub fn remote(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // Detect if the function is async
     let is_async = sig.asyncness.is_some();
 
-    // Extract argument names and types
-    let arg_data: Vec<(syn::Pat, syn::Type)> = inputs
+    // Extract argument types (ignore user pattern in call expression via hygienic locals)
+    let arg_data: Vec<syn::Type> = inputs
         .iter()
         .filter_map(|arg| {
             if let FnArg::Typed(pat_type) = arg {
-                Some((*pat_type.pat.clone(), *pat_type.ty.clone()))
+                Some(*pat_type.ty.clone())
             } else {
                 None
             }
         })
         .collect();
 
-    let arg_names: Vec<_> = arg_data.iter().map(|(pat, _)| quote! { #pat }).collect();
+    let expected_arg_count = arg_data.len();
 
-    // Build (name, type, index) triples for deserialization
+    let cb_arg_idents: Vec<_> = (0..expected_arg_count)
+        .map(|i| format_ident!("__rayrust_arg_{}", i))
+        .collect();
+
     let arg_deserialize: Vec<_> = arg_data
         .iter()
         .enumerate()
-        .map(|(i, (pat, ty))| {
+        .map(|(i, ty)| {
+            let local_ident = &cb_arg_idents[i];
             quote! {
-                let #pat: #ty = ::rayrust::deserialize(&__rayrust_deserialized[#i])
-                    .expect(concat!("failed to deserialize arg ", #i, " of ", #fn_name_str));
+                let #local_ident: #ty = ::rayrust::callback::deserialize_arg(
+                    __rayrust_raw_args[#i],
+                    #i,
+                    #fn_name_str,
+                )?;
             }
         })
         .collect();
@@ -100,11 +116,11 @@ pub fn remote(_attr: TokenStream, item: TokenStream) -> TokenStream {
     //
     // 调用器的参数一律叫 `__arg0`, `__arg1`, ...，不沿用用户写的模式：用户很可能
     // 起一个叫 `ray` 的名字，解构参数（`(a, b): (i32, i32)`）也不能直接当泛型参数
-    // 的类型标注。用户模式只在工人侧的反序列化里出现。
+    // 的类型标注。
     let arg_generic_bounds: Vec<_> = arg_data
         .iter()
         .enumerate()
-        .map(|(i, (_, ty))| {
+        .map(|(i, ty)| {
             let generic = generic_arg_ident(i);
             quote! { #generic: ::rayrust::TaskArg<#ty> }
         })
@@ -134,7 +150,7 @@ pub fn remote(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let arg_pushes: Vec<_> = arg_data
         .iter()
         .enumerate()
-        .map(|(i, (_, ty))| {
+        .map(|(i, ty)| {
             let arg_name = format_ident!("__arg{}", i);
             quote! { ::rayrust::TaskArg::<#ty>::push_arg(#arg_name, &mut __rayrust_args); }
         })
@@ -151,11 +167,11 @@ pub fn remote(_attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             // Use the persistent global tokio runtime (created once, reused).
             // This avoids allocating a new runtime per call.
-            ::rayrust::block_on_async(#fn_name(#(#arg_names),*))
+            ::rayrust::block_on_async(#fn_name(#(#cb_arg_idents),*))
         }
     } else {
         quote! {
-            #fn_name(#(#arg_names),*)
+            #fn_name(#(#cb_arg_idents),*)
         }
     };
 
@@ -169,64 +185,19 @@ pub fn remote(_attr: TokenStream, item: TokenStream) -> TokenStream {
         pub extern "C" fn #callback_fn_name(
             __rayrust_args: *const ::rayrust::sys::RayBytes,
             __rayrust_arg_count: usize,
-        ) -> ::rayrust::sys::RayBytes {
-            let __rayrust_args_slice = if __rayrust_arg_count == 0 {
-                &[][..]
-            } else {
-                unsafe { ::std::slice::from_raw_parts(__rayrust_args, __rayrust_arg_count) }
-            };
-
-            let mut __rayrust_deserialized: Vec<Vec<u8>> =
-                Vec::with_capacity(__rayrust_arg_count);
-            for __rayrust_i in 0..__rayrust_arg_count {
-                let __rayrust_raw = unsafe {
-                    ::std::slice::from_raw_parts(
-                        __rayrust_args_slice[__rayrust_i].data as *const u8,
-                        __rayrust_args_slice[__rayrust_i].len,
-                    )
+        ) -> ::rayrust::sys::RayCallbackResult {
+            ::rayrust::callback::run_task_callback(#fn_name_str, || {
+                let __rayrust_raw_args = unsafe {
+                    ::rayrust::callback::unpack_args(
+                        __rayrust_args,
+                        __rayrust_arg_count,
+                        #expected_arg_count,
+                        #fn_name_str,
+                    )?
                 };
-                __rayrust_deserialized.push(__rayrust_raw.to_vec());
-            }
-
-            // 上一次回调（同一个线程）留下的标志不能带进这一次。
-            ::rayrust::actor_exit::clear_exit_request();
-
-            let __rayrust_result = {
                 #( #arg_deserialize )*
-                #call_expr
-            };
-
-            // 任务里调用 exit_actor() 结束不了任何东西：退出语义只在 actor 方法里
-            // 成立。把标志变成哨兵，C 侧看到它就抛 RayException，这次调用因此失败。
-            if ::rayrust::actor_exit::take_exit_request() {
-                return ::rayrust::sys::RayBytes {
-                    data: ::std::ptr::null(),
-                    len: ::rayrust::sys::RAY_EXIT_OUTSIDE_ACTOR_SENTINEL,
-                };
-            }
-
-            let __rayrust_result_bytes = ::rayrust::serialize(&__rayrust_result)
-                .expect(concat!("failed to serialize result of ", #fn_name_str));
-
-            let __rayrust_layout = ::std::alloc::Layout::array::<u8>(
-                __rayrust_result_bytes.len())
-                .expect("layout alloc failed");
-            let __rayrust_ptr = unsafe { ::std::alloc::alloc(__rayrust_layout) };
-            if __rayrust_ptr.is_null() {
-                ::std::alloc::handle_alloc_error(__rayrust_layout);
-            }
-            unsafe {
-                ::std::ptr::copy_nonoverlapping(
-                    __rayrust_result_bytes.as_ptr(),
-                    __rayrust_ptr,
-                    __rayrust_result_bytes.len(),
-                );
-            }
-
-            ::rayrust::sys::RayBytes {
-                data: __rayrust_ptr as *const ::std::os::raw::c_char,
-                len: __rayrust_result_bytes.len(),
-            }
+                ::std::result::Result::Ok(#call_expr)
+            })
         }
 
         /// Register this function with Ray's FunctionManager.
@@ -324,7 +295,11 @@ pub fn remote(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Helper to generate a unique callback function name for an actor method.
 fn callback_name(type_name: &str, method_name: &str) -> String {
-    format!("__rayrust_member_{}_{}", type_name.to_lowercase(), method_name)
+    format!(
+        "__rayrust_member_{}_{}",
+        type_name.to_lowercase(),
+        method_name
+    )
 }
 
 /// Helper to generate the factory callback name.
@@ -338,12 +313,25 @@ pub fn actor(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Extract the type name from the impl block
     let type_name = match *input.self_ty {
-        Type::Path(ref p) => {
-            p.path.segments.last()
-                .map(|s| s.ident.to_string())
-                .expect("actor: could not determine type name")
+        Type::Path(ref p) => match p.path.segments.last() {
+            Some(s) => s.ident.to_string(),
+            None => {
+                return syn::Error::new_spanned(
+                    &input.self_ty,
+                    "#[rayrust::actor] could not determine type name",
+                )
+                .to_compile_error()
+                .into();
+            }
+        },
+        _ => {
+            return syn::Error::new_spanned(
+                &input.self_ty,
+                "#[rayrust::actor] requires a named type",
+            )
+            .to_compile_error()
+            .into();
         }
-        _ => panic!("#[rayrust::actor] requires a named type"),
     };
 
     let type_name_lower = type_name.to_lowercase();
@@ -353,29 +341,72 @@ pub fn actor(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let register_ident = format_ident!("__register_{}_actor", type_name_lower);
     let ctor_ident = format_ident!("__RAYRUST_CTOR_ACTOR_{}", type_name_upper(&type_name));
 
+    #[derive(Clone, Copy)]
+    enum SelfKind {
+        Mut,
+        Ref,
+        Static,
+    }
+
     // Find `new` constructor and collect methods
-    type MethodInfo = (syn::Ident, Vec<(syn::Pat, syn::Type)>, Type);
+    type MethodInfo = (syn::Ident, Vec<Type>, Type, SelfKind);
     let mut methods: Vec<MethodInfo> = Vec::new();
-    let mut new_args: Vec<(syn::Pat, syn::Type)> = Vec::new();
+    let mut new_args: Vec<Type> = Vec::new();
     let mut has_new = false;
 
     for item in &input.items {
         if let ImplItem::Fn(method) = item {
             let method_name = method.sig.ident.to_string();
             if method_name == "new" {
+                if let Some(receiver) = method.sig.receiver() {
+                    return syn::Error::new_spanned(
+                        receiver,
+                        "#[rayrust::actor] constructor `new` cannot take a `self` receiver",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
                 has_new = true;
-                // Extract args (skip self)
                 for arg in method.sig.inputs.iter() {
                     if let FnArg::Typed(pat_type) = arg {
-                        new_args.push((*pat_type.pat.clone(), *pat_type.ty.clone()));
+                        new_args.push(*pat_type.ty.clone());
                     }
                 }
             } else {
+                let self_kind = match method.sig.receiver() {
+                    Some(syn::Receiver {
+                        reference: Some(_),
+                        mutability: Some(_),
+                        ..
+                    }) => SelfKind::Mut,
+                    Some(syn::Receiver {
+                        reference: Some(_),
+                        mutability: None,
+                        ..
+                    }) => SelfKind::Ref,
+                    Some(
+                        receiver @ syn::Receiver {
+                            reference: None, ..
+                        },
+                    ) => {
+                        return syn::Error::new_spanned(
+                            receiver,
+                            "#[rayrust::actor] methods cannot take `self` by value; use `&self`, `&mut self`, or omit `self`",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                    None => SelfKind::Static,
+                };
+
                 // All non-new methods become actor methods (regardless of visibility)
-                let m_args: Vec<(syn::Pat, syn::Type)> = method.sig.inputs.iter()
+                let m_args: Vec<Type> = method
+                    .sig
+                    .inputs
+                    .iter()
                     .filter_map(|arg| {
                         if let FnArg::Typed(pat_type) = arg {
-                            Some((*pat_type.pat.clone(), *pat_type.ty.clone()))
+                            Some(*pat_type.ty.clone())
                         } else {
                             None // skip `self`
                         }
@@ -387,64 +418,88 @@ pub fn actor(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     ReturnType::Type(_, ty) => (**ty).clone(),
                 };
 
-                methods.push((method.sig.ident.clone(), m_args, ret_type));
+                methods.push((method.sig.ident.clone(), m_args, ret_type, self_kind));
             }
         }
     }
 
     if !has_new {
-        panic!("#[rayrust::actor] requires a `new` constructor method");
+        return syn::Error::new_spanned(
+            &input,
+            "#[rayrust::actor] requires a `new` constructor method",
+        )
+        .to_compile_error()
+        .into();
     }
 
     // Generate factory callback
-    let new_arg_names: Vec<_> = new_args.iter().map(|(p, _)| quote! { #p }).collect();
-    let new_arg_deserialize: Vec<_> = new_args.iter()
+    let new_expected_count = new_args.len();
+    let new_cb_arg_idents: Vec<_> = (0..new_expected_count)
+        .map(|i| format_ident!("__rayrust_arg_{}", i))
+        .collect();
+    let new_arg_deserialize: Vec<_> = new_args
+        .iter()
         .enumerate()
-        .map(|(i, (pat, ty))| {
+        .map(|(i, ty)| {
+            let local_ident = &new_cb_arg_idents[i];
             quote! {
-                let #pat: #ty = ::rayrust::deserialize(&__rayrust_deserialized[#i])
-                    .expect("failed to deserialize constructor arg");
+                let #local_ident: #ty = ::rayrust::callback::deserialize_arg(
+                    __rayrust_raw_args[#i],
+                    #i,
+                    #factory_str,
+                )?;
             }
         })
         .collect();
 
     // Generate member callbacks
-    let member_callbacks: Vec<_> = methods.iter()
-        .map(|(method_ident, m_args, _ret_type)| {
+    let member_callbacks: Vec<_> = methods
+        .iter()
+        .map(|(method_ident, m_args, _ret_type, self_kind)| {
             let cb_name = callback_name(&type_name, &method_ident.to_string());
             let cb_ident = format_ident!("{}", cb_name);
-            let m_arg_names: Vec<_> = m_args.iter().map(|(p, _)| quote! { #p }).collect();
-            let m_arg_deserialize: Vec<_> = m_args.iter()
+            let method_full_name = format!("{}::{}", factory_str, method_ident);
+            let m_expected_count = m_args.len();
+            let m_cb_arg_idents: Vec<_> = (0..m_expected_count)
+                .map(|i| format_ident!("__rayrust_arg_{}", i))
+                .collect();
+            let m_arg_deserialize: Vec<_> = m_args
+                .iter()
                 .enumerate()
-                .map(|(i, (pat, ty))| {
+                .map(|(i, ty)| {
+                    let local_ident = &m_cb_arg_idents[i];
                     quote! {
-                        let #pat: #ty = ::rayrust::deserialize(&__rayrust_deserialized[#i])
-                            .expect("failed to deserialize method arg");
+                        let #local_ident: #ty = ::rayrust::callback::deserialize_arg(
+                            __rayrust_raw_args[#i],
+                            #i,
+                            #method_full_name,
+                        )?;
                     }
                 })
                 .collect();
 
-            // Check if method takes &mut self or &self
-            let self_kind = input.items.iter()
-                .find_map(|item| {
-                    if let ImplItem::Fn(m) = item {
-                        if m.sig.ident == *method_ident {
-                            let kind = match m.sig.receiver() {
-                                Some(syn::Receiver { reference: Some(_), mutability: Some(_), .. }) => "mut",
-                                Some(syn::Receiver { reference: Some(_), mutability: None, .. }) => "ref",
-                                Some(syn::Receiver { reference: None, .. }) => "owned",
-                                None => "static",
-                            };
-                            return Some(kind);
-                        }
-                    }
-                    None
-                }).unwrap_or("ref");
-
             let call_expr = match self_kind {
-                "mut" => quote! { unsafe { (__rayrust_actor_ptr as *mut #type_ident).as_mut().unwrap().#method_ident(#(#m_arg_names),*) } },
-                "ref" => quote! { unsafe { (__rayrust_actor_ptr as *const #type_ident).as_ref().unwrap().#method_ident(#(#m_arg_names),*) } },
-                _ => quote! { #type_ident::#method_ident(#(#m_arg_names),*) },
+                SelfKind::Mut => quote! {
+                    unsafe {
+                        ::rayrust::callback::with_actor_mut::<#type_ident, _>(
+                            __rayrust_actor_ptr,
+                            #method_full_name,
+                            |__rayrust_self| __rayrust_self.#method_ident(#(#m_cb_arg_idents),*),
+                        )
+                    }
+                },
+                SelfKind::Ref => quote! {
+                    unsafe {
+                        ::rayrust::callback::with_actor_ref::<#type_ident, _>(
+                            __rayrust_actor_ptr,
+                            #method_full_name,
+                            |__rayrust_self| __rayrust_self.#method_ident(#(#m_cb_arg_idents),*),
+                        )
+                    }
+                },
+                SelfKind::Static => quote! {
+                    ::std::result::Result::Ok(#type_ident::#method_ident(#(#m_cb_arg_idents),*))
+                },
             };
 
             quote! {
@@ -454,75 +509,28 @@ pub fn actor(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     __rayrust_actor_ptr: u64,
                     __rayrust_args: *const ::rayrust::sys::RayBytes,
                     __rayrust_arg_count: usize,
-                ) -> ::rayrust::sys::RayBytes {
-                    let __rayrust_args_slice = if __rayrust_arg_count == 0 {
-                        &[][..]
-                    } else {
-                        unsafe {
-                            ::std::slice::from_raw_parts(__rayrust_args, __rayrust_arg_count)
-                        }
-                    };
-
-                    let mut __rayrust_deserialized: Vec<Vec<u8>> =
-                        Vec::with_capacity(__rayrust_arg_count);
-                    for __rayrust_i in 0..__rayrust_arg_count {
-                        let __rayrust_raw = unsafe {
-                            ::std::slice::from_raw_parts(
-                                __rayrust_args_slice[__rayrust_i].data as *const u8,
-                                __rayrust_args_slice[__rayrust_i].len,
-                            )
+                ) -> ::rayrust::sys::RayCallbackResult {
+                    ::rayrust::callback::run_member_callback(#method_full_name, || {
+                        let __rayrust_raw_args = unsafe {
+                            ::rayrust::callback::unpack_args(
+                                __rayrust_args,
+                                __rayrust_arg_count,
+                                #m_expected_count,
+                                #method_full_name,
+                            )?
                         };
-                        __rayrust_deserialized.push(__rayrust_raw.to_vec());
-                    }
-
-                    // 上一次回调（同一个线程）留下的标志不能带进这一次。
-                    ::rayrust::actor_exit::clear_exit_request();
-
-                    let __rayrust_result = {
                         #( #m_arg_deserialize )*
                         #call_expr
-                    };
-
-                    // actor 方法里调用了 exit_actor()：不序列化结果，把标志变成哨兵。
-                    // C 侧在 Rust 帧返回之后抛 RayIntentionalSystemExitException，
-                    // core worker 据此关闭 actor 且不按 max_restarts 重启。
-                    if ::rayrust::actor_exit::take_exit_request() {
-                        return ::rayrust::sys::RayBytes {
-                            data: ::std::ptr::null(),
-                            len: ::rayrust::sys::RAY_INTENTIONAL_EXIT_SENTINEL,
-                        };
-                    }
-
-                    let __rayrust_result_bytes = ::rayrust::serialize(&__rayrust_result)
-                        .expect("failed to serialize method result");
-
-                    let __rayrust_layout = ::std::alloc::Layout::array::<u8>(
-                        __rayrust_result_bytes.len())
-                        .expect("layout alloc failed");
-                    let __rayrust_ptr = unsafe { ::std::alloc::alloc(__rayrust_layout) };
-                    if __rayrust_ptr.is_null() {
-                        ::std::alloc::handle_alloc_error(__rayrust_layout);
-                    }
-                    unsafe {
-                        ::std::ptr::copy_nonoverlapping(
-                            __rayrust_result_bytes.as_ptr(),
-                            __rayrust_ptr,
-                            __rayrust_result_bytes.len(),
-                        );
-                    }
-
-                    ::rayrust::sys::RayBytes {
-                        data: __rayrust_ptr as *const ::std::os::raw::c_char,
-                        len: __rayrust_result_bytes.len(),
-                    }
+                    })
                 }
             }
         })
         .collect();
 
     // Generate registration
-    let reg_names: Vec<_> = methods.iter()
-        .map(|(method_ident, _, _)| {
+    let reg_names: Vec<_> = methods
+        .iter()
+        .map(|(method_ident, _, _, _)| {
             let name = format!("{}::{}", factory_str, method_ident);
             let cb_name = callback_name(&type_name, &method_ident.to_string());
             let cb_ident = format_ident!("{}", cb_name);
@@ -537,14 +545,13 @@ pub fn actor(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Generate caller functions
     //
-    // 调用器的参数一律叫 `__arg0`, `__arg1`, ...，构造参数也是：用户写的模式只在
-    // 工厂/成员回调的反序列化里出现。否则用户参数叫 `ray`/`opts` 或写解构模式时
-    // 生成的签名会撞名或不合法。
+    // 调用器的参数一律叫 `__arg0`, `__arg1`, ...，构造参数也是：否则用户参数叫
+    // `ray`/`opts` 或写解构模式时生成的签名会撞名或不合法。
     let create_fn = format_ident!("{}_actor_create", type_name_lower);
     let create_inputs: Vec<_> = new_args
         .iter()
         .enumerate()
-        .map(|(i, (_, ty))| {
+        .map(|(i, ty)| {
             let arg_name = format_ident!("__arg{}", i);
             quote! { #arg_name: #ty }
         })
@@ -558,8 +565,9 @@ pub fn actor(_attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
-    let method_callers: Vec<_> = methods.iter()
-        .map(|(method_ident, m_args, ret_type)| {
+    let method_callers: Vec<_> = methods
+        .iter()
+        .map(|(method_ident, m_args, ret_type, _)| {
             let caller_name = format_ident!("{}_{}", type_name_lower, method_ident);
             let caller_sync_name = format_ident!("{}_{}_sync", type_name_lower, method_ident);
             let method_full_name = format!("{}::{}", factory_str, method_ident);
@@ -569,7 +577,7 @@ pub fn actor(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let m_generic_bounds: Vec<_> = m_args
                 .iter()
                 .enumerate()
-                .map(|(i, (_, ty))| {
+                .map(|(i, ty)| {
                     let generic = generic_arg_ident(i);
                     quote! { #generic: ::rayrust::TaskArg<#ty> }
                 })
@@ -591,7 +599,7 @@ pub fn actor(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let m_arg_pushes: Vec<_> = m_args
                 .iter()
                 .enumerate()
-                .map(|(i, (_, ty))| {
+                .map(|(i, ty)| {
                     let arg_name = format_ident!("__arg{}", i);
                     quote! { ::rayrust::TaskArg::<#ty>::push_arg(#arg_name, &mut __rayrust_args); }
                 })
@@ -658,66 +666,19 @@ pub fn actor(_attr: TokenStream, item: TokenStream) -> TokenStream {
         pub extern "C" fn #factory_ident(
             __rayrust_args: *const ::rayrust::sys::RayBytes,
             __rayrust_arg_count: usize,
-        ) -> ::rayrust::sys::RayBytes {
-            let __rayrust_args_slice = if __rayrust_arg_count == 0 {
-                &[][..]
-            } else {
-                unsafe { ::std::slice::from_raw_parts(__rayrust_args, __rayrust_arg_count) }
-            };
-
-            let mut __rayrust_deserialized: Vec<Vec<u8>> =
-                Vec::with_capacity(__rayrust_arg_count);
-            for __rayrust_i in 0..__rayrust_arg_count {
-                let __rayrust_raw = unsafe {
-                    ::std::slice::from_raw_parts(
-                        __rayrust_args_slice[__rayrust_i].data as *const u8,
-                        __rayrust_args_slice[__rayrust_i].len,
-                    )
+        ) -> ::rayrust::sys::RayCallbackResult {
+            ::rayrust::callback::run_factory_callback::<#type_ident>(#factory_str, || {
+                let __rayrust_raw_args = unsafe {
+                    ::rayrust::callback::unpack_args(
+                        __rayrust_args,
+                        __rayrust_arg_count,
+                        #new_expected_count,
+                        #factory_str,
+                    )?
                 };
-                __rayrust_deserialized.push(__rayrust_raw.to_vec());
-            }
-
-            // 上一次回调（同一个线程）留下的标志不能带进这一次。
-            ::rayrust::actor_exit::clear_exit_request();
-
-            let __rayrust_instance = {
                 #( #new_arg_deserialize )*
-                #type_ident::new(#(#new_arg_names),*)
-            };
-
-            // 构造函数里调用 exit_actor() 只能让这次 actor 创建失败。
-            if ::rayrust::actor_exit::take_exit_request() {
-                return ::rayrust::sys::RayBytes {
-                    data: ::std::ptr::null(),
-                    len: ::rayrust::sys::RAY_EXIT_OUTSIDE_ACTOR_SENTINEL,
-                };
-            }
-
-            let __rayrust_boxed = ::std::boxed::Box::new(__rayrust_instance);
-            let __rayrust_ptr_val = ::std::boxed::Box::into_raw(__rayrust_boxed) as u64;
-
-            let __rayrust_result_bytes = ::rayrust::serialize(&__rayrust_ptr_val)
-                .expect("failed to serialize actor ptr");
-
-            let __rayrust_layout = ::std::alloc::Layout::array::<u8>(
-                __rayrust_result_bytes.len())
-                .expect("layout alloc failed");
-            let __rayrust_ptr = unsafe { ::std::alloc::alloc(__rayrust_layout) };
-            if __rayrust_ptr.is_null() {
-                ::std::alloc::handle_alloc_error(__rayrust_layout);
-            }
-            unsafe {
-                ::std::ptr::copy_nonoverlapping(
-                    __rayrust_result_bytes.as_ptr(),
-                    __rayrust_ptr,
-                    __rayrust_result_bytes.len(),
-                );
-            }
-
-            ::rayrust::sys::RayBytes {
-                data: __rayrust_ptr as *const ::std::os::raw::c_char,
-                len: __rayrust_result_bytes.len(),
-            }
+                ::std::result::Result::Ok(#type_ident::new(#(#new_cb_arg_idents),*))
+            })
         }
 
         // Member callbacks
@@ -763,5 +724,13 @@ pub fn actor(_attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 fn type_name_upper(s: &str) -> String {
-    s.chars().map(|c| if c.is_ascii_lowercase() { c.to_ascii_uppercase() } else { c }).collect()
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            }
+        })
+        .collect()
 }

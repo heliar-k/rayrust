@@ -180,7 +180,7 @@ fn task_call_python_rejects_a_name_registered_as_a_rust_function() {
     extern "C" fn never_called(
         _args: *const rayrust::sys::RayBytes,
         _arg_count: usize,
-    ) -> rayrust::sys::RayBytes {
+    ) -> rayrust::sys::RayCallbackResult {
         panic!("the registered function must not run")
     }
     let registered = "__rayrust_registered_rust_function";
