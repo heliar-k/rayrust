@@ -338,7 +338,7 @@ let futs = (0..10).map(|i| add_remote_async(&ray, i, 1));
 
 ### 错误处理 —— 全部 `Result`，无隐藏 panic
 
-`put`、`kill_actor`、`get_actor` 与全部宏生成的调用器都返回 `Result`：参数序列化错误与任务、actor 提交错误都回到调用方，不变成 panic。C ABI 的线程局部 `last_error()` 在 FFI 调用后检查，调用前 `clear_error()` 防止残留错误。失败的任务与 actor 从错误载荷中提取格式化异常文本（如 Python traceback），无法提取时按 UTF-8 lossy 呈现原始字节。C++ SDK 未翻译的错误类型以 `RayError::Unclassified` 返回：不带错误文本的对象（如已取消的任务）由消息说明该情况并点名 `TASK_CANCELLED`；携带错误帧的对象（如 `runtime_env` 安装失败）在解码之前就被识别，因此 `get`、`get_value`、`Vec<u8>` 以及批量与异步入口都返回 Ray 记录的错误文本，不把帧字节当成值解出来。判定要求载荷严格满足帧规则（总长为 `9 + N`、正文是 msgpack `bin`、protobuf 顶层字段号与 wire type 都在允许集合内、文本非空且是合法 UTF-8），正常值不会被改判；恰好满足这些规则的载荷会以 `RayError::Unclassified` 返回，该载荷因此不再参与解码。
+`put`、`kill_actor`、`get_actor` 与全部宏生成的调用器都返回 `Result`：参数序列化错误与任务、actor 提交错误都回到调用方，不变成 panic。`Ray::connect` 在进入 SDK 之前校验 `RayConfig::address` 与 `RayConfig::runtime_env`，畸形 `runtime_env` JSON（或非对象的合法 JSON 值）返回 `Err`，不会终止进程。C ABI 的线程局部 `last_error()` 在 FFI 调用后检查，调用前 `clear_error()` 防止残留错误。失败的任务与 actor 从错误载荷中提取格式化异常文本（如 Python traceback），无法提取时按 UTF-8 lossy 呈现原始字节。C++ SDK 未翻译的错误类型以 `RayError::Unclassified` 返回：不带错误文本的对象（如已取消的任务）由消息说明该情况并点名 `TASK_CANCELLED`；携带错误帧的对象（如 `runtime_env` 安装失败）在解码之前就被识别，因此 `get`、`get_value`、`Vec<u8>` 以及批量与异步入口都返回 Ray 记录的错误文本，不把帧字节当成值解出来。判定要求载荷严格满足帧规则（总长为 `9 + N`、正文是 msgpack `bin`、protobuf 顶层字段号与 wire type 都在允许集合内、文本非空且是合法 UTF-8），正常值不会被改判；恰好满足这些规则的载荷会以 `RayError::Unclassified` 返回，该载荷因此不再参与解码。
 
 Rust vs Python 在 Ray 集群上（500 个任务）：
 

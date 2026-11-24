@@ -204,3 +204,154 @@ fn task_call_python_rejects_a_name_registered_as_a_rust_function() {
         Ok(_) => panic!("撞名的 Python 任务被提交了"),
     }
 }
+
+/// 直接读 C 入口的 namespace（本地模式下是 `ray_init` 在新运行时初始化成功之后记下的那份值）。
+/// 运行时还没有建立时 `ray_get_namespace` 交回空指针，这里返回 `None`。
+fn c_namespace() -> Option<String> {
+    let mut bytes = unsafe { rayrust::sys::ray_get_namespace() };
+    if bytes.data.is_null() {
+        return None;
+    }
+    let text = unsafe {
+        let slice = std::slice::from_raw_parts(bytes.data as *const u8, bytes.len);
+        std::str::from_utf8(slice)
+            .expect("C 入口交回的 namespace 不是合法 UTF-8")
+            .to_string()
+    };
+    unsafe { rayrust::sys::ray_free_bytes(&mut bytes) };
+    Some(text)
+}
+
+/// namespace 只在新运行时初始化成功之后写入，畸形 `runtime_env` 被拒绝之后正常
+/// `Ray::connect` 仍能初始化与关闭。断言按发生次序排列，每一步在写时机回退时都会失败：
+///
+/// 1. 进程里没有运行时，C 入口没有可读的 namespace；
+/// 2. `RayConfig::local().namespace("rejected_ns").runtime_env("[1,2,3]")` 返回 `Err`；
+/// 3. 失败之后仍是第 1 步的状态，被拒的调用没有留下 namespace；
+/// 4. `RayConfig::local().namespace("initial_ns")` 成功，两处读到的都是 `"initial_ns"`；
+/// 5. 绕过 Rust 层配置比较直接调 C 入口 `ray_init`，`ns="overwritten_ns"`：返回 0
+///    （已初始化是空操作），namespace 仍是 `"initial_ns"`；
+/// 6. 同一条 C 入口路径带畸形 `runtime_env`：返回 -1，namespace 仍是 `"initial_ns"`；
+/// 7. `put`/`get` 照常工作，`drop` 关闭；合法对象 `runtime_env` 仍能初始化与关闭。
+#[test]
+fn connect_succeeds_and_keeps_clean_namespace_after_rejected_runtime_env() {
+    let _lock = lock_ray();
+
+    // 1. 进程里还没有运行时。
+    assert!(
+        !unsafe { rayrust::sys::ray_is_initialized() },
+        "这个测试要求进程里没有 Ray runtime"
+    );
+    assert_eq!(c_namespace(), None, "没有运行时时 C 入口交回了 namespace");
+
+    // 2. 四种畸形输入都被拒：集群与本地模式各两种。
+    for config in [
+        RayConfig::new("127.0.0.1:1")
+            .namespace("rejected_ns")
+            .runtime_env("{"),
+        RayConfig::new("127.0.0.1:1")
+            .namespace("rejected_ns")
+            .runtime_env("[1,2,3]"),
+        RayConfig::local().namespace("rejected_ns").runtime_env("{"),
+        RayConfig::local()
+            .namespace("rejected_ns")
+            .runtime_env("[1,2,3]"),
+    ] {
+        match Ray::connect(&config) {
+            Err(RayError::Ffi(message)) => assert!(
+                message.starts_with("ray_init: runtime_env JSON is invalid: "),
+                "被拒绝的 runtime_env 消息前缀不符: {}",
+                message
+            ),
+            Err(other) => panic!("被拒绝的 runtime_env 返回了其他错误变体: {}", other),
+            Ok(_) => panic!("非法的 runtime_env 被接受了"),
+        }
+    }
+
+    // 3. 被拒的调用没有留下 namespace，也没有建出运行时。
+    assert_eq!(c_namespace(), None, "被拒绝的 init 留下了可读的 namespace");
+    assert!(
+        !unsafe { rayrust::sys::ray_is_initialized() },
+        "被拒绝的 init 建出了运行时"
+    );
+
+    // 4. 正常 init 写入传入的 namespace。
+    let ray = Ray::connect(&RayConfig::local().namespace("initial_ns"))
+        .expect("拒绝之后使用正常配置初始化本地运行时");
+    assert_eq!(
+        ray.namespace().expect("读取本地模式 namespace"),
+        "initial_ns",
+        "成功 init 之后 Rust 层读到的 namespace 不对"
+    );
+    assert_eq!(
+        c_namespace().as_deref(),
+        Some("initial_ns"),
+        "成功 init 之后 C 入口读到的 namespace 不对"
+    );
+
+    // 5. 已初始化时直接进 C 入口：`ray::Init` 是空操作，namespace 不该跟着换。
+    fn direct_init(namespace: &str, runtime_env: &str) -> i32 {
+        let ns_c = rayrust::sys::to_cstring(namespace);
+        let env_c = rayrust::sys::to_cstring(runtime_env);
+        let env_ptr = if runtime_env.is_empty() {
+            std::ptr::null()
+        } else {
+            env_c.as_ptr()
+        };
+        unsafe {
+            rayrust::sys::ray_init(
+                std::ptr::null(),
+                1,
+                std::ptr::null(),
+                std::ptr::null(),
+                env_ptr,
+                std::ptr::null(),
+                0,
+                ns_c.as_ptr(),
+            )
+        }
+    }
+
+    rayrust::sys::clear_error();
+    assert_eq!(
+        direct_init("overwritten_ns", ""),
+        0,
+        "已初始化时的 ray_init 返回了非零"
+    );
+    assert_eq!(
+        c_namespace().as_deref(),
+        Some("initial_ns"),
+        "已初始化时的 ray_init 改写了 namespace"
+    );
+
+    // 6. 同一条路径带畸形 runtime_env：被拒，namespace 同样不变。
+    rayrust::sys::clear_error();
+    assert_eq!(
+        direct_init("rejected_again", "{"),
+        -1,
+        "直接调 C 入口的畸形 runtime_env 没有被拒"
+    );
+    let message = rayrust::sys::last_error().expect("C 入口没有记录错误");
+    assert!(
+        message.starts_with("runtime_env JSON is invalid: "),
+        "直接调 C 入口的错误消息前缀不符: {}",
+        message
+    );
+    assert_eq!(
+        c_namespace().as_deref(),
+        Some("initial_ns"),
+        "带畸形 runtime_env 的直接调用改写了 namespace"
+    );
+
+    // 7. 运行时仍然可用：put/get 与正常关闭。
+    let obj = ray.put(&42i32).expect("put 42");
+    assert_eq!(obj.get_timeout(5000).expect("get 42"), 42);
+    drop(ray);
+
+    let with_valid_env =
+        RayConfig::local().runtime_env(r#"{"env_vars":{"RAYRUST_T41_LOCAL":"ok"}}"#);
+    let ray = Ray::connect(&with_valid_env).expect("携带合法对象 runtime_env 初始化本地运行时");
+    let obj = ray.put(&99i32).expect("put 99");
+    assert_eq!(obj.get_timeout(5000).expect("get 99"), 99);
+    drop(ray);
+}
