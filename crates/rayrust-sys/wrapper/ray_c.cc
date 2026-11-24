@@ -69,13 +69,17 @@ static_assert(alignof(RayIntentionalSystemExitException) == alignof(RayException
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <limits>
-#include <mutex>
-#include <string>
 #include <cstring>
+#include <functional>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
 #include <type_traits>
 
 static thread_local std::string g_last_error;
@@ -145,28 +149,52 @@ namespace ray { namespace internal {
     FunctionManager &GetFunctionManager();
 }}
 
-// Forward declarations for the private symbols ray_cancel calls. Neither type
-// is declared in the headers the wheel ships (ray/api/*.h), so the layout below
-// is copied by hand from the Ray 2.51.1 sources. The static_asserts compare it
-// against constants restated in this same file: they catch a mistyped constant,
-// not a layout change in the SDK. Only a version check at connect time (#12) or
-// a build against two adjacent releases (#14) can catch such a change.
-//   - ray::ObjectID is BaseID<ObjectID> under #pragma pack(1): a mutable
-//     size_t hash_ at offset 0, then uint8_t id_[kLength], with
-//     kLength = sizeof(uint32_t) + TaskID::kLength = 28 (src/ray/common/id.h).
-//     BaseID<T>::Data() is `this + sizeof(hash_)`, i.e. id_ at offset 8.
-//   - ray::Status is a single State* that is nullptr iff the status is ok
-//     (src/ray/common/status.h).
+// Forward declarations for the private symbols `ray_cancel` and `ray_put_xlang`
+// call. None of these types are declared in the headers the wheel ships
+// (`ray/api/*.h`), so their layouts are restated from the upstream Ray sources:
+//   - `ray::Buffer` (`src/ray/common/buffer.h:30-57`): pure virtual base with
+//     four const accessors and a virtual destructor.
+//   - `ray::ObjectID` (`src/ray/common/id.h`): `BaseID<ObjectID>` under
+//     `#pragma pack(1)` — a mutable `size_t hash_` at offset 0 followed by
+//     `uint8_t id_[28]`.
+//   - `ray::Status` (`src/ray/common/status.h`): a single `State *` that is
+//     `nullptr` iff the status is ok.
+//   - `ray::RayObject` (`src/ray/common/ray_object.h:28-177`, fields at
+//     `:163-176`): tail layout after `creation_time_nanos_` selected at build
+//     time by `crates/rayrust-sys/build.rs` from `libray_api.so` symbols
+//     (112 bytes with enum on Ray 2.49.0 / 2.51.1, 136 bytes with two
+//     `std::optional<std::string>` fields on Ray 2.55.0 / 2.60.0).
 namespace ray {
+    class Buffer {
+    public:
+        Buffer() = default;
+        virtual uint8_t *Data() const = 0;
+        virtual size_t Size() const = 0;
+        virtual bool OwnsData() const = 0;
+        virtual bool IsPlasmaBuffer() const = 0;
+        virtual ~Buffer() = default;
+        Buffer(const Buffer &) = delete;
+        Buffer &operator=(const Buffer &) = delete;
+    };
+
+    static_assert(sizeof(ray::Buffer) == sizeof(void *),
+                  "ray::Buffer stand-in does not match the SDK layout");
+
 #pragma pack(push, 1)
     class ObjectID {
     public:
         static constexpr size_t kLength = 28;
 
+        ObjectID() : hash_(0), id_{} {}
+
         // hash_ stays 0, which BaseID<T>::Hash() reads as "not computed yet".
         ObjectID(const char *data, size_t len) {
             hash_ = 0;
             std::memcpy(id_, data, len);
+        }
+
+        std::string Binary() const {
+            return std::string(reinterpret_cast<const char *>(id_), kLength);
         }
 
     private:
@@ -181,6 +209,7 @@ namespace ray {
     class Status {
     public:
         bool ok() const { return state_ == nullptr; }
+        std::string ToString() const;
         // Defined in libray_api.so (the SDK emits it as a weak symbol) and
         // deleted through `delete state_`.
         ~Status();
@@ -192,16 +221,57 @@ namespace ray {
 
     static_assert(sizeof(ray::Status) == sizeof(void *),
                   "ray::Status stand-in does not match the SDK layout");
+
+    struct OpaqueObjectReference {};
+
+    class RayObject {
+    public:
+        __attribute__((visibility("hidden")))
+        RayObject(std::shared_ptr<Buffer> data, std::shared_ptr<Buffer> metadata)
+            : data_(std::move(data)), metadata_(std::move(metadata)) {}
+
+        __attribute__((visibility("hidden")))
+        ~RayObject() = default;
+
+    private:
+        std::shared_ptr<Buffer> data_;
+        std::function<const std::shared_ptr<Buffer>()> data_factory_ = nullptr;
+        std::shared_ptr<Buffer> metadata_;
+        std::vector<OpaqueObjectReference> nested_refs_;
+        bool has_data_copy_ = false;
+        bool accessed_ = false;
+        int64_t creation_time_nanos_ = 0;
+#if defined(RAYRUST_RAY_OBJECT_LAYOUT_OPTIONAL_STR)
+        std::optional<std::string> tensor_transport_;
+        std::optional<std::string> direct_transport_metadata_;
+#elif defined(RAYRUST_RAY_OBJECT_LAYOUT_ENUM)
+        int32_t tensor_transport_ = 0;
+#else
+#error "ray::RayObject layout macro not defined by build.rs"
+#endif
+    };
+
+#if defined(RAYRUST_RAY_OBJECT_LAYOUT_OPTIONAL_STR)
+    static_assert(sizeof(ray::RayObject) == 136,
+                  "ray::RayObject stand-in size must be 136 bytes for optional<string> layout");
+#elif defined(RAYRUST_RAY_OBJECT_LAYOUT_ENUM)
+    static_assert(sizeof(ray::RayObject) == 112,
+                  "ray::RayObject stand-in size must be 112 bytes for enum layout");
+#endif
 }
 namespace ray::core {
     class CoreWorker {
     public:
+        ray::Status Put(const ray::RayObject &object,
+                        const std::vector<ray::ObjectID> &contained_object_ids,
+                        ray::ObjectID *object_id);
         ray::Status CancelTask(const ray::ObjectID &object_id,
                                bool force_kill,
                                bool recursive);
     };
     class CoreWorkerProcess {
     public:
+        static bool IsInitialized();
         static CoreWorker& GetCoreWorker();
     };
 }
@@ -222,6 +292,27 @@ namespace ray::internal {
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+namespace {
+
+/// 本编译单元自持字节的 `ray::Buffer` 实现，控制块与 `virtual` 析构函数均在此完成释放，
+/// 无需依赖上游未导出的 `aligned_malloc` / `aligned_free`。
+class OwnedRayBuffer final : public ray::Buffer {
+public:
+    OwnedRayBuffer(const uint8_t *src, size_t len) : bytes_(src, src + len) {}
+
+    uint8_t *Data() const override {
+        return const_cast<uint8_t *>(bytes_.data());
+    }
+    size_t Size() const override { return bytes_.size(); }
+    bool OwnsData() const override { return true; }
+    bool IsPlasmaBuffer() const override { return false; }
+
+private:
+    std::vector<uint8_t> bytes_;
+};
+
+}  // namespace
 
 // ─── Function Registration ────────────────────────────────────
 
@@ -1003,7 +1094,7 @@ bool ray_is_initialized(void) {
 /// （`_Exit(1)`，`src/ray/util/process.cc:845-848`）直接终止进程，Rust 侧没有捕获机会。
 ///
 /// 关闭标志 `runtime_closing()` 有两类读者：
-/// - 24 个取运行时的入口经 `runtime_for_call()` 读这个原子标志，命中时写入
+/// - 25 个取运行时的入口经 `runtime_for_call()` 读这个原子标志，命中时写入
 ///   `RAY_ERROR_KIND_RUNTIME` 并立即拒绝，不等待也不计入在途计数（`get`/`put`/`wait`
 ///   等阻塞调用不能让关闭等待，例如无期限的 `Get`）；
 /// - 两个引用计数入口在 `ref_count_gate_mutex()` 下读这个标志并计入 `ref_count_in_flight()`，
@@ -1256,6 +1347,89 @@ ray_bytes_t ray_put(const char *data, size_t len) {
 
         std::string id = runtime->Put(buffer);
         return dup_bytes(id);
+    } catch (const std::exception &e) {
+        set_last_error_exception(e);
+        return ray_bytes_t{nullptr, 0};
+    }
+}
+
+ray_bytes_t ray_put_xlang(const char *data, size_t len) {
+    ray_clear_error();
+    try {
+        // 参数校验排在取运行时与关闭闸门之前：无运行时也可直接验证，且关闭期间遇到
+        // 非法参数仍报参数错误，合法参数在关闭闸门报 RAY_ERROR_KIND_RUNTIME。
+        if (len == 0) {
+            set_last_error("the object store cannot store a zero-length value: Ray's "
+                           "LocalMemoryBuffer requires a non-null data pointer "
+                           "(src/ray/common/buffer.h:77), and every serialized value is "
+                           "at least one byte");
+            return ray_bytes_t{nullptr, 0};
+        }
+        if (!data) {
+            set_last_error("data pointer is null");
+            return ray_bytes_t{nullptr, 0};
+        }
+        if (len <= ray::internal::XLANG_HEADER_LEN) {
+            set_last_error("XLANG payload must be larger than the 9-byte header");
+            return ray_bytes_t{nullptr, 0};
+        }
+        bool valid_header = false;
+        uint64_t declared_len = 0;
+        try {
+            msgpack::unpacked unpacked =
+                msgpack::unpack(data, ray::internal::XLANG_HEADER_LEN);
+            if (unpacked.get().type == msgpack::type::POSITIVE_INTEGER) {
+                declared_len = unpacked.get().as<uint64_t>();
+                valid_header = true;
+            }
+        } catch (const std::exception &) {
+            valid_header = false;
+        }
+        const uint64_t body_len =
+            static_cast<uint64_t>(len - ray::internal::XLANG_HEADER_LEN);
+        if (!valid_header) {
+            set_last_error(
+                "ray_put_xlang requires a payload starting with a 9-byte XLANG header "
+                "whose first msgpack value is a non-negative integer body length");
+            return ray_bytes_t{nullptr, 0};
+        }
+        if (declared_len != body_len) {
+            std::string msg =
+                "ray_put_xlang requires the 9-byte XLANG header to declare a body "
+                "length equal to len - 9 (" +
+                std::to_string(body_len) + " bytes), got " +
+                std::to_string(declared_len) + " bytes";
+            set_last_error(msg.c_str());
+            return ray_bytes_t{nullptr, 0};
+        }
+
+        auto runtime = runtime_for_call();
+        if (!runtime) return ray_bytes_t{nullptr, 0};
+
+        // 本地模式不启动 CoreWorkerProcess 与 Python 执行器，LocalModeObjectStore::PutRaw
+        // （cpp/src/ray/runtime/object/local_mode_object_store.cc:34-38、:40-46）只能写入
+        // 空 metadata，直接返回错误。
+        if (runtime->IsLocalMode() || !ray::core::CoreWorkerProcess::IsInitialized()) {
+            set_last_error(
+                "put_xlang is not supported in local mode: local mode starts no "
+                "CoreWorkerProcess or Python executor and LocalModeObjectStore "
+                "cannot attach XLANG metadata");
+            return ray_bytes_t{nullptr, 0};
+        }
+
+        auto data_buf = std::make_shared<OwnedRayBuffer>(
+            reinterpret_cast<const uint8_t *>(data), len);
+        auto meta_buf = std::make_shared<OwnedRayBuffer>(
+            reinterpret_cast<const uint8_t *>(ray::internal::METADATA_STR_XLANG.data()),
+            ray::internal::METADATA_STR_XLANG.size());
+        ray::RayObject object(std::move(data_buf), std::move(meta_buf));
+        ray::ObjectID object_id;
+        ray::Status status =
+            ray::core::CoreWorkerProcess::GetCoreWorker().Put(object, {}, &object_id);
+        if (!status.ok()) {
+            throw ray::internal::RayException("Put object error: " + status.ToString());
+        }
+        return dup_bytes(object_id.Binary());
     } catch (const std::exception &e) {
         set_last_error_exception(e);
         return ray_bytes_t{nullptr, 0};

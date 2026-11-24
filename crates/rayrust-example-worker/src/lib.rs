@@ -147,6 +147,33 @@ pub fn put_in_worker(value: i64) -> Result<(Vec<u8>, i64), String> {
     Ok((id, read_back))
 }
 
+/// 在工人进程里调用 `ray_put_xlang` 写入带 9 字节 XLANG 头与 `"XLANG"` metadata 的对象，
+/// 再用 `ray_get` 与 `deserialize_xlang::<i64>` 读回该值。
+#[remote]
+pub fn put_xlang_in_worker(value: i64) -> Result<(Vec<u8>, i64), String> {
+    let data = rayrust::serialize_xlang(&value).map_err(|e| format!("{:?}", e))?;
+    rayrust::sys::clear_error();
+    let raw = unsafe {
+        rayrust::sys::ray_put_xlang(data.as_ptr() as *const std::os::raw::c_char, data.len())
+    };
+    let id_guard = rayrust::sys::CBytesGuard::from(raw).ok_or_else(|| {
+        let msg = rayrust::sys::last_error().unwrap_or_else(|| "unknown FFI error".to_string());
+        format!("ray_put_xlang: {}", msg)
+    })?;
+    let id = id_guard.as_slice().to_vec();
+    rayrust::sys::clear_error();
+    let got = unsafe {
+        rayrust::sys::ray_get(id.as_ptr() as *const std::os::raw::c_char, id.len(), 10_000)
+    };
+    let val_guard = rayrust::sys::CBytesGuard::from(got).ok_or_else(|| {
+        let msg = rayrust::sys::last_error().unwrap_or_else(|| "unknown FFI error".to_string());
+        format!("ray_get: {}", msg)
+    })?;
+    let read_back =
+        rayrust::deserialize_xlang::<i64>(val_guard.as_slice()).map_err(|e| format!("{:?}", e))?;
+    Ok((id, read_back))
+}
+
 /// 在工人进程里调用 `ray_task_call_with_options` 提交已注册的 `multiply(value, 7)`，
 /// 并用返回的 28 字节 object id 读出乘积。
 #[remote]

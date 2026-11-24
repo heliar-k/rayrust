@@ -17,11 +17,15 @@
 //! `&ObjectRef<T>` 按借用传：`Clone` 加一个本地引用，随保活集合一起释放，调用方
 //! 原句柄的计数不受影响。
 //!
-//! 两种形状过同一道守卫：id 必须是 28 字节，而且必须是本进程当前持有的引用
-//! （`ObjectRef::counts_reference`）。第二个条件拦住「保存 id 字节再重建」「自己
-//! 拼的 28 字节」「工人交回的 id」这几类句柄：集群模式下把这样的 id 当引用参数交给
-//! Ray，`TransformArgs` 的 `GetOwnerAddressOrDie` 会用 `RAY_LOG(FATAL)` 终止进程
-//! （无 owner 的 id），本地模式下同一个 id 则永久等待。
+//! 两种形状过同一道守卫：id 必须是 28 字节，必须是本进程当前持有的引用
+//! （`ObjectRef::counts_reference`），且必须是非跨语言载荷（`!obj.is_xlang()`）。
+//! 第二个条件拦住「保存 id 字节再重建」「自己拼的 28 字节」「工人交回的 id」这几类
+//! 句柄：集群模式下把这样的 id 当引用参数交给 Ray，`TransformArgs` 的
+//! `GetOwnerAddressOrDie` 会用 `RAY_LOG(FATAL)` 终止进程（无 owner 的 id），本地模式
+//! 下同一个 id 则永久等待。第三个条件拒绝跨语言对象引用并返回
+//! [`RayError::Serialization`]：C++ 工人的 `TaskExecutor::ExecuteTask`
+//! （`cpp/src/ray/runtime/task/task_executor.cc:120-291`，`:151` 与 `:174-186`）对
+//! C++ 调用方不会剥离前 9 字节 XLANG 头，放行会让工人把头部长度整数当成参数值。
 //!
 //! ## 不支持的形状
 //!
@@ -172,14 +176,19 @@ impl TaskArgs {
 
 /// 参数位置上的类型：要么是一个值，要么是一个引用（按值或借用）。
 ///
-/// 值参数要求 `Serialize`；引用参数要求 `ObjectRef<T>` 或 `&ObjectRef<T>`。两条
+/// 值参数要求 `Serialize`；引用参数要求 `ObjectRef<T>` 或 `&ObjectRef<T>`。三条
 /// 限制：
 ///
 /// 1. 引用必须是本进程当前持有的引用（`put`、任务调用、actor 调用返回的句柄）。
 ///    从 id 字节重建的、自己拼的、别的进程交回的 28 字节 id 都会被拒成
 ///    `RayError::Runtime`：这样的 id 交给 Ray 会在 `TransformArgs` 的
 ///    `GetOwnerAddressOrDie` 里终止进程，本地模式下则永久等待。
-/// 2. Rust 任务不能把可用的引用交回来：任务返回的 id 没有嵌套引用，驱动侧也没有
+/// 2. 引用必须是非跨语言对象（`!obj.is_xlang()`）。`put_xlang`、`task_call_python*`
+///    与 `actor_call_python` 返回的句柄带 9 字节 XLANG 头，而 C++ 工人执行 Rust 任务
+///    与 actor 方法时不会剥离该头部（`cpp/src/ray/runtime/task/task_executor.cc:120-291`，
+///    `:151` 与 `:174-186`），所以这类句柄在这里被拒成 `RayError::Serialization`；向
+///    Python 传递引用请取 `.id()` 传给 `task_call_python` / `actor_call_python`。
+/// 3. Rust 任务不能把可用的引用交回来：任务返回的 id 没有嵌套引用，驱动侧也没有
 ///    这个 id 的 owner 路径，`get_timeout` 得到 `ObjectUnknownOwner`，对象活着
 ///    也一样。详见 [`crate::ObjectRef`] 模块文档的「作为参数」。
 ///
@@ -205,6 +214,8 @@ impl<T> TaskArg<T> for ObjectRef<T> {
     fn push_arg(self, args: &mut TaskArgs) {
         if let Some(error) = reference_arg_error(&self) {
             args.record(error);
+            // 句柄连同它的本地引用移入 held，随 into_parts 一并释放。
+            args.held.push(self.cast());
             return;
         }
         args.data.push(self.id().to_vec());
@@ -227,7 +238,7 @@ impl<'a, T> TaskArg<T> for &'a ObjectRef<T> {
     }
 }
 
-/// 一个引用参数要先过的两道关：id 长度、本进程是否持有它。
+/// 一个引用参数要先过的三道关：id 长度、本进程是否持有它、是否为非跨语言载荷。
 fn reference_arg_error<T>(obj: &ObjectRef<T>) -> Option<RayError> {
     if obj.id().len() != OBJECT_ID_LEN {
         // 长度不对的 id 交给 C++ 侧会被 `ObjectID::FromBinary` 的 `RAY_CHECK`
@@ -241,6 +252,12 @@ fn reference_arg_error<T>(obj: &ObjectRef<T>) -> Option<RayError> {
     if !obj.counts_reference() {
         return Some(RayError::Runtime(format!(
             "object id {} is not a reference this process holds; pass a handle returned by put or by a task/actor call",
+            obj.id_hex()
+        )));
+    }
+    if obj.is_xlang() {
+        return Some(RayError::Serialization(format!(
+            "object id {} carries a cross-language payload (XLANG header) and cannot be passed by reference to a Rust task or actor method: TaskExecutor::ExecuteTask does not strip the 9-byte XLANG header for C++ callers; pass a handle from Ray::put or pass this id to Python via task_call_python / actor_call_python",
             obj.id_hex()
         )));
     }
@@ -354,6 +371,49 @@ mod tests {
                 }
                 Err(other) => panic!("{} 返回了别的错误变体: {}", label, other),
                 Ok(_) => panic!("{}：来路不明的 28 字节 id 被当成了引用参数", label),
+            }
+        }
+    }
+
+    #[test]
+    fn an_xlang_reference_is_rejected_by_value_and_by_borrow() {
+        let _guard = epoch_guard();
+        let epoch = crate::object_ref::publish_live_epoch();
+        let id = vec![9u8; OBJECT_ID_LEN];
+        let obj: ObjectRef<i32> = ObjectRef::from_call_xlang(id);
+        let expected_hex = obj.id_hex();
+
+        let mut by_ref = TaskArgs::new();
+        TaskArg::<i32>::push_arg(&obj, &mut by_ref);
+        let mut by_value = TaskArgs::new();
+        TaskArg::<i32>::push_arg(obj, &mut by_value);
+
+        crate::object_ref::retract_live_epoch();
+        assert!(epoch != 0, "代次表没有发布成功");
+        assert!(by_ref.is_empty(), "被拒的借用跨语言引用不该写入参数缓冲区");
+        assert!(
+            by_value.is_empty(),
+            "被拒的按值跨语言引用不该写入参数缓冲区"
+        );
+
+        for (label, args) in [("借用", by_ref), ("按值", by_value)] {
+            match args.into_parts() {
+                Err(RayError::Serialization(msg)) => {
+                    assert!(
+                        msg.contains(&expected_hex),
+                        "{} 的错误消息未包含对象 id: {}",
+                        label,
+                        msg
+                    );
+                    assert!(
+                        msg.contains("carries a cross-language payload (XLANG header)"),
+                        "{} 的错误消息未说明跨语言载荷原因: {}",
+                        label,
+                        msg
+                    );
+                }
+                Err(other) => panic!("{} 返回了别的错误变体: {}", label, other),
+                Ok(_) => panic!("{}：跨语言 ObjectRef 被放行给 Rust 任务", label),
             }
         }
     }

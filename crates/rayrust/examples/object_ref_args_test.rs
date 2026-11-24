@@ -15,14 +15,16 @@
 //! 3. 扇出：两个任务消费同一个引用，两个结果都对
 //! 4. 异步调用带引用参数；再补一条「future 先建、引用先 drop、等一会儿再轮询」
 //! 5. actor 方法带引用参数，同步与异步各一次；异步同样补「先建 future、先 drop」
-//! 6. （集群）Python 任务与 Python actor 的引用参数：驱动 put 的对象会被 Python 拒绝
-//!    （原因只能从 worker 的 `.err` 读到），Python 自己产生的对象可以按引用传；
+//! 6. （集群）Python 任务与 Python actor 的引用参数：驱动 `put_xlang` 写入的对象携带
+//!    `XLANG` metadata，与 Python 自己产生的对象均可按引用传给 Python 任务与 actor；
+//!    驱动 `put` 写入的对象无 metadata，按引用传给 Python 时返回 `RayError::Task`；
 //!    Python actor 的 handle 也要能 `serialize` → `from_serialized` → 调用
 //! 7. 提交之后立刻 drop 参数引用，任务仍读到值
 //! 8. （集群）任务返回的 id 不可读：驱动自己持有引用时交回的 id 能读；actor 里
 //!    put 并保活的对象，驱动按同一个 id 读也读不到（对象活着也一样）
-//! 9. 来路不明的 id 当引用参数：保存字节重建的、自己拼的 28 字节、27 字节都返回
-//!    `Err`，进程不崩也不阻塞；裸通道的 `is_ref` 长度对不上时拒绝
+//! 9. 非法或类型不匹配的引用参数：保存字节重建的、自己拼的 28 字节、27 字节都返回
+//!    `Err`，进程继续运行且不阻塞；裸通道的 `is_ref` 长度对不上时拒绝；集群模式下
+//!    把 `put_xlang` 句柄传给 Rust 宏调用器在提交前返回 `Err(RayError::Serialization)`
 //! 10. 异步入口的错误路径：27 字节 id 的 future 返回 `Err(RayError::Ffi)`
 //! 11. id 宽度：3 字节与 0 字节的 id 在进 Ray 之前被拒，进程不终止。单个读取、
 //!    `get_many_timeout`、`wait`、任务的引用参数（含 0 字节那个修复前永久挂起的
@@ -263,32 +265,76 @@ async fn actor_with_ref(ray: &Ray, cluster: bool) {
 
 /// 6. Python 任务与 Python actor 的引用参数。
 ///
-/// 驱动 `put` 的对象没有 metadata（`NativeObjectStore::PutRaw` 给 `CoreWorker::Put`
-/// 传的是空 metadata，`object/native_object_store.cc:36-38`），Python 的反序列化
-/// 拒收「有数据、没有 metadata」的参数（`_private/serialization.py:537-538`）。
-/// 这条原因在调用方看不到，只能从 worker 的 `.err` 读到，所以下面只断言「Python
-/// 任务/actor 失败了」，不声称原因。Python 自己产生的对象带 PYTHON metadata，
-/// 同一套引用参数就能通过。
+/// 驱动 `put_xlang` 经 `CoreWorker::Put` 写入 9 字节 XLANG 头与 `"XLANG"` metadata，
+/// Python 任务与 Python actor 可直接按引用读取；驱动 `put` 经 `NativeObjectStore::PutRaw`
+/// （`cpp/src/ray/runtime/object/native_object_store.cc:31-44`）写入空 metadata，Python
+/// 在 `SerializationContext._deserialize_object`（`ray/_private/serialization.py:393-544`，
+/// `:537-538`）拒收有数据而无 metadata 的参数并报 `RayError::Task`。
 async fn python_with_ref(ray: &Ray) {
     println!("\n--- 6. Python 任务与 Python actor 的引用参数 ---");
     let two = serialize(&2i32).expect("serialize(2)");
 
-    // 6a. 驱动 put 出来的对象当引用参数：Python 任务失败。
+    // 6a. 驱动 put_xlang 写入的对象当引用参数：携带 XLANG metadata，Python 任务正常解码。
     let driver_put = ray.put_xlang(&40i32).expect("put_xlang(40)");
+    assert!(driver_put.is_xlang(), "put_xlang 应返回 is_xlang() == true");
+    let sum_6a: i32 = ray
+        .task_call_python(
+            PYTHON_MODULE,
+            "add",
+            &[driver_put.id(), &two],
+            &[true, false],
+        )
+        .expect("submit Python add(&put_xlang(40), 2)")
+        .cast::<i32>()
+        .get_timeout(PROBE_TIMEOUT_MS)
+        .expect("read Python add(&put_xlang(40), 2)");
+    assert_eq!(
+        sum_6a, 42,
+        "Python add(&put_xlang(40), 2) 返回了 {}",
+        sum_6a
+    );
+    println!(
+        "  驱动 put_xlang 的对象当引用参数：add(&put_xlang(40), 2) → {}",
+        sum_6a
+    );
+
+    let nums = ray.put_xlang(&vec![10i64, 20, 12]).expect("put_xlang(vec)");
+    let list_sum: i64 = ray
+        .task_call_python(PYTHON_MODULE, "sum_list", &[nums.id()], &[true])
+        .expect("submit Python sum_list(&put_xlang([10, 20, 12]))")
+        .cast::<i64>()
+        .get_timeout(PROBE_TIMEOUT_MS)
+        .expect("read Python sum_list(&put_xlang([10, 20, 12]))");
+    assert_eq!(
+        list_sum, 42,
+        "Python sum_list(&put_xlang([10, 20, 12])) 返回了 {}",
+        list_sum
+    );
+    println!(
+        "  驱动 put_xlang 的列表当引用参数：sum_list(&put_xlang([10, 20, 12])) → {}",
+        list_sum
+    );
+
+    // 6a'. API 区分对照：驱动 put（无 metadata）按引用传给 Python add，Python 侧拒收。
+    let rust_only = ray.put(&40i32).expect("put(40)");
+    assert!(!rust_only.is_xlang(), "put 应返回 is_xlang() == false");
     match ray.task_call_python(
         PYTHON_MODULE,
         "add",
-        &[driver_put.id(), &two],
+        &[rust_only.id(), &two],
         &[true, false],
     ) {
         Ok(obj) => match obj.cast::<i32>().get_timeout(PROBE_TIMEOUT_MS) {
             Err(RayError::Task(msg)) => {
                 println!(
-                    "  驱动 put 的对象当引用参数 → Python 任务失败 Task({})",
+                    "  驱动 put（无 metadata）当引用参数 → Python 任务失败 Task({})",
                     msg
                 )
             }
-            Ok(value) => panic!("驱动 put 的对象当引用参数，Python 任务却成功了：{}", value),
+            Ok(value) => panic!(
+                "驱动 put（无 metadata）当引用参数，Python 任务却成功了：{}",
+                value
+            ),
             Err(other) => panic!("返回了别的错误变体: {}", other),
         },
         Err(other) => panic!("Python 任务提交就失败了: {}", other),
@@ -315,16 +361,34 @@ async fn python_with_ref(ray: &Ray) {
         .actor_create_python(PYTHON_MODULE, "Counter", &[&start], &ActorOptions::new())
         .expect("create the Python Counter actor");
 
-    // 6c. actor 方法拿驱动 put 的引用：与 6a 一样，Python 侧失败。
+    // 6c. actor 方法拿驱动 put_xlang 的引用：成功返回 5。
     let driver_put_five = ray.put_xlang(&5i64).expect("put_xlang(5)");
-    match ray.actor_call_python(handle.id(), "increment", &[driver_put_five.id()], &[true]) {
+    let val_6c: i64 = ray
+        .actor_call_python(handle.id(), "increment", &[driver_put_five.id()], &[true])
+        .expect("call Python Counter.increment(&put_xlang(5))")
+        .cast::<i64>()
+        .get_timeout(PROBE_TIMEOUT_MS)
+        .expect("read Python Counter.increment(&put_xlang(5))");
+    assert_eq!(
+        val_6c, 5,
+        "Python Counter.increment(&put_xlang(5)) 返回了 {}",
+        val_6c
+    );
+    println!(
+        "  驱动 put_xlang 的对象当 actor 参数：Counter.increment(&put_xlang(5)) → {}",
+        val_6c
+    );
+
+    // 6c'. API 区分对照：驱动 put（无 metadata）按引用传给同一个 Python actor，Python 侧拒收。
+    let rust_only_five = ray.put(&5i64).expect("put(5)");
+    match ray.actor_call_python(handle.id(), "increment", &[rust_only_five.id()], &[true]) {
         Ok(obj) => match obj.cast::<i64>().get_timeout(PROBE_TIMEOUT_MS) {
             Err(RayError::Task(msg)) => println!(
-                "  驱动 put 的对象当 actor 参数 → Python actor 失败 Task({})",
+                "  驱动 put（无 metadata）当 actor 参数 → Python actor 失败 Task({})",
                 msg
             ),
             Ok(value) => panic!(
-                "驱动 put 的对象当 actor 参数，Python actor 却成功了：{}",
+                "驱动 put（无 metadata）当 actor 参数，Python actor 却成功了：{}",
                 value
             ),
             Err(other) => panic!("返回了别的错误变体: {}", other),
@@ -332,7 +396,7 @@ async fn python_with_ref(ray: &Ray) {
         Err(other) => panic!("Python actor 调用提交就失败了: {}", other),
     }
 
-    // 6d. actor 方法拿 Python 产生的引用：正常。
+    // 6d. actor 方法拿 Python 产生的引用：在 6c 的 5 基础上累加得到 10。
     let two = serialize(&2i64).expect("serialize(2)");
     let three = serialize(&3i64).expect("serialize(3)");
     let five: ObjectRef<i64> = ray
@@ -346,7 +410,7 @@ async fn python_with_ref(ray: &Ray) {
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("read the Python actor result");
     assert_eq!(
-        value, 5,
+        value, 10,
         "Python Counter.increment(&ref(5)) 返回了 {}",
         value
     );
@@ -488,8 +552,8 @@ async fn returned_ref_is_unusable(ray: &Ray) {
     }
 }
 
-/// 9. 来路不明的 28 字节 id 与 27 字节 id：都在 Rust 侧被拒，进程继续运行。
-async fn unknown_ids_are_rejected(ray: &Ray) {
+/// 9. 来路不明的 28 字节 id、27 字节 id 与跨语言 `ObjectRef`：都在 Rust 侧被拒，进程继续运行。
+async fn unknown_ids_are_rejected(ray: &Ray, cluster: bool) {
     println!("\n--- 9. 来路不明的 id 当引用参数 ---");
 
     // 9a. `put` 之后保存 id 字节、drop 句柄、再按字节重建：本进程不再持有这个引用。
@@ -554,6 +618,30 @@ async fn unknown_ids_are_rejected(ray: &Ray) {
         }
         Ok(_) => panic!("is_ref 长度对不上却提交了"),
         Err(other) => panic!("is_ref 长度对不上返回了别的错误变体: {}", other),
+    }
+    // 9f. 集群模式下 put_xlang 句柄交给 Rust 宏调用器：提交前立即返回 RayError::Serialization。
+    if cluster {
+        let driver_put = ray.put_xlang(&40i32).expect("put_xlang(40)");
+        match add_remote(ray, &driver_put, 2) {
+            Err(RayError::Serialization(msg)) => {
+                println!("  add(&put_xlang(40), 2) → Serialization({})", msg);
+            }
+            Ok(obj) => panic!(
+                "put_xlang 句柄被当成 Rust 任务引用参数提交了: {:?}",
+                obj.get_timeout(PROBE_TIMEOUT_MS)
+            ),
+            Err(other) => panic!("put_xlang 借用句柄返回了别的错误变体: {}", other),
+        }
+        match add_remote(ray, driver_put, 2) {
+            Err(RayError::Serialization(_)) => {
+                println!("  add(put_xlang(40), 2)（按值）→ Serialization");
+            }
+            Ok(obj) => panic!(
+                "按值传的 put_xlang 句柄被当成 Rust 任务引用参数提交了: {:?}",
+                obj.get_timeout(PROBE_TIMEOUT_MS)
+            ),
+            Err(other) => panic!("put_xlang 按值句柄返回了别的错误变体: {}", other),
+        }
     }
     println!("  进程继续运行：没有 GetOwnerAddressOrDie 的终止，也没有本地模式的永久等待");
 }
@@ -773,7 +861,7 @@ async fn main() {
         println!("  这一项要 worker .so 里的 return_id_bytes 与 Python actor，本地模式两样都没有");
     }
 
-    unknown_ids_are_rejected(&ray).await;
+    unknown_ids_are_rejected(&ray, cluster).await;
     async_error_path(&ray).await;
     id_width_rejections(&ray, cluster).await;
 

@@ -29,7 +29,7 @@ Ray 的 Rust SDK —— 通过 FFI 封装 Ray C++ SDK，提供地道的 Rust API
 | `kill_actor`（本地模式返回错误，actor 随进程结束，见 #53） | ❌ | ✅ |
 | XLANG header 自动检测（兼容 Ray 2.51.1+） | ✅ | ✅ |
 | `rmpv::Value` 动态反序列化 | ✅ | ✅ |
-| `put_xlang`（把 xlang 头写进存入的数据；Python 侧仍因缺 metadata 拒收，见 #21） | ✅ | ✅ |
+| `put_xlang`（集群模式经 `CoreWorker::Put` 写入 9 字节 XLANG 头与 `XLANG` metadata；本地模式无 `CoreWorker` 与 Python 执行器，返回错误，见 #21） | ❌ | ✅ |
 | `ray_last_error_bytes()`（带长度的线程局部错误字节；Rust 提取格式化异常文本，失败时按 UTF-8 lossy 回退） | ✅ | ✅ |
 
 ## 快速开始
@@ -115,7 +115,7 @@ let v: i32 = sum.get_async().await?;                 // 42
 
 宏生成的调用器都返回 `Result`：参数序列化错误与提交错误都回到调用方，不变成 panic。actor 方法的引用参数写法相同（`counter_increment(&ray, &handle, &a)`）。
 
-这条能力有两条限制。驱动自己 put 出来的引用只能交给 Rust 任务与 actor：Python 拒绝没有 metadata 的对象，而 C++ SDK 的 `put` 不写 metadata。Rust 任务也不能把可用的引用交回来：它交回的 id 不附带嵌套引用，驱动侧也没有这个 id 的 owner 路径，所以读这个 id 得到 `ObjectUnknownOwner`，对象活着也一样。两条限制都写在 `rayrust::TaskArg` 的文档里。
+这条能力有两条限制。Rust 任务与 actor 只接收 `Ray::put` 等非跨语言引用（C++ 工人不剥离 9 字节 XLANG 头，`TaskArg` 会将 `Ray::put_xlang` 句柄拒绝为 `RayError::Serialization`）；集群模式下向 Python 任务或 actor 按引用传参须使用 `Ray::put_xlang` 写入 `XLANG` metadata（`Ray::put` 不写 metadata，Python 侧会拒绝）。Rust 任务也不能把可用的引用交回来：它交回的 id 不附带嵌套引用，驱动侧也没有这个 id 的 owner 路径，所以读这个 id 得到 `ObjectUnknownOwner`，对象活着也一样。详见 `rayrust::TaskArg` 的文档。
 
 ### Actor（`#[actor]` 宏）
 

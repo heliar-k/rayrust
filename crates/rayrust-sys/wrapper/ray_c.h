@@ -214,8 +214,8 @@ void ray_shutdown(void);
 /// 或 `CoreWorkerProcess::EnsureInitialized`（同文件 `:842-856`）里调用 `QuickExit()`
 /// （`_Exit(1)`，`src/ray/util/process.cc:845-848`）终止进程，`RAY_CATCH` 无法捕获。
 ///
-/// - 关闭期间被拒绝的入口（共 24 个）：`ray_put`、`ray_get`、`ray_wait`、
-///   `ray_get_many`、`ray_task_call_with_options`、`ray_task_call_python`、
+/// - 关闭期间被拒绝的入口（共 25 个）：`ray_put`、`ray_put_xlang`、`ray_get`、
+///   `ray_wait`、`ray_get_many`、`ray_task_call_with_options`、`ray_task_call_python`、
 ///   `ray_task_call_python_with_options`、`ray_actor_create_with_options`、
 ///   `ray_actor_create_python_with_options`、`ray_actor_call`、
 ///   `ray_actor_call_python`、`ray_actor_kill`、`ray_actor_handle_serialize`、
@@ -271,6 +271,31 @@ void ray_shutdown(void);
 /// 关闭期间同样拒绝（data=NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 /// Caller must free with ray_free_bytes.
 ray_bytes_t ray_put(const char *data, size_t len);
+
+/// Put a cross-language serialized object into the object store with `"XLANG"`
+/// metadata (`ray::internal::METADATA_STR_XLANG`).
+/// - `data` must hold a cross-language payload prefixed with the 9-byte XLANG
+///   header: `len > 9`, `data != NULL`, and the first msgpack value in the
+///   9-byte header must be a non-negative integer equal to `len - 9`. Any other
+///   input (zero length, null pointer, `len <= 9`, a payload without an XLANG
+///   header, or a header whose declared length differs from `len - 9`) returns
+///   `{NULL, 0}` with `RAY_ERROR_KIND_GENERIC` before the runtime is looked up.
+/// - Once `ray_shutdown` has started or finished, the closing gate refuses the
+///   call and returns `{NULL, 0}` with `RAY_ERROR_KIND_RUNTIME`.
+/// - Local mode starts no `CoreWorkerProcess` or Python executor, and
+///   `LocalModeObjectStore::PutRaw`
+///   (`cpp/src/ray/runtime/object/local_mode_object_store.cc:34-38`, `:40-46`)
+///   can only store empty metadata. When `runtime->IsLocalMode()` is true or
+///   `CoreWorkerProcess::IsInitialized()`
+///   (`src/ray/core_worker/core_worker_process.cc:110`) is false, this entry
+///   returns `{NULL, 0}` with `RAY_ERROR_KIND_GENERIC` without writing an
+///   object lacking metadata.
+/// - In cluster mode this entry writes `data` together with `"XLANG"` metadata
+///   through `CoreWorker::Put` (`src/ray/core_worker/core_worker.cc:956-975`),
+///   returning a `malloc`-allocated 28-byte binary `ObjectID` (freed via
+///   `ray_free_bytes`) whose initial local reference count is 1
+///   (`core_worker.cc:962-969`).
+ray_bytes_t ray_put_xlang(const char *data, size_t len);
 
 /// Get a single object from the object store.
 /// `id_data`/`id_len` is the binary object ID and must be exactly 28 bytes (the
@@ -419,8 +444,9 @@ ray_bytes_t ray_task_call_with_options(const char *func_name,
 ///   rejection as ray_task_call_with_options.
 ///   Such an id must be a reference the calling process holds and whose owner
 ///   Ray knows: a 28-byte id of unknown origin makes `TransformArgs` call
-///   `GetOwnerAddressOrDie`, which terminates the process. It must also come
-///   from a Python worker; objects put through this SDK carry no metadata and
+///   `GetOwnerAddressOrDie`, which terminates the process. It must also carry
+///   cross-language or Python metadata (written by `ray_put_xlang` or produced
+///   by a Python worker); objects written by `ray_put` carry no metadata and
 ///   Python rejects them as an argument.
 /// Local mode returns an error instead of submitting when a `#[rayrust::remote]`
 /// function is registered under `function_name`: `LocalModeTaskSubmitter::Submit`
@@ -505,7 +531,8 @@ ray_bytes_t ray_task_call_python(const char *module_name,
 /// looked up and before any task is submitted), and `function_name` is not checked
 /// (an empty one resolves to the module object, which can be callable). A
 /// reference argument must be a 28-byte id this process holds, whose owner Ray
-/// knows, and it must come from a Python worker.
+/// knows, and it must carry cross-language or Python metadata (written by
+/// `ray_put_xlang` or produced by a Python worker).
 /// Local mode returns an error instead of submitting when a `#[rayrust::remote]`
 /// function is registered under `function_name`, for the reason
 /// `ray_task_call_python` documents.
@@ -741,8 +768,9 @@ ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
 ///   rejection as ray_task_call_with_options.
 ///   It must also be a reference the calling process holds and whose owner
 ///   Ray knows: a 28-byte id of unknown origin makes `TransformArgs` call
-///   `GetOwnerAddressOrDie`, which terminates the process. It must also come
-///   from a Python worker; objects put through this SDK carry no metadata and
+///   `GetOwnerAddressOrDie`, which terminates the process. It must also carry
+///   cross-language or Python metadata (written by `ray_put_xlang` or produced
+///   by a Python worker); objects written by `ray_put` carry no metadata and
 ///   Python rejects them as an argument.
 /// Local mode returns an error without reaching the core worker:
 /// `AbstractRayRuntime::CallActor` reads the actor's module and class from the

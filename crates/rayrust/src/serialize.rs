@@ -77,22 +77,22 @@ pub fn deserialize<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T, Ray
 /// Format: [msgpack_int(data_len)] [zero_padding to 9 bytes]
 fn build_xlang_header(data_len: usize) -> [u8; XLANG_HEADER_LEN] {
     let mut header = [0u8; XLANG_HEADER_LEN];
-    let mut buf = Vec::new();
-    // Encode data_len as a msgpack integer.
-    if data_len <= 0x7f {
-        buf.push(data_len as u8); // positive fixint
-    } else if data_len <= 0xff {
-        buf.push(0xcc); // uint8
-        buf.push(data_len as u8);
-    } else if data_len <= 0xffff {
-        buf.push(0xcd); // uint16
-        buf.extend_from_slice(&(data_len as u16).to_be_bytes());
+    let len = data_len as u64;
+    if len <= 0x7f {
+        header[0] = len as u8; // positive fixint
+    } else if len <= 0xff {
+        header[0] = 0xcc; // uint8
+        header[1] = len as u8;
+    } else if len <= 0xffff {
+        header[0] = 0xcd; // uint16
+        header[1..3].copy_from_slice(&(len as u16).to_be_bytes());
+    } else if len <= 0xffff_ffff {
+        header[0] = 0xce; // uint32
+        header[1..5].copy_from_slice(&(len as u32).to_be_bytes());
     } else {
-        buf.push(0xce); // uint32
-        buf.extend_from_slice(&(data_len as u32).to_be_bytes());
+        header[0] = 0xcf; // uint64
+        header[1..9].copy_from_slice(&len.to_be_bytes());
     }
-    let n = buf.len().min(XLANG_HEADER_LEN);
-    header[..n].copy_from_slice(&buf[..n]);
     header
 }
 
@@ -276,9 +276,26 @@ mod tests {
 
     #[test]
     fn test_xlang_declared_len_all_encodings() {
-        // 与 Python 的 msgpack.dumps(len) 一样取最短编码
-        for len in [0usize, 1, 0x7f, 0x80, 0xff, 0x100, 0xffff, 0x10000] {
+        // 覆盖五档 msgpack 无符号整数编码边界（正 fixint、0xcc、0xcd、0xce、0xcf）
+        let cases: &[(usize, u8)] = &[
+            (0, 0x00),
+            (1, 0x01),
+            (0x7f, 0x7f),
+            (0x80, 0xcc),
+            (0xff, 0xcc),
+            (0x100, 0xcd),
+            (0xffff, 0xcd),
+            (0x1_0000, 0xce),
+            (0xffff_ffff, 0xce),
+            (0x1_0000_0000usize, 0xcf),
+        ];
+        for &(len, expected_first_byte) in cases {
             let header = build_xlang_header(len);
+            assert_eq!(
+                header[0], expected_first_byte,
+                "first header byte for length {}",
+                len
+            );
             assert_eq!(
                 xlang_declared_msgpack_len(&header),
                 Some(len as u64),

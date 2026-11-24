@@ -438,17 +438,35 @@ impl Ray {
 
     // ── Object Store ──────────────────────────────────────────
 
-    /// Put an object into the object store.
+    /// Put an object into the object store for Rust consumers.
+    ///
+    /// Writes bare msgpack bytes with empty metadata (`ObjectRef::is_xlang() == false`),
+    /// supported in both local mode and cluster mode. The returned [`ObjectRef`]
+    /// can be read in Rust and passed by reference to Rust `#[remote]` tasks and
+    /// `#[actor]` methods. Passing its `.id()` by reference to a Python task or
+    /// actor fails on the Python worker because Python requires object metadata;
+    /// use [`Ray::put_xlang`] for cross-language reference arguments.
     pub fn put<T: serde::Serialize>(&self, value: &T) -> Result<ObjectRef<T>, RayError> {
         put(value)
     }
 
-    /// Put a value with a 9-byte XLANG header in front of the data (the msgpack
-    /// layout Python uses). The object itself carries no metadata: Put through
-    /// the C++ SDK stores `nullptr` metadata, so a Python task or actor rejects
-    /// this object when it arrives as a reference argument
-    /// (`_private/serialization.py` 的 `_deserialize_object` 拒收无 metadata 的
-    /// 非空对象，见 #21)。
+    /// Put a cross-language value into the object store with a 9-byte XLANG
+    /// header and `"XLANG"` metadata (`ObjectRef::is_xlang() == true`).
+    ///
+    /// In cluster mode this writes the payload and `"XLANG"` metadata via
+    /// `CoreWorker::Put` (`src/ray/core_worker/core_worker.cc:956-975`). The
+    /// returned [`ObjectRef`] can be decoded on the Rust side (`get`,
+    /// `get_value`, etc.) and its `.id()` can be passed by reference (`is_ref`
+    /// entry `true`) to [`Ray::task_call_python`],
+    /// [`Ray::task_call_python_with_options`], and [`Ray::actor_call_python`].
+    /// Passing this handle to a Rust `#[remote]` task or `#[actor]` method via
+    /// [`crate::TaskArg`] returns [`RayError::Serialization`] before submission.
+    ///
+    /// Local mode starts no `CoreWorkerProcess` or Python executor and
+    /// `LocalModeObjectStore::PutRaw`
+    /// (`cpp/src/ray/runtime/object/local_mode_object_store.cc:34-38`, `:40-46`)
+    /// cannot attach `"XLANG"` metadata, so calling `put_xlang` in local mode
+    /// returns [`RayError::Ffi`].
     pub fn put_xlang<T: serde::Serialize>(&self, value: &T) -> Result<ObjectRef<T>, RayError> {
         put_xlang(value)
     }
@@ -744,9 +762,10 @@ impl Ray {
     ///   local mode sends it without an owner lookup
     ///   (`cpp/src/ray/runtime/abstract_ray_runtime.cc:152-155` only asks a core
     ///   worker in cluster mode).
-    /// - it must come from a Python worker: objects put through the C++ SDK carry
-    ///   no metadata and Python rejects them when they arrive as an argument (see
-    ///   [`Ray::put_xlang`], #21).
+    /// - it must carry cross-language or Python metadata (written by
+    ///   [`Ray::put_xlang`] or produced by a Python worker); objects written by
+    ///   [`Ray::put`] carry no metadata and Python rejects them when they arrive
+    ///   as an argument.
     ///
     /// Local mode returns [`RayError::Ffi`] instead of submitting when `function`
     /// is also the name a `#[rayrust::remote]` function registered in this
@@ -1088,9 +1107,10 @@ impl Ray {
     /// - it must be a reference this process currently holds and whose owner Ray
     ///   knows. A 28-byte id of unknown origin makes Ray's `TransformArgs` →
     ///   `GetOwnerAddressOrDie` terminate the driver process.
-    /// - it must come from a Python worker: objects put through the C++ SDK carry
-    ///   no metadata and Python rejects them when they arrive as an argument (see
-    ///   [`Ray::put_xlang`], #21).
+    /// - it must carry cross-language or Python metadata (written by
+    ///   [`Ray::put_xlang`] or produced by a Python worker); objects written by
+    ///   [`Ray::put`] carry no metadata and Python rejects them when they arrive
+    ///   as an argument.
     ///
     /// Local mode returns [`RayError::Ffi`] before any of the reference
     /// requirements are looked at:
@@ -1513,16 +1533,12 @@ pub(crate) fn put<T: serde::Serialize>(value: &T) -> Result<ObjectRef<T>, RayErr
     Ok(ObjectRef::from_call_id(id))
 }
 
-/// Put a value into the object store with XLANG header wrapping.
-///
-/// 数据前带 9 字节 xlang 头，与 Python 的 msgpack 段格式一致。驱动 put 出来的
-/// 对象没有 metadata（`NativeObjectStore::PutRaw` 给 `CoreWorker::Put` 传
-/// `nullptr`），所以把它当引用参数交给 Python 任务/actor 时，Python 侧会因为
-/// 缺 metadata 拒收（`_private/serialization.py` 的 `_deserialize_object`）；
-/// 这是既有行为，见 #21。
+/// Put a cross-language value into the object store with a 9-byte XLANG header
+/// and `"XLANG"` metadata (`CoreWorker::Put` in cluster mode; returns
+/// [`RayError::Ffi`] in local mode).
 pub(crate) fn put_xlang<T: serde::Serialize>(value: &T) -> Result<ObjectRef<T>, RayError> {
     let data = crate::serialize::serialize_xlang(value)?;
-    let id = put_raw(&data)?;
+    let id = put_xlang_raw(&data)?;
     Ok(ObjectRef::from_call_xlang(id))
 }
 
@@ -1629,6 +1645,16 @@ pub(crate) fn put_raw(data: &[u8]) -> Result<Vec<u8>, RayError> {
     let bytes =
         unsafe { rayrust_sys::ray_put(data.as_ptr() as *const std::os::raw::c_char, data.len()) };
     let guard = CBytesGuard::from(bytes).ok_or_else(|| ffi_error("ray_put"))?;
+    Ok(guard.as_slice().to_vec())
+}
+
+/// Put cross-language bytes (9-byte XLANG header + msgpack body) into the
+/// object store with `"XLANG"` metadata. Returns the binary object ID.
+pub(crate) fn put_xlang_raw(data: &[u8]) -> Result<Vec<u8>, RayError> {
+    let bytes = unsafe {
+        rayrust_sys::ray_put_xlang(data.as_ptr() as *const std::os::raw::c_char, data.len())
+    };
+    let guard = CBytesGuard::from(bytes).ok_or_else(|| ffi_error("ray_put_xlang"))?;
     Ok(guard.as_slice().to_vec())
 }
 
@@ -4998,5 +5024,129 @@ mod tests {
             !unsafe { rayrust_sys::ray_is_initialized() },
             "1MB 畸形输入被拒绝之后激活了运行时"
         );
+    }
+
+    /// `ray_put_xlang` 的前置参数守卫排在取运行时之前：零长度、空指针、长度不超过 9、
+    /// 非 XLANG 头载荷、头部声明长度与正文长度不一致均直接返回空并记录参数错误；合法
+    /// 跨语言载荷穿过参数守卫并停在「运行时未初始化」。
+    #[test]
+    fn ray_put_xlang_validates_payload_before_runtime_lookup() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+
+        // 1. 零长度
+        rayrust_sys::clear_error();
+        let res = unsafe { rayrust_sys::ray_put_xlang(std::ptr::null(), 0) };
+        assert!(res.data.is_null() && res.len == 0);
+        assert_eq!(rayrust_sys::last_error_kind(), ErrorKind::Generic);
+        assert!(
+            rayrust_sys::last_error()
+                .unwrap_or_default()
+                .contains("zero-length"),
+            "零长度错误文本不符: {:?}",
+            rayrust_sys::last_error()
+        );
+
+        // 2. 空指针且非零长度
+        rayrust_sys::clear_error();
+        let res = unsafe { rayrust_sys::ray_put_xlang(std::ptr::null(), 10) };
+        assert!(res.data.is_null() && res.len == 0);
+        assert_eq!(rayrust_sys::last_error_kind(), ErrorKind::Generic);
+        assert_eq!(
+            rayrust_sys::last_error().as_deref(),
+            Some("data pointer is null")
+        );
+
+        // 3. 长度 <= 9（1 字节与恰好 9 字节）
+        for short_len in [1usize, 9usize] {
+            let buf = [0u8; 9];
+            rayrust_sys::clear_error();
+            let res = unsafe {
+                rayrust_sys::ray_put_xlang(buf.as_ptr() as *const std::os::raw::c_char, short_len)
+            };
+            assert!(res.data.is_null() && res.len == 0);
+            assert_eq!(rayrust_sys::last_error_kind(), ErrorKind::Generic);
+            assert!(
+                rayrust_sys::last_error()
+                    .unwrap_or_default()
+                    .contains("larger than the 9-byte header"),
+                "长度 {} 的错误文本不符: {:?}",
+                short_len,
+                rayrust_sys::last_error()
+            );
+        }
+
+        // 4. 裸 msgpack（首字节 0x91 是 fixarray，非正整数头）与截断的 msgpack 字符串头
+        let bare_array = [0x91u8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09];
+        let truncated_str = [0xd9u8, 0x20, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68];
+        for (label, bad_header) in [
+            ("裸 msgpack 数组", &bare_array[..]),
+            ("截断的 str8 头", &truncated_str[..]),
+        ] {
+            rayrust_sys::clear_error();
+            let res = unsafe {
+                rayrust_sys::ray_put_xlang(
+                    bad_header.as_ptr() as *const std::os::raw::c_char,
+                    bad_header.len(),
+                )
+            };
+            assert!(res.data.is_null() && res.len == 0, "{} 未被拒绝", label);
+            assert_eq!(rayrust_sys::last_error_kind(), ErrorKind::Generic);
+            assert!(
+                rayrust_sys::last_error()
+                    .unwrap_or_default()
+                    .contains("9-byte XLANG header"),
+                "{} 的错误文本不符: {:?}",
+                label,
+                rayrust_sys::last_error()
+            );
+        }
+
+        // 5. 头部声明长度与 len - 9 不一致（声明过小与声明过大）
+        let mut declared_too_small = [0u8; 11];
+        declared_too_small[0] = 1; // 声明 1 字节，实际正文 11 - 9 = 2 字节
+        declared_too_small[9] = 0x2a;
+        declared_too_small[10] = 0x00;
+
+        let mut declared_too_large = [0u8; 10];
+        declared_too_large[0] = 5; // 声明 5 字节，实际正文 10 - 9 = 1 字节
+        declared_too_large[9] = 0x2a;
+
+        for (label, mismatched) in [
+            ("声明长度小于正文", &declared_too_small[..]),
+            ("声明长度大于正文", &declared_too_large[..]),
+        ] {
+            rayrust_sys::clear_error();
+            let res = unsafe {
+                rayrust_sys::ray_put_xlang(
+                    mismatched.as_ptr() as *const std::os::raw::c_char,
+                    mismatched.len(),
+                )
+            };
+            assert!(res.data.is_null() && res.len == 0, "{} 未被拒绝", label);
+            assert_eq!(rayrust_sys::last_error_kind(), ErrorKind::Generic);
+            assert!(
+                rayrust_sys::last_error()
+                    .unwrap_or_default()
+                    .contains("declare a body length equal to len - 9"),
+                "{} 的错误文本不符: {:?}",
+                label,
+                rayrust_sys::last_error()
+            );
+        }
+
+        // 6. 正向对照：合法 10 字节跨语言载荷通过参数守卫，停在运行时检查
+        let valid = crate::serialize::serialize_xlang(&42i64).expect("serialize_xlang(42)");
+        assert_eq!(valid.len(), 10);
+        match put_xlang_raw(&valid) {
+            Err(RayError::Ffi(msg)) => assert!(
+                msg.contains("Ray runtime is not initialized"),
+                "合法载荷未走到运行时检查: {}",
+                msg
+            ),
+            other => panic!("无运行时下合法载荷返回了 {:?}", other),
+        }
     }
 }
