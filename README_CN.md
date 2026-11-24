@@ -10,8 +10,8 @@ Ray 的 Rust SDK —— 通过 FFI 封装 Ray C++ SDK，提供地道的 Rust API
 |---|:---:|:---:|
 | `Ray::connect` / `drop`（RAII 生命周期管理） | ✅ | ✅ |
 | `put` / `get` / `wait` | ✅ | ✅ |
-| `get_many` / `get_many_timeout`（批量获取，可带期限） | ✅ | ✅ |
-| `get_many_async` / `get_many_timeout_async` / `wait_async`（批量 `Get` 与 `Wait` 跑在 tokio blocking pool 上） | ✅ | ✅ |
+| `get_many` / `get_many_timeout`（批量获取，可带期限；一次 `Wait` 加逐元素 `Get`，见 #41） | ✅ | ✅ |
+| `get_many_async` / `get_many_timeout_async` / `wait_async`（批量获取与 `Wait` 跑在 tokio blocking pool 上） | ✅ | ✅ |
 | `#[remote]` 同步任务 | ✅ | ✅ |
 | `#[remote]` 异步任务（持久化 runtime） | ✅ | ✅ |
 | `#[actor]` 宏（自动生成 factory + 方法） | ✅ | ✅ |
@@ -218,6 +218,13 @@ let vals = ray.get_many(&[obj1, obj2, obj3])?;
 // 等待就绪
 let (ready, unready) = ray.wait(&[obj1, obj2], 2, 5000)?;
 ```
+
+`get_many*` 先按去重后的 ID 调用一次 `Wait`，再对每个就绪元素执行一次单对象 `Get`
+（最多每个输入槽位一次）：上游 C++ SDK 的批量 `Get` 在含有异常对象的混合批次中会
+留下空 `RayObject` 指针并在 `NativeObjectStore::GetRaw` 中直接解引用触发段错误
+（见 #41）。这次 `Wait` 不会因为批次里已有失败对象而提前返回，所以含多个元素的批次
+会等到全部就绪或期限到期：无期限的 `get_many` 会阻塞到每个元素就绪，带期限的入口
+在期限到期后才报告首个失败元素。
 
 集群模式（core worker 已初始化）下，`put` 与任务、actor 调用返回的 `ObjectRef` 为
 它的 id 持有一个 Ray 本地引用：`Clone` 加一个、`Drop` 减一个，只要还有这样的引用

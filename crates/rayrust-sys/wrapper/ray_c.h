@@ -222,7 +222,9 @@ ray_bytes_t ray_put(const char *data, size_t len);
 /// mismatch and terminates the process (`src/ray/common/id.h:430-441`), while an
 /// empty id becomes the nil id, which is never ready (`get` then reports
 /// TimedOut).
-/// `timeout_ms` is -1 for infinite wait.
+/// `timeout_ms` is -1 for infinite wait; any value below -1 is rejected before
+/// Ray is entered, because `src/ray/core_worker/store_provider/memory_store/memory_store.cc:97`
+/// RAY_CHECKs `timeout_ms >= 0 || timeout_ms == -1` and ends the process.
 /// Returns a ray_bytes_t containing the serialized object data.
 /// On error, returns ray_bytes_t with data=NULL.
 /// A zero-length buffer from `Get` means Ray failed the object with an error
@@ -276,7 +278,9 @@ int ray_remove_local_reference(const char *id_data, size_t id_len);
 /// input answers Ok instead of ending the process.
 /// Both rejections carry the sentence Ray's own `CoreWorker::Wait` produces
 /// (src/ray/core_worker/core_worker.cc:1475-1483).
-/// `timeout_ms` is -1 for infinite wait.
+/// `timeout_ms` is -1 for infinite wait; any value below -1 is rejected before
+/// Ray is entered (`src/ray/core_worker/store_provider/memory_store/memory_store.cc:97`
+/// RAY_CHECKs it and ends the process).
 /// Returns a heap-allocated bool array (one per input ID).
 /// 关闭期间同样拒绝（返回 NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 /// Caller must free with ray_free_bools.
@@ -1022,24 +1026,59 @@ int ray_cancel(const char *id_data, size_t id_len, bool force_kill, bool recursi
 /// Get multiple objects from the object store.
 /// `ids` is an array of ray_bytes_t, each exactly 28 bytes (the Ray 2.51.1
 /// ObjectID length). Any other length, including 0, is rejected without touching
-/// Ray for the same reasons as ray_get. `count` is the number of IDs.
-/// `timeout_ms` is -1 for infinite wait.
-/// Returns a heap-allocated array of ray_bytes_t (one per input ID).
+/// Ray for the same reasons as ray_get. `count` is the number of IDs; a value
+/// above INT_MAX is rejected before the IDs are walked, because Ray's `Wait`
+/// takes an `int`.
+/// `timeout_ms` is -1 for infinite wait; any value below -1 is rejected before
+/// Ray is entered (`src/ray/core_worker/store_provider/memory_store/memory_store.cc:97`
+/// RAY_CHECKs it and ends the process).
+/// Returns a heap-allocated array of ray_bytes_t (one per input ID), or NULL
+/// when argument validation, runtime lookup, `Wait`, or array allocation fails.
 /// 关闭期间同样拒绝（返回 NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
-/// Elements are checked in order: a zero-length buffer from `Get` means Ray
-/// failed that object with an error type outside the seven the C++ SDK
-/// translates and recorded no error text (every value this crate writes is
-/// msgpack-encoded and at least one byte long, and `ray_put` refuses `len == 0`,
-/// so zero length never comes from a normal value; untranslated types that
-/// record a `RayErrorInfo` payload carry a `9 + N` protobuf frame instead, which
-/// Rust recognises before decoding and reports as `RayError::Unclassified`),
-/// and sets that element to `data=NULL, len=0` with
-/// `RAY_ERROR_KIND_UNCLASSIFIED` and a message naming `TASK_CANCELLED`;
-/// when the object store returns no buffer for an element or copying it fails,
-/// that element has `data=NULL, len=0` with a `RAY_ERROR_KIND_GENERIC` message.
+///
+/// Implementation and cost: every non-empty batch deduplicates IDs (because
+/// `CoreWorker::Wait` rejects duplicates at
+/// `src/ray/core_worker/core_worker.cc:1475-1484`), calls `Wait` once with
+/// `timeout_ms` to establish the deadline across all unique IDs, and then performs
+/// one single-object `Get` per ready element — at most `count` calls, and a
+/// single-element batch costs one `Wait` plus one `Get`. Upstream's batch `Get`
+/// cannot be used because mixed batches leave null `RayObject` entries when any
+/// element is an exception — both for unready elements
+/// (`src/ray/core_worker/store_provider/memory_store/memory_store.cc:276-419`,
+/// early return at `:308-333`) and for plasma-promoted elements skipped when
+/// `got_exception` is set (`src/ray/core_worker/core_worker.cc:1337-1426` at
+/// `:1375-1384` and `:1404-1423`) — and `NativeObjectStore::GetRaw` dereferences
+/// `results[i]` without a null check
+/// (`cpp/src/ray/runtime/object/native_object_store.cc:90-134` at `:104-105`),
+/// crashing the process with SIGSEGV.
+///
+/// The `Wait` does not return early when the batch already holds an exception
+/// object (`CoreWorkerMemoryStore::GetImpl` runs with
+/// `abort_if_any_object_is_exception = false`), so a multi-element batch waits for
+/// every element or for the deadline; `timeout_ms = -1` therefore blocks until all
+/// elements are ready.
+///
+/// Elements are processed in input order:
+/// - An element still unready after `Wait` has `data=NULL, len=0` with
+///   `RAY_ERROR_KIND_TIMEOUT` (`"Get timed out: some object(s) not ready."`).
+/// - An element whose single-object `Get` throws a C++ exception has
+///   `data=NULL, len=0` with the exception's mapped `ray_error_kind_t` and full
+///   message.
+/// - A zero-length buffer from `Get` means Ray failed that object with an error
+///   type outside the seven the C++ SDK translates and recorded no error text
+///   (every value this crate writes is msgpack-encoded and at least one byte long,
+///   and `ray_put` refuses `len == 0`, so zero length never comes from a normal
+///   value; untranslated types that record a `RayErrorInfo` payload carry a
+///   `9 + N` protobuf frame instead, which Rust recognises before decoding and
+///   reports as `RayError::Unclassified`), and sets that element to
+///   `data=NULL, len=0` with `RAY_ERROR_KIND_UNCLASSIFIED` and a message naming
+///   `TASK_CANCELLED`.
+/// - When the object store returns no buffer for an element or copying it fails,
+///   that element has `data=NULL, len=0` with a `RAY_ERROR_KIND_GENERIC` message.
 /// The first failing element's kind and message are recorded for
-/// `ray_last_error_bytes()` and `ray_last_error_kind()`.
-/// Caller must free each element with ray_free_bytes, then free the array.
+/// `ray_last_error_bytes()` and `ray_last_error_kind()`; later failing elements
+/// leave the thread-local error channel untouched.
+/// Caller must free the returned array with `ray_free_bytes_array(out, count)`.
 ray_bytes_t *ray_get_many(const ray_bytes_t *ids, size_t count, int timeout_ms);
 
 /// Free an array returned by ray_get_many.
