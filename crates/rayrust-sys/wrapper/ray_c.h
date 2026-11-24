@@ -204,7 +204,12 @@ void ray_shutdown(void);
 // ─── Object Store ─────────────────────────────────────────────
 
 /// Put a serialized object into the object store.
-/// `data` is msgpack-serialized bytes.
+/// `data` is msgpack-serialized bytes; `len` must be at least 1: a zero-length
+/// value is refused with `RAY_ERROR_KIND_GENERIC` before the runtime is looked
+/// up, because `msgpack::sbuffer(0)` hands the SDK a null data pointer and
+/// `LocalMemoryBuffer` RAY_CHECKs it (`src/ray/common/buffer.h:77`), terminating
+/// the process in both modes. Every value this crate serializes is at least one
+/// byte, so the refusal never rejects a value the crate itself produces.
 /// Returns a ray_bytes_t containing the binary object ID.
 /// 关闭期间同样拒绝（data=NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 /// Caller must free with ray_free_bytes.
@@ -220,6 +225,15 @@ ray_bytes_t ray_put(const char *data, size_t len);
 /// `timeout_ms` is -1 for infinite wait.
 /// Returns a ray_bytes_t containing the serialized object data.
 /// On error, returns ray_bytes_t with data=NULL.
+/// A zero-length buffer from `Get` means Ray failed the object with an error
+/// type outside the seven the C++ SDK translates and recorded no error text:
+/// `ray_get` returns `data=NULL` and `len=0` with `RAY_ERROR_KIND_UNCLASSIFIED`
+/// and a message that explains the condition and names `TASK_CANCELLED`
+/// (untranslated types that record a `RayErrorInfo` payload carry a `9 + N`
+/// protobuf frame instead, which Rust recognises before decoding and reports as
+/// `RayError::Unclassified`). Every value this crate writes is msgpack-encoded
+/// and at least one byte long, and `ray_put` refuses `len == 0`, so zero length
+/// never comes from a normal value.
 /// 关闭期间同样拒绝（返回 data=NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
 ray_bytes_t ray_get(const char *id_data, size_t id_len, int timeout_ms);
 
@@ -1012,9 +1026,19 @@ int ray_cancel(const char *id_data, size_t id_len, bool force_kill, bool recursi
 /// `timeout_ms` is -1 for infinite wait.
 /// Returns a heap-allocated array of ray_bytes_t (one per input ID).
 /// 关闭期间同样拒绝（返回 NULL），类别是 `RAY_ERROR_KIND_RUNTIME`。
-/// When the object store returns no buffer for an element or copying it fails,
-/// that element has data=NULL and len=0, and a RAY_ERROR_KIND_GENERIC message
-/// is recorded for ray_last_error_bytes().
+/// Elements are checked in order: a zero-length buffer from `Get` means Ray
+/// failed that object with an error type outside the seven the C++ SDK
+/// translates and recorded no error text (every value this crate writes is
+/// msgpack-encoded and at least one byte long, and `ray_put` refuses `len == 0`,
+/// so zero length never comes from a normal value; untranslated types that
+/// record a `RayErrorInfo` payload carry a `9 + N` protobuf frame instead, which
+/// Rust recognises before decoding and reports as `RayError::Unclassified`),
+/// and sets that element to `data=NULL, len=0` with
+/// `RAY_ERROR_KIND_UNCLASSIFIED` and a message naming `TASK_CANCELLED`;
+/// when the object store returns no buffer for an element or copying it fails,
+/// that element has `data=NULL, len=0` with a `RAY_ERROR_KIND_GENERIC` message.
+/// The first failing element's kind and message are recorded for
+/// `ray_last_error_bytes()` and `ray_last_error_kind()`.
 /// Caller must free each element with ray_free_bytes, then free the array.
 ray_bytes_t *ray_get_many(const ray_bytes_t *ids, size_t count, int timeout_ms);
 
@@ -1084,6 +1108,9 @@ typedef enum {
     RAY_ERROR_KIND_TIMEOUT = 7,
     /// 运行时正在关闭：仅由关闭闸门给出，与 Ray 的异常层次无关。
     RAY_ERROR_KIND_RUNTIME = 8,
+    /// Ray 判定该对象失败，且错误类型在 C++ SDK 翻译的七种之外：仅由 `ray_get` 与
+    /// `ray_get_many` 的零长度结果给出，与 Ray 的异常层次无关。
+    RAY_ERROR_KIND_UNCLASSIFIED = 9,
 } ray_error_kind_t;
 
 /// Get the last error message bytes (thread-local) and their byte length.
@@ -1094,7 +1121,8 @@ typedef enum {
 void ray_last_error_bytes(const char **data, size_t *len);
 
 /// Get the class of the last error (thread-local), one of ray_error_kind_t
-/// （0..=8，含关闭闸门写入的 `RAY_ERROR_KIND_RUNTIME`）。
+/// （0..=9，含关闭闸门写入的 `RAY_ERROR_KIND_RUNTIME` 与零长度结果写入的
+/// `RAY_ERROR_KIND_UNCLASSIFIED`）。
 /// Returns RAY_ERROR_KIND_NONE when no error is recorded on this thread
 /// (`ray_last_error_bytes` writes `*data = NULL, *len = 0`).
 int ray_last_error_kind(void);

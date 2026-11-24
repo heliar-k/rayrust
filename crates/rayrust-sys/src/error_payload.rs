@@ -13,21 +13,9 @@
 //! 解析成功且文本为非空合法 UTF-8 时返回去除尾部空白后的文本；其余情况一律按
 //! `String::from_utf8_lossy` 原样呈现全部字节。
 
-/// 将错误通道记录的载荷字节渲染为可读字符串。
-///
-/// 若载荷符合 Ray 序列化错误缓冲格式且能提取出非空 UTF-8 格式化文本，返回去除尾部
-/// 空白后的该文本；否则按 `String::from_utf8_lossy` 转换全部原始字节。
-pub fn render(payload: &[u8]) -> String {
-    extract_formatted_text(payload).unwrap_or_else(|| String::from_utf8_lossy(payload).into_owned())
-}
-
-/// `MakeSerializedErrorBuffer` 给正文预留的固定头部长度
-/// （`src/ray/common/constants.h:61`、`src/ray/common/ray_object.cc:79-90`）：msgpack
-/// 整数写在偏移 0，正文从偏移 9 开始，缓冲区总长恒为 `9 + 正文长度`。正文位于载荷
-/// 末尾与头部长度恒为 9 这两条一起把「任意可打印文本恰好形如帧」的误判挡住。
-const K_MESSAGEPACK_OFFSET: usize = 9;
-
-fn extract_formatted_text(payload: &[u8]) -> Option<String> {
+/// 载荷是 C++ SDK 未翻译的错误对象的帧（`[9 字节头][bin][protobuf]`）时返回其中
+/// 的文本；任何不满足帧规则或字段规则的字节都返回 `None`。
+pub fn extract(payload: &[u8]) -> Option<String> {
     let (body_len, int_len) = read_msgpack_uint(payload)?;
     if body_len == 0 || int_len > K_MESSAGEPACK_OFFSET {
         return None;
@@ -39,6 +27,20 @@ fn extract_formatted_text(payload: &[u8]) -> Option<String> {
     let pb = read_msgpack_bin(body)?;
     scan_protobuf_error_text(pb).map(|text| text.to_string())
 }
+
+/// 将错误通道记录的载荷字节渲染为可读字符串。
+///
+/// 若载荷符合 Ray 序列化错误缓冲格式且能提取出非空 UTF-8 格式化文本，返回去除尾部
+/// 空白后的该文本；否则按 `String::from_utf8_lossy` 转换全部原始字节。
+pub fn render(payload: &[u8]) -> String {
+    extract(payload).unwrap_or_else(|| String::from_utf8_lossy(payload).into_owned())
+}
+
+/// `MakeSerializedErrorBuffer` 给正文预留的固定头部长度
+/// （`src/ray/common/constants.h:61`、`src/ray/common/ray_object.cc:79-90`）：msgpack
+/// 整数写在偏移 0，正文从偏移 9 开始，缓冲区总长恒为 `9 + 正文长度`。正文位于载荷
+/// 末尾与头部长度恒为 9 这两条一起把「任意可打印文本恰好形如帧」的误判挡住。
+const K_MESSAGEPACK_OFFSET: usize = 9;
 
 /// 读取切片开头的无符号 msgpack 整数，返回 `(数值, 整数编码占用的字节数)`。
 fn read_msgpack_uint(data: &[u8]) -> Option<(usize, usize)> {
@@ -506,5 +508,64 @@ mod tests {
         assert_eq!(text[0], b'I');
         assert_ne!(text.len(), K_MESSAGEPACK_OFFSET + 73);
         assert_eq!(render(&text), String::from_utf8_lossy(&text));
+    }
+
+    #[test]
+    fn extract_returns_some_matching_render_for_valid_frames() {
+        let mut nested = Vec::new();
+        push_len_delimited(
+            &mut nested,
+            1,
+            b"ValueError: Expected URI but received path /nonexistent",
+        );
+        let mut pb = Vec::new();
+        push_len_delimited(&mut pb, 3, &nested);
+        let msg = concat!(
+            "[Node 172.18.92.125] Traceback (most recent call last):\n",
+            "ValueError: Expected URI but received path /nonexistent\n",
+            " lease_id=0000, name=add\n",
+        );
+        push_len_delimited(&mut pb, 5, msg.as_bytes());
+        push_varint(&mut pb, (11 << 3) | 0);
+        push_varint(&mut pb, 7);
+
+        let payload = wrap_bin16_with_9byte_header(&pb, [0u8; 6]);
+        let extracted = extract(&payload);
+        assert_eq!(extracted.as_deref(), Some(msg.trim_end()));
+        assert_eq!(extracted.unwrap(), render(&payload));
+    }
+
+    #[test]
+    fn extract_returns_none_for_plain_text_and_zero_length_message() {
+        let cases: &[&[u8]] = &[
+            b"Get object error: TimedOut: Get timed out: some object(s) not ready.",
+            concat!(
+                "the object carries no data and Ray raised no exception: Ray failed it ",
+                "with an error type the C++ SDK does not translate and that records no ",
+                "error text (TASK_CANCELLED of a task is the common case; the SDK ",
+                "translates seven of the 27 rpc::ErrorType values)"
+            )
+            .as_bytes(),
+            b"\xc0",
+            b"\x2a",
+        ];
+        for &input in cases {
+            assert_eq!(extract(input), None);
+        }
+    }
+
+    #[test]
+    fn extract_returns_none_for_empty_and_malformed_payloads() {
+        assert_eq!(extract(&[]), None);
+        assert_eq!(extract(&[0xcd, 0x04, 0x00, 0x00, 0xff]), None);
+
+        let mut nested = Vec::new();
+        push_len_delimited(&mut nested, 1, b"nested only");
+        let mut pb = Vec::new();
+        push_len_delimited(&mut pb, 3, &nested);
+        push_varint(&mut pb, (11 << 3) | 0);
+        push_varint(&mut pb, 7);
+        let no_field5 = wrap_bin16_with_9byte_header(&pb, [0u8; 6]);
+        assert_eq!(extract(&no_field5), None);
     }
 }
