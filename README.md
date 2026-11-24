@@ -31,7 +31,7 @@ rayrust wraps the Ray C++ SDK (`libray_api.so`) via a C ABI layer, providing idi
 | `kill_actor` (local mode returns an error and the actor ends with the process, see #53) | ❌ | ✅ |
 | XLANG header auto-detection (Ray 2.51.1+ compatible) | ✅ | ✅ |
 | `rmpv::Value` dynamic deserialization | ✅ | ✅ |
-| `put_xlang` (writes the xlang header into the stored data; Python still rejects it for lack of metadata, see #21) | ✅ | ✅ |
+| `put_xlang` (writes the 9-byte XLANG header and `XLANG` metadata via `CoreWorker::Put` in cluster mode; local mode has no `CoreWorker` or Python executor and returns an error, see #21) | ❌ | ✅ |
 | `ray_last_error_bytes()` (thread-local error bytes + length; Rust extracts formatted exception text with UTF-8 lossy fallback) | ✅ | ✅ |
 
 ## Quick Start
@@ -117,7 +117,7 @@ let v: i32 = sum.get_async().await?;                 // 42
 
 Every macro-generated caller returns `Result`, so argument serialization and submission errors both reach the caller instead of panicking. Actor methods take references the same way (`counter_increment(&ray, &handle, &a)`).
 
-Two limits come with this feature. A reference the driver put can only be handed to Rust tasks and actors: Python rejects an object without metadata, and the C++ SDK's `put` writes none. And a Rust task cannot hand back a usable reference: the id it returns carries no nested references, and the driver has no owner path for it, so reading that id gives `ObjectUnknownOwner` even while the object is alive. Both limits are documented on `rayrust::TaskArg`.
+Two limits come with this feature. Rust tasks and actors take non-xlang references such as those from `Ray::put` (`TaskArg` rejects `Ray::put_xlang` handles with `RayError::Serialization` because C++ workers do not strip the 9-byte XLANG header); to pass a driver-written object by reference to a Python task or actor in cluster mode, write it with `Ray::put_xlang` so it carries `XLANG` metadata (`Ray::put` writes empty metadata, which Python rejects). And a Rust task cannot hand back a usable reference: the id it returns carries no nested references, and the driver has no owner path for it, so reading that id gives `ObjectUnknownOwner` even while the object is alive. Both limits are documented on `rayrust::TaskArg`.
 
 ### Actors (`#[actor]` macro)
 

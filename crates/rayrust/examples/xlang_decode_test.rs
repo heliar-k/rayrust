@@ -13,7 +13,10 @@
 //!   2. return_custom_object(7) → Err(RayError::Serialization)
 //!   3. return_list_with_custom_object(3) → Err(RayError::Serialization)
 //!   4. the raw bytes of that ref split into msgpack part + a tail > 0
-//!   5. Rust put/get and put_xlang/get_value still round-trip
+//!   5. Rust put/get round-trips in both modes; in cluster mode put_xlang
+//!      round-trips via get/get_value and passes by reference to Python
+//!      `sum_list` and `echo_dict`, while in local mode put_xlang returns
+//!      `Err(RayError::Ffi)` naming `local mode`
 //!   6. a normal Python call still works after the rejections
 //!   7. options reach a Python task: with the single CPU held by one Python task,
 //!      a call through `task_call_python` waits (Err(RayError::Timeout)) while the
@@ -32,6 +35,7 @@
 //! Environment for the cluster mode: RAY_ADDRESS, RAY_NODE_IP, RAY_WORKER_SO, and
 //! a cluster started with `--num-cpus=1`.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use rayrust::prelude::*;
@@ -144,7 +148,11 @@ fn check_plain_list(ray: &Ray) {
     let obj_ref = ray
         .task_call_python(PYTHON_MODULE, "return_list", &[], &[])
         .expect("submit return_list()");
-    println!("  ray.{}.return_list() → {}", PYTHON_MODULE, obj_ref.id_hex());
+    println!(
+        "  ray.{}.return_list() → {}",
+        PYTHON_MODULE,
+        obj_ref.id_hex()
+    );
 
     let value = match obj_ref.get_value() {
         Ok(value) => value,
@@ -153,8 +161,16 @@ fn check_plain_list(ray: &Ray) {
     let items = value
         .as_array()
         .unwrap_or_else(|| panic!("return_list() decoded to {:?}, not an array", value));
-    let numbers: Vec<i64> = items.iter().map(|v| v.as_i64().expect("an integer element")).collect();
-    assert_eq!(numbers, vec![1, 2, 3, 4, 5], "return_list() returned {:?}", numbers);
+    let numbers: Vec<i64> = items
+        .iter()
+        .map(|v| v.as_i64().expect("an integer element"))
+        .collect();
+    assert_eq!(
+        numbers,
+        vec![1, 2, 3, 4, 5],
+        "return_list() returned {:?}",
+        numbers
+    );
     println!("  value → {:?} ✓", numbers);
 
     check_raw_bytes(&obj_ref, 0);
@@ -168,14 +184,12 @@ fn check_raw_bytes(obj_ref: &ObjectRef<()>, expected_tail: u64) {
     let raw = obj_ref.get_raw_bytes().expect("get_raw_bytes()");
     let declared = declared_msgpack_len(&raw);
     let after_header = raw.len() - XLANG_HEADER_LEN;
-    let tail = after_header
-        .checked_sub(declared)
-        .unwrap_or_else(|| {
-            panic!(
-                "the header declares {} msgpack bytes but only {} follow it",
-                declared, after_header
-            )
-        });
+    let tail = after_header.checked_sub(declared).unwrap_or_else(|| {
+        panic!(
+            "the header declares {} msgpack bytes but only {} follow it",
+            declared, after_header
+        )
+    });
     println!(
         "  raw bytes: {} total, {} header, {} msgpack, {} tail; header first bytes {:02x?}",
         raw.len(),
@@ -190,7 +204,11 @@ fn check_raw_bytes(obj_ref: &ObjectRef<()>, expected_tail: u64) {
             "the payload carries no pickle5 section, so it cannot show the reported shape"
         );
     } else {
-        assert_eq!(tail, 0, "the payload carries an unexpected {} byte tail", tail);
+        assert_eq!(
+            tail, 0,
+            "the payload carries an unexpected {} byte tail",
+            tail
+        );
     }
 }
 
@@ -241,7 +259,12 @@ fn check_list_with_custom_object(ray: &Ray) {
     println!("\n--- 3. return_list_with_custom_object(3) → rejected ---");
     let arg = serialize(&3i64).expect("serialize the argument");
     let obj_ref = ray
-        .task_call_python(PYTHON_MODULE, "return_list_with_custom_object", &[&arg], &[])
+        .task_call_python(
+            PYTHON_MODULE,
+            "return_list_with_custom_object",
+            &[&arg],
+            &[],
+        )
         .expect("submit return_list_with_custom_object(3)");
     println!(
         "  ray.{}.return_list_with_custom_object(3) → {}",
@@ -313,10 +336,13 @@ fn check_local_mode_python_task(ray: &Ray) {
     println!("  get_value() → Nil ✓ (no cross-language payload exists in local mode)");
 }
 
-/// Check 5: values Rust wrote itself still round-trip through both paths.
-fn check_rust_roundtrip(ray: &Ray) {
-    println!("\n--- 5. Rust put/get is unaffected ---");
+/// Check 5: values Rust wrote itself round-trip; `put_xlang` refuses local mode
+/// and attaches `"XLANG"` metadata in cluster mode so Python tasks can consume
+/// it by reference.
+fn check_rust_roundtrip(ray: &Ray, is_local: bool) {
+    println!("\n--- 5. Rust put/get and put_xlang ---");
     let obj = ray.put(&42i32).expect("put(42i32)");
+    assert!(!obj.is_xlang(), "put() returned is_xlang() == true");
     let value: i32 = obj.get().expect("get() of put(42i32)");
     assert_eq!(value, 42, "put/get returned {}", value);
     println!("  put(42i32) → get() → {} ✓", value);
@@ -332,7 +358,31 @@ fn check_rust_roundtrip(ray: &Ray) {
     assert_eq!(numbers, vec![1, 2, 3], "put/get returned {:?}", numbers);
     println!("  put(vec![1, 2, 3]) → get_value() → {:?} ✓", numbers);
 
-    let obj = ray.put_xlang(&vec![7i64, 8, 9]).expect("put_xlang(vec![7, 8, 9])");
+    if is_local {
+        match ray.put_xlang(&vec![7i64, 8, 9]) {
+            Err(RayError::Ffi(msg)) => {
+                assert!(
+                    msg.contains("local mode"),
+                    "put_xlang in local mode did not mention local mode: {}",
+                    msg
+                );
+                println!("  put_xlang in local mode → Err(RayError::Ffi({})) ✓", msg);
+            }
+            Ok(_) => panic!("put_xlang succeeded in local mode"),
+            Err(other) => panic!(
+                "put_xlang in local mode returned {:?}, expected RayError::Ffi",
+                other
+            ),
+        }
+        return;
+    }
+
+    let obj = ray
+        .put_xlang(&vec![7i64, 8, 9])
+        .expect("put_xlang(vec![7, 8, 9])");
+    assert!(obj.is_xlang(), "put_xlang() returned is_xlang() == false");
+    let typed: Vec<i64> = obj.get().expect("get() of put_xlang(vec![7, 8, 9])");
+    assert_eq!(typed, vec![7, 8, 9], "put_xlang/get returned {:?}", typed);
     let value = obj
         .get_value()
         .expect("get_value() of put_xlang(vec![7, 8, 9])");
@@ -342,8 +392,46 @@ fn check_rust_roundtrip(ray: &Ray) {
         .iter()
         .map(|v| v.as_i64().expect("an integer element"))
         .collect();
-    assert_eq!(numbers, vec![7, 8, 9], "put_xlang/get_value returned {:?}", numbers);
-    println!("  put_xlang(vec![7, 8, 9]) → get_value() → {:?} ✓", numbers);
+    assert_eq!(
+        numbers,
+        vec![7, 8, 9],
+        "put_xlang/get_value returned {:?}",
+        numbers
+    );
+    println!(
+        "  put_xlang(vec![7, 8, 9]) → get() & get_value() → {:?} ✓",
+        numbers
+    );
+
+    let sum_ref = ray
+        .task_call_python(PYTHON_MODULE, "sum_list", &[obj.id()], &[true])
+        .expect("submit sum_list(&put_xlang)");
+    let sum_val: i64 = sum_ref
+        .cast::<i64>()
+        .get()
+        .expect("get() of sum_list(&put_xlang)");
+    assert_eq!(sum_val, 24, "sum_list(&put_xlang) returned {}", sum_val);
+    println!(
+        "  ray.{}.sum_list(&put_xlang([7, 8, 9])) → {} ✓",
+        PYTHON_MODULE, sum_val
+    );
+
+    let mut dict = HashMap::new();
+    dict.insert("alpha".to_string(), 10i64);
+    dict.insert("beta".to_string(), 32i64);
+    let dict_obj = ray.put_xlang(&dict).expect("put_xlang(dict)");
+    let echoed_ref = ray
+        .task_call_python(PYTHON_MODULE, "echo_dict", &[dict_obj.id()], &[true])
+        .expect("submit echo_dict(&put_xlang)");
+    let echoed: HashMap<String, i64> = echoed_ref
+        .cast::<HashMap<String, i64>>()
+        .get()
+        .expect("get() of echo_dict(&put_xlang)");
+    assert_eq!(echoed, dict, "echo_dict(&put_xlang) returned {:?}", echoed);
+    println!(
+        "  ray.{}.echo_dict(&put_xlang(dict)) → {:?} ✓",
+        PYTHON_MODULE, echoed
+    );
 }
 
 /// Check 6: a rejection does not leave the process unable to talk to Ray.
@@ -365,7 +453,11 @@ fn check_after_rejections(ray: &Ray) {
     let entries = value
         .as_map()
         .unwrap_or_else(|| panic!("return_dict() decoded to {:?}, not a map", value));
-    println!("  ray.{}.return_dict() → {} map entries ✓", PYTHON_MODULE, entries.len());
+    println!(
+        "  ray.{}.return_dict() → {} map entries ✓",
+        PYTHON_MODULE,
+        entries.len()
+    );
     let a = entries
         .iter()
         .find(|(k, _)| k.as_str() == Some("a"))
@@ -392,7 +484,11 @@ fn check_python_task_options(ray: &Ray) {
     let holder = ray
         .task_call_python(PYTHON_MODULE, "sleep_for", &[&seconds], &[])
         .expect("submit the CPU-holding Python task");
-    println!("  ray.{}.sleep_for(60.0) → {}", PYTHON_MODULE, holder.id_hex());
+    println!(
+        "  ray.{}.sleep_for(60.0) → {}",
+        PYTHON_MODULE,
+        holder.id_hex()
+    );
     // 等它真的拿到那个唯一的 CPU。
     std::thread::sleep(Duration::from_secs(4));
 
@@ -449,7 +545,9 @@ fn check_python_task_options(ray: &Ray) {
 }
 
 fn main() {
-    let mode = std::env::args().nth(1).unwrap_or_else(|| "local".to_string());
+    let mode = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "local".to_string());
     println!("=== Ray Cross-Language Decode ===");
 
     let ray = connect(&mode);
@@ -458,12 +556,12 @@ fn main() {
         // C++/Rust driver 的本地模式固定用 C++ 函数描述符提交任务，Python 函数
         // 在那里跑不了，所以本地模式只能验证「产生不了跨语言载荷」这一点。
         check_local_mode_python_task(&ray);
-        check_rust_roundtrip(&ray);
+        check_rust_roundtrip(&ray, true);
     } else {
         check_plain_list(&ray);
         check_custom_object(&ray);
         check_list_with_custom_object(&ray);
-        check_rust_roundtrip(&ray);
+        check_rust_roundtrip(&ray, false);
         check_after_rejections(&ray);
         check_python_task_options(&ray);
     }

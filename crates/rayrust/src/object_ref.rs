@@ -75,11 +75,12 @@
 //!
 //! ## 作为参数
 //!
-//! 引用可以顶替一个值参数传给任务或 actor 方法（`ObjectRef<T>` 或
+//! 引用可以顶替一个值参数传给 Rust 任务或 actor 方法（`ObjectRef<T>` 或
 //! `&ObjectRef<T>`，见 [`crate::TaskArg`]）：驱动不必先读出来，集群模式下 core
 //! worker 把对象的值投递给工人，本地模式下提交前取成值。调用器自己持有一份引用
 //! 直到提交的 FFI 调用返回，调用方不需要保证句柄活到某个时刻。传进来的句柄必须是
-//! 本进程当前持有的引用（[`crate::TaskArg`] 里有这条守卫）。
+//! 本进程当前持有的非跨语言引用（[`crate::TaskArg`] 检查 28 字节宽度、持有权以及
+//! `!obj.is_xlang()`；跨语言引用取 `.id()` 传给 `task_call_python` / `actor_call_python`）。
 //!
 //! Rust 任务不能把可用的引用交回来。`TaskExecutor` 给 `AllocateReturnObject` 传
 //! 的是空的嵌套引用表（`cpp/src/ray/runtime/task/task_executor.cc:251-258`），
@@ -380,6 +381,24 @@ impl<T> ObjectRef<T> {
     /// Get the object ID as a hex string (for debugging).
     pub fn id_hex(&self) -> String {
         self.id.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    /// Whether this reference carries a cross-language payload (9-byte XLANG
+    /// header and `"XLANG"` / `"PYTHON"` metadata).
+    ///
+    /// Returns `true` for handles created by [`Ray::put_xlang`](crate::Ray::put_xlang),
+    /// [`Ray::task_call_python`](crate::Ray::task_call_python),
+    /// [`Ray::task_call_python_with_options`](crate::Ray::task_call_python_with_options),
+    /// and [`Ray::actor_call_python`](crate::Ray::actor_call_python).
+    /// Returns `false` for handles created by [`Ray::put`](crate::Ray::put),
+    /// [`Ray::put_async`](crate::Ray::put_async),
+    /// [`Ray::task_call`](crate::Ray::task_call),
+    /// [`Ray::task_call_async`](crate::Ray::task_call_async),
+    /// [`Ray::actor_call`](crate::Ray::actor_call),
+    /// [`Ray::actor_call_async`](crate::Ray::actor_call_async), and
+    /// `ObjectRef::from`.
+    pub fn is_xlang(&self) -> bool {
+        self.is_xlang
     }
 
     /// Retrieve the object value (blocks until ready).
@@ -709,5 +728,28 @@ mod tests {
             decode_value_generic(&frame, false),
             Err(RayError::Unclassified(_))
         ));
+    }
+
+    #[test]
+    fn is_xlang_tracks_constructor_clone_and_cast() {
+        let _guard = EPOCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(live_epoch(), 0);
+
+        let rebuilt: ObjectRef<i64> = ObjectRef::from_id(vec![1u8; OBJECT_ID_LEN]);
+        assert!(!rebuilt.is_xlang());
+        assert!(!rebuilt.clone().is_xlang());
+        assert!(!rebuilt.cast::<i32>().is_xlang());
+
+        let rust_call: ObjectRef<i64> = ObjectRef::from_call_id(vec![2u8; OBJECT_ID_LEN]);
+        assert!(!rust_call.is_xlang());
+        assert!(!rust_call.clone().is_xlang());
+        assert!(!rust_call.cast::<i32>().is_xlang());
+
+        let xlang_call: ObjectRef<i64> = ObjectRef::from_call_xlang(vec![3u8; OBJECT_ID_LEN]);
+        assert!(xlang_call.is_xlang());
+        assert!(xlang_call.clone().is_xlang());
+        assert!(xlang_call.cast::<i32>().is_xlang());
     }
 }

@@ -68,8 +68,8 @@ fn main() {
         .expect("get read_driver_object");
     println!("  read_driver_object -> {:?}", read_res);
 
-    // 2. 工人侧调用 ray_put 写入对象并读回
-    println!("\n--- 2. put_in_worker ---");
+    // 2. 工人侧调用 ray_put 与 ray_put_xlang 写入对象并读回
+    println!("\n--- 2. put_in_worker & put_xlang_in_worker ---");
     let put_arg = serialize(&99i64).expect("serialize(99)");
     let put_res: Result<(Vec<u8>, i64), String> = ray
         .task_call("put_in_worker", &[&put_arg], &[], &TaskOptions::new())
@@ -78,6 +78,20 @@ fn main() {
         .get_timeout(TIMEOUT_MS)
         .expect("get put_in_worker");
     println!("  put_in_worker -> {:?}", put_res);
+
+    let put_xlang_arg = serialize(&123i64).expect("serialize(123)");
+    let put_xlang_res: Result<(Vec<u8>, i64), String> = ray
+        .task_call(
+            "put_xlang_in_worker",
+            &[&put_xlang_arg],
+            &[],
+            &TaskOptions::new(),
+        )
+        .expect("submit put_xlang_in_worker")
+        .cast::<Result<(Vec<u8>, i64), String>>()
+        .get_timeout(TIMEOUT_MS)
+        .expect("get put_xlang_in_worker");
+    println!("  put_xlang_in_worker -> {:?}", put_xlang_res);
 
     // 3. 工人侧嵌套提交 multiply(6, 7) 并读回
     println!("\n--- 3. submit_nested ---");
@@ -120,6 +134,17 @@ fn main() {
     };
     assert_eq!(put_id.len(), OBJECT_ID_LEN, "put_in_worker id length");
     assert_eq!(put_val, 99, "put_in_worker value mismatch");
+
+    let (put_xlang_id, put_xlang_val) = match put_xlang_res {
+        Ok(pair) => pair,
+        Err(err) => panic!("put_xlang_in_worker failed: {}", err),
+    };
+    assert_eq!(
+        put_xlang_id.len(),
+        OBJECT_ID_LEN,
+        "put_xlang_in_worker id length"
+    );
+    assert_eq!(put_xlang_val, 123, "put_xlang_in_worker value mismatch");
 
     let (nested_id, nested_val) = match nested_res {
         Ok(pair) => pair,
