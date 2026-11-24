@@ -125,8 +125,13 @@ pub struct RayConfig {
     /// Node IP address to use when registering with the cluster.
     /// If empty, the C++ SDK auto-detects (may fail with multiple NICs).
     pub node_ip: String,
-    /// Runtime environment JSON string (e.g. `{"pip": ["pkg1", "pkg2"]}`).
-    /// If empty, no runtime_env is set.
+    /// Runtime environment JSON object string (e.g. `{"pip": ["pkg1", "pkg2"]}`
+    /// or `{"env_vars": {"FOO": "bar"}}`). If empty, no `runtime_env` is set.
+    ///
+    /// Malformed JSON text or a valid JSON value that is not an object causes
+    /// the initial [`Ray::connect`] to return `Err(RayError::Ffi(msg))` with
+    /// `msg` containing `runtime_env JSON is invalid: ` before the SDK is
+    /// entered, without terminating the process.
     pub runtime_env: String,
     /// Directory for Ray logs. If empty, uses default.
     pub log_dir: String,
@@ -171,8 +176,12 @@ impl RayConfig {
         self
     }
 
-    /// Set the runtime environment JSON string.
-    /// Example: `{"pip": ["numpy", "pandas"]}` or `{"env_vars": {"FOO": "bar"}}`
+    /// Set the runtime environment JSON object string.
+    /// Example: `{"pip": ["numpy", "pandas"]}` or `{"env_vars": {"FOO": "bar"}}`.
+    ///
+    /// A malformed JSON string or a non-object JSON value makes the initial
+    /// [`Ray::connect`] return `Err(RayError::Ffi(msg))` whose message includes
+    /// `runtime_env JSON is invalid: `, leaving the process alive.
     pub fn runtime_env(mut self, json: impl Into<String>) -> Self {
         self.runtime_env = json.into();
         self
@@ -197,7 +206,10 @@ impl RayConfig {
     ///
     /// Local mode accepts the value and reports it back ([`Ray::namespace`]), but
     /// its actor registration and lookup ignore it: the local runtime keeps one
-    /// flat name table.
+    /// flat name table. The value local mode reports is stored only when a new
+    /// runtime is initialized successfully: an initialization that is rejected,
+    /// a call while Ray is already initialized, and a `ray::Init` that throws
+    /// all leave the reported namespace as it was.
     pub fn namespace(mut self, ns: impl Into<String>) -> Self {
         self.namespace = ns.into();
         self
@@ -354,6 +366,15 @@ impl Ray {
     /// the driver stops about 35 seconds later at
     /// cpp/src/ray/util/process_helper.cc:110 (`RAY_CHECK_OK` on its
     /// `GetNodeToConnectForDriver`).
+    ///
+    /// # Runtime environment validation
+    ///
+    /// When [`RayConfig::runtime_env`] is non-empty, it must be a valid JSON
+    /// object. Malformed JSON text or a non-object JSON value returns
+    /// [`RayError::Ffi`] carrying `runtime_env JSON is invalid: ` before Ray is
+    /// initialized, without terminating the process. A non-object value is
+    /// reported by its JSON type name, so the message stays short whatever the
+    /// input length.
     pub fn connect(config: &RayConfig) -> Result<Self, RayError> {
         // 取锁之前先看一眼：关闭线程在排空期间不持有 LIVE（见 `Drop for RayInner`），
         // 这一眼让任务体在绝大多数情况下连锁都不用碰。
@@ -4751,6 +4772,215 @@ mod tests {
             message.contains("more object ids than Ray's Wait accepts"),
             "数量拒绝消息不符: {:?}",
             message
+        );
+    }
+
+    /// 集群模式下畸形 `runtime_env` JSON 在连接前被 `ray_init` 内层 `try` 拦截，
+    /// 返回 `Err(RayError::Ffi)` 且消息包含 `runtime_env JSON is invalid: `，进程保持存活。
+    #[test]
+    fn connect_cluster_rejects_malformed_runtime_env_json() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let config = RayConfig::new("127.0.0.1:1").runtime_env("{");
+        match Ray::connect(&config) {
+            Err(RayError::Ffi(message)) => {
+                assert!(
+                    message.starts_with("ray_init: runtime_env JSON is invalid: "),
+                    "集群模式畸形 runtime_env 错误前缀不符: {}",
+                    message
+                );
+            }
+            Err(other) => panic!("集群模式畸形 runtime_env 返回了其他错误变体: {}", other),
+            Ok(_) => panic!("集群模式畸形 runtime_env 被接受了"),
+        }
+        assert_eq!(
+            rayrust_sys::last_error_kind(),
+            rayrust_sys::ErrorKind::Generic,
+            "畸形 runtime_env 没有记录为 RAY_ERROR_KIND_GENERIC"
+        );
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "被拒绝的调用创建了运行时"
+        );
+    }
+
+    /// 集群模式下合法 JSON 数组或标量并非对象，`ray_init` 同样在进入 SDK 连接逻辑之前
+    /// 返回 `Err(RayError::Ffi)`，消息点名 `runtime_env`。
+    #[test]
+    fn connect_cluster_rejects_non_object_runtime_env_json() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        for input in ["[1,2,3]", "123", "true", "null", "\"text\""] {
+            let config = RayConfig::new("127.0.0.1:1").runtime_env(input);
+            match Ray::connect(&config) {
+                Err(RayError::Ffi(message)) => {
+                    assert!(
+                        message.starts_with("ray_init: runtime_env JSON is invalid: "),
+                        "输入 {} 的错误前缀不符: {}",
+                        input,
+                        message
+                    );
+                    assert!(
+                        message.contains("runtime_env must be a JSON object"),
+                        "输入 {} 的错误消息没有说明需要 JSON 对象: {}",
+                        input,
+                        message
+                    );
+                }
+                Err(other) => panic!("输入 {} 返回了其他错误变体: {}", input, other),
+                Ok(_) => panic!("输入 {} 被接受了", input),
+            }
+        }
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "被拒绝的调用创建了运行时"
+        );
+    }
+
+    /// `runtime_env` 校验失败之后，运行时登记与错误通道没有残留污染；后续连接正常进入
+    /// 各自校验分支（完整初始化与正常关闭的端到端校验位于独立测试进程 `tests/actor_registry.rs`，
+    /// 以免在本单元测试进程内激活全局运行时）。
+    #[test]
+    fn connect_after_rejected_runtime_env_is_unpolluted() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let bad_syntax = RayConfig::new("127.0.0.1:1")
+            .namespace("uncommitted_ns")
+            .runtime_env("{");
+        assert!(matches!(Ray::connect(&bad_syntax), Err(RayError::Ffi(_))));
+
+        let bad_shape = RayConfig::new("127.0.0.1:1")
+            .namespace("uncommitted_ns")
+            .runtime_env("[1,2,3]");
+        assert!(matches!(Ray::connect(&bad_shape), Err(RayError::Ffi(_))));
+
+        assert!(!shutting_down(), "被拒绝的初始化遗留了关闭标志");
+        assert!(
+            LIVE.lock()
+                .expect("live runtime registry poisoned")
+                .is_none(),
+            "被拒绝的初始化写入了 LIVE 登记表"
+        );
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "被拒绝的初始化激活了 C++ 运行时"
+        );
+
+        match Ray::connect(&RayConfig::new("local")) {
+            Err(RayError::Ffi(message)) => {
+                assert!(
+                    message.contains("address \"local\" is not host:port"),
+                    "后续连接没有返回地址校验错误: {}",
+                    message
+                );
+                assert!(
+                    !message.contains("runtime_env"),
+                    "后续连接残留了上一次的 runtime_env 错误: {}",
+                    message
+                );
+            }
+            Err(other) => panic!("后续坏地址连接返回了其他错误变体: {}", other),
+            Ok(_) => panic!("坏地址 \"local\" 被接受了"),
+        }
+    }
+
+    /// 本地模式下畸形 `runtime_env` 与非对象 JSON 同样返回 `Err(RayError::Ffi)`，
+    /// 消息包含 `runtime_env JSON is invalid: `，进程保持存活。
+    #[test]
+    fn connect_local_rejects_malformed_and_non_object_runtime_env_json() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        for input in ["{", "[1,2,3]"] {
+            let config = RayConfig::local().runtime_env(input);
+            match Ray::connect(&config) {
+                Err(RayError::Ffi(message)) => {
+                    assert!(
+                        message.starts_with("ray_init: runtime_env JSON is invalid: "),
+                        "本地模式输入 {} 的错误消息前缀不符: {}",
+                        input,
+                        message
+                    );
+                }
+                Err(other) => panic!("本地模式输入 {} 返回了其他错误变体: {}", input, other),
+                Ok(_) => panic!("本地模式输入 {} 被接受了", input),
+            }
+            assert!(
+                !unsafe { rayrust_sys::ray_is_initialized() },
+                "本地模式输入 {} 被拒绝之后激活了运行时",
+                input
+            );
+        }
+    }
+
+    /// 非对象 `runtime_env` 的错误消息只报告 JSON 类型名：1MB 的标量输入得到短消息，
+    /// 消息里不会把输入原样拼进去。
+    #[test]
+    fn connect_reports_a_short_message_for_a_megabyte_non_object_runtime_env() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let scalar = format!("\"{}\"", "a".repeat(1024 * 1024));
+        assert!(scalar.len() >= 1024 * 1024, "构造的输入不足 1MB");
+        let config = RayConfig::local().runtime_env(scalar);
+        match Ray::connect(&config) {
+            Err(RayError::Ffi(message)) => {
+                assert!(
+                    message.len() < 4096,
+                    "1MB 标量输入的 错误消息长 {} 字节，超过 4096",
+                    message.len()
+                );
+                assert!(
+                    message.contains("runtime_env must be a JSON object"),
+                    "消息没有说明需要 JSON 对象: {}",
+                    message
+                );
+                assert!(
+                    message.contains("type string"),
+                    "消息没有报告 JSON 类型名: {}",
+                    message
+                );
+            }
+            Err(other) => panic!("1MB 标量输入返回了其他错误变体: {}", other),
+            Ok(_) => panic!("1MB 标量输入被接受了"),
+        }
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "1MB 标量输入被拒绝之后激活了运行时"
+        );
+    }
+
+    /// 1MB 的畸形 JSON 同样得到短消息：形状校验在 `RuntimeEnv::Deserialize` 之前完成，
+    /// `nlohmann::json::parse` 的异常文本只带出错位置，不带整段输入。
+    #[test]
+    fn connect_reports_a_short_message_for_a_megabyte_malformed_runtime_env() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let malformed = "{".repeat(1024 * 1024);
+        assert!(malformed.len() >= 1024 * 1024, "构造的输入不足 1MB");
+        let config = RayConfig::local().runtime_env(malformed);
+        match Ray::connect(&config) {
+            Err(RayError::Ffi(message)) => assert!(
+                message.len() < 4096,
+                "1MB 畸形输入的 错误消息长 {} 字节，超过 4096",
+                message.len()
+            ),
+            Err(other) => panic!("1MB 畸形输入返回了其他错误变体: {}", other),
+            Ok(_) => panic!("1MB 畸形输入被接受了"),
+        }
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "1MB 畸形输入被拒绝之后激活了运行时"
         );
     }
 }

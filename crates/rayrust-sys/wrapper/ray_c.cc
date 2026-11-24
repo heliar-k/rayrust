@@ -835,95 +835,103 @@ int ray_init(const char *address, int local_mode, const char *node_ip,
              const char *log_dir,
              int actor_lifetime,
              const char *ns) {
-    const bool local = local_mode != 0;
-    ray::RayConfig config;
-    // 本地模式不看地址：`ConfigInternal::Init` 只在 `config.address` 非空时调
-    // `SetBootstrapAddress`（cpp/src/ray/config_internal.cc:124-126），而 `SINGLE_PROCESS`
-    // 建的是 `LocalModeRayRuntime`（cpp/src/ray/runtime/abstract_ray_runtime.cc:48-51），
-    // 本地模式没有 bootstrap 地址可用。
-    //
-    // 交给 SDK 的不合规地址在上游分四种结局：`ParseAddress` 解析不出来的停在
-    // `config_internal.cc:255`，端口为空或不是十进制数字的停在 `:261`，端口超出 65535
-    // 或带尾缀被 `std::from_chars` 截断的交给后续连接、约 35 秒后停在
-    // `process_helper.cc:110`，负端口停在 `util.cc:42`；空 host 让上游把 bootstrap 地址
-    // 当成没设置，转头去起 head 节点（`process_helper.cc:84-92`）。
-    //
-    // 两处校验都在 `init_namespace()` 那次写入与 `local_tasks().mutex` 之前：被拒的
-    // init 不该改掉 `ray_get_namespace` 读的那份值，也不该在关闭闸门上排队。
-    if (!local && address && address[0] != '\0') {
-        if (check_bootstrap_address("address", address) != 0) return -1;
-        config.address = address;
-    }
-    config.local_mode = local;
-    // 空地址时下游会读 `RAY_ADDRESS`（cpp/src/ray/config_internal.cc:207-215）并走
-    // 同一个 `SetBootstrapAddress`，所以环境变量按同一规则校验；被设置时（包括空串）
-    // 都要判，空串在那里同样是解析不出地址的输入。
-    if (!local && config.address.empty()) {
-        const char *env = std::getenv("RAY_ADDRESS");
-        if (env && check_bootstrap_address("RAY_ADDRESS", env) != 0) return -1;
-    }
-
-    // Set default actor lifetime: 0 = NON_DETACHED (default), 1 = DETACHED.
-    if (actor_lifetime == 1) {
-        config.default_actor_lifetime = ray::ActorLifetime::DETACHED;
-    }
-
-    // Set job-level namespace for named actors.
-    if (ns && ns[0] != '\0') {
-        config.ray_namespace = ns;
-    }
-
-    // 同一处留一份给本地模式的 `ray_get_namespace`；没传就是空串。
-    {
-        std::lock_guard<std::mutex> lock(init_namespace_mutex());
-        init_namespace() = config.ray_namespace;
-    }
-
-    // Set code search path for worker to find .so with remote functions.
-    if (code_search_path && code_search_path[0] != '\0') {
-        std::string paths(code_search_path);
-        size_t start = 0, end;
-        while ((end = paths.find(':', start)) != std::string::npos) {
-            if (end > start) {
-                config.code_search_path.push_back(paths.substr(start, end - start));
-            }
-            start = end + 1;
-        }
-        if (start < paths.size()) {
-            config.code_search_path.push_back(paths.substr(start));
-        }
-    }
-
-    // Set runtime_env from JSON string
-    if (runtime_env_json && runtime_env_json[0] != '\0') {
-        config.runtime_env = ray::RuntimeEnv::Deserialize(std::string(runtime_env_json));
-    }
-
-    // Build argv to pass node_ip_address and log_dir via command-line flags.
-    int argc = 1;
-    std::vector<std::string> arg_strings;
-    std::vector<const char *> arg_ptrs;
-
-    arg_strings.push_back("rayrust");
-    arg_ptrs.push_back(arg_strings[0].c_str());
-
-    if (node_ip && node_ip[0] != '\0') {
-        arg_strings.push_back("--ray_node_ip_address");
-        arg_strings.push_back(node_ip);
-        arg_ptrs.push_back(arg_strings[1].c_str());
-        arg_ptrs.push_back(arg_strings[2].c_str());
-        argc = 3;
-    }
-
-    if (log_dir && log_dir[0] != '\0') {
-        arg_strings.push_back("--ray_logs_dir");
-        arg_strings.push_back(log_dir);
-        arg_ptrs.push_back(arg_strings[argc].c_str());
-        arg_ptrs.push_back(arg_strings[argc + 1].c_str());
-        argc += 2;
-    }
-
+    ray_clear_error();
     try {
+        const bool local = local_mode != 0;
+        ray::RayConfig config;
+        // 本地模式忽略地址：`ConfigInternal::Init` 只在 `config.address` 非空时调用
+        // `SetBootstrapAddress`（cpp/src/ray/config_internal.cc:124-126），而 `SINGLE_PROCESS`
+        // 创建的是 `LocalModeRayRuntime`（cpp/src/ray/runtime/abstract_ray_runtime.cc:48-51），
+        // 本地模式没有 bootstrap 地址可用。
+        //
+        // 交给 SDK 的不合规地址在上游分四种结局：`ParseAddress` 解析不出来的停在
+        // `config_internal.cc:255`，端口为空或非十进制数字的停在 `:261`，端口超出 65535
+        // 或带尾缀被 `std::from_chars` 截断的交给后续连接、约 35 秒后停在
+        // `process_helper.cc:110`，负端口停在 `util.cc:42`；空 host 让上游把 bootstrap 地址
+        // 当成未设置，转去启动 head 节点（`process_helper.cc:84-92`）。
+        //
+        // 全部参数校验与配置构建都在 `local_tasks().mutex` 之前：被拒绝的 init 不在关闭闸门上排队。
+        // `init_namespace()` 的写入推到了新运行时初始化成功之后（见下方），因为已初始化时
+        // `ray::Init` 是空操作、运行时不换，命名空间也不该换。
+        if (!local && address && address[0] != '\0') {
+            if (check_bootstrap_address("address", address) != 0) return -1;
+            config.address = address;
+        }
+        config.local_mode = local;
+        // 空地址时下游会读取 `RAY_ADDRESS`（cpp/src/ray/config_internal.cc:207-215）并进入
+        // 同一个 `SetBootstrapAddress`，所以环境变量按同一规则校验；被设置时（包括空串）
+        // 都要判定，空串在那里同样是解析不出地址的输入。
+        if (!local && config.address.empty()) {
+            const char *env = std::getenv("RAY_ADDRESS");
+            if (env && check_bootstrap_address("RAY_ADDRESS", env) != 0) return -1;
+        }
+
+        // Set default actor lifetime: 0 = NON_DETACHED (default), 1 = DETACHED.
+        if (actor_lifetime == 1) {
+            config.default_actor_lifetime = ray::ActorLifetime::DETACHED;
+        }
+
+        // Set job-level namespace for named actors.
+        if (ns && ns[0] != '\0') {
+            config.ray_namespace = ns;
+        }
+
+        // Set code search path for worker to find .so with remote functions.
+        if (code_search_path && code_search_path[0] != '\0') {
+            std::string paths(code_search_path);
+            size_t start = 0, end;
+            while ((end = paths.find(':', start)) != std::string::npos) {
+                if (end > start) {
+                    config.code_search_path.push_back(paths.substr(start, end - start));
+                }
+                start = end + 1;
+            }
+            if (start < paths.size()) {
+                config.code_search_path.push_back(paths.substr(start));
+            }
+        }
+
+        // Set runtime_env from JSON string.
+        // 先判形状再反序列化：`ray::RuntimeEnv::Deserialize`
+        // （cpp/src/ray/runtime/runtime_env.cc:67-76）内部对整段文本调用
+        // `nlohmann::json::parse`，异常消息会把输入原样拼进去，一次解析失败会生成与输入
+        // 同长的消息。数组与标量不会让它抛出异常，所以这里与 `apply_runtime_env` 一致，
+        // 要求顶层为 JSON 对象，非对象只报告类型名。
+        if (runtime_env_json && runtime_env_json[0] != '\0') {
+            try {
+                const std::string raw_runtime_env(runtime_env_json);
+                const auto parsed_runtime_env = nlohmann::json::parse(raw_runtime_env);
+                if (!parsed_runtime_env.is_object()) {
+                    throw std::runtime_error("runtime_env must be a JSON object, got type " +
+                                             std::string(parsed_runtime_env.type_name()));
+                }
+                config.runtime_env = ray::RuntimeEnv::Deserialize(raw_runtime_env);
+            } catch (const std::exception &e) {
+                set_last_error_kind(std::string("runtime_env JSON is invalid: ") + e.what(),
+                                    RAY_ERROR_KIND_GENERIC);
+                return -1;
+            }
+        }
+
+        // Build argv to pass node_ip_address and log_dir via command-line flags.
+        std::vector<std::string> arg_strings;
+        arg_strings.reserve(5);
+        arg_strings.push_back("rayrust");
+        if (node_ip && node_ip[0] != '\0') {
+            arg_strings.push_back("--ray_node_ip_address");
+            arg_strings.push_back(node_ip);
+        }
+        if (log_dir && log_dir[0] != '\0') {
+            arg_strings.push_back("--ray_logs_dir");
+            arg_strings.push_back(log_dir);
+        }
+        std::vector<const char *> arg_ptrs;
+        arg_ptrs.reserve(arg_strings.size());
+        for (const auto &arg : arg_strings) {
+            arg_ptrs.push_back(arg.c_str());
+        }
+        const int argc = static_cast<int>(arg_ptrs.size());
+
         std::lock_guard<std::mutex> lock(local_tasks().mutex);
         if (local_tasks().shutting_down) {
             set_last_error("a ray_shutdown is still in progress");
@@ -937,6 +945,11 @@ int ray_init(const char *address, int local_mode, const char *node_ip,
         if (!already_initialized) {
             local_tasks().ids.clear();
             local_tasks().shutting_down = false;
+            // 新运行时建立成功之后才记录一份给本地模式的 `ray_get_namespace`；未传入时为空串。
+            // 关闭进行中被拒、参数校验失败、`ray::Init` 抛异常这三条路径都不会写到这里，
+            // 已初始化时的调用也不写：运行时不换，命名空间就不换。
+            std::lock_guard<std::mutex> namespace_lock(init_namespace_mutex());
+            init_namespace() = config.ray_namespace;
         }
         return 0;
     } catch (const std::exception &e) {

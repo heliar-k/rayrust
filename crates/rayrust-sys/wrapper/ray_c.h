@@ -98,14 +98,27 @@ typedef struct {
 ///   Pass NULL to auto-detect.
 /// `code_search_path` is a colon-separated list of directories or .so files
 ///   for the worker to search for remote functions. Pass NULL to skip.
-/// `runtime_env_json` is a JSON string for runtime_env (e.g. {"pip": ["pkg"]}).
-///   Pass NULL to skip.
+/// `runtime_env_json` is a JSON object string for runtime_env
+///   (e.g. {"pip": ["pkg"]}). Pass NULL or empty string to skip. A malformed
+///   JSON text or a valid JSON value that is not an object returns -1 before
+///   the SDK is entered, recording `RAY_ERROR_KIND_GENERIC` with a message
+///   starting with `runtime_env JSON is invalid: ` without terminating the
+///   process. A non-object value reports only the JSON type name
+///   (`array`, `number`, `string`, `boolean`, `null`), so the message does not
+///   grow with the input.
 /// `log_dir` is the directory for Ray logs. Pass NULL for default.
 /// `actor_lifetime` is 0 = NON_DETACHED (default), 1 = DETACHED.
 ///   Detached actors outlive the job that created them.
 /// `namespace` is the job-level namespace for named actors.
 ///   Pass NULL or empty string for default (no namespace).
 /// Returns 0 on success, -1 on failure.
+/// Any `std::exception` thrown while building `RayConfig` or `argv` is caught
+/// inside `ray_init`, recorded as `RAY_ERROR_KIND_GENERIC` (or the matching
+/// `ray_error_kind_t` for a `RayException`), and reported as -1 without
+/// terminating the process. The namespace that local mode reports through
+/// `ray_get_namespace()` is updated only after a new runtime is initialized
+/// successfully: a rejected call, a call while Ray is already initialized, and
+/// a `ray::Init` that throws all leave it unchanged.
 /// The address checks run before the shutdown check: when an address is refused,
 /// ray_last_error_bytes() carries that message and not
 /// `a ray_shutdown is still in progress`.
@@ -1127,12 +1140,16 @@ void ray_free_bools(bool *ptr);
 /// (`ray/api/ray_exception.h`).
 ///
 /// `RayFunctionNotFound` and `RayRuntimeEnvException` have no constant here:
-/// neither class ever reaches this side. A missing function is thrown only on
-/// the worker, where `TaskExecutor`'s catch turns it into `Status::Invalid`
-/// (`cpp/src/ray/runtime/task/task_executor.cc:101-111`, the catch at `:101` and the
-/// `Status::Invalid` it returns at `:111`), so the driver sees
-/// a `RayTaskException`. A malformed runtime_env is deserialized before
-/// `ray_init`'s `try`, so it aborts the process instead of being recorded.
+/// a missing function is thrown only on the worker, where `TaskExecutor`'s
+/// catch turns it into `Status::Invalid`
+/// (`cpp/src/ray/runtime/task/task_executor.cc:101-111`, the catch at `:101`
+/// and the `Status::Invalid` it returns at `:111`), so the driver sees a
+/// `RayTaskException`; `RayRuntimeEnvException` from `ray_init` is caught by
+/// its inner `runtime_env` block and recorded as `RAY_ERROR_KIND_GENERIC` with
+/// a `runtime_env JSON is invalid: ` prefix, while `apply_runtime_env` on task
+/// and actor options parses the JSON upfront (`nlohmann::json::parse` throws
+/// `json::parse_error`, also `RAY_ERROR_KIND_GENERIC`) before calling
+/// `RuntimeEnv::Deserialize`.
 typedef enum {
     /// No error recorded on this thread.
     RAY_ERROR_KIND_NONE = 0,
