@@ -44,7 +44,8 @@ typedef struct {
 } ray_actor_handle_meta_t;
 
 /// Rust 回调返回状态与结果结构体，配合 `ray_func_callback_t` 与
-/// `ray_member_callback_t` 使用。所有非空 `data` 缓冲区一律由 C 侧调用 `free()` 释放。
+/// `ray_member_callback_t` 使用。所有非空 `data` 缓冲区必须由回调方通过
+/// C 标准库 `malloc`（Rust 侧为 `libc::malloc`）分配，由 C 侧调用 `std::free` 释放。
 ///
 /// 四个状态在集群模式与本地模式下的传播路径：
 /// - `RAY_CALLBACK_OK`（0）：正常返回，`data`/`len` 为 msgpack 序列化的返回值，C 侧
@@ -1157,8 +1158,9 @@ void ray_free_bytes_array(ray_bytes_t *array, size_t count);
 
 /// Callback type for a Rust remote function.
 /// Receives an array of msgpack-serialized argument buffers.
-/// Returns a `ray_callback_result_t` whose non-NULL `data` buffer is allocated on the
-/// heap and will be freed by the C wrapper with `free()`.
+/// Returns a `ray_callback_result_t` whose non-NULL `data` buffer is allocated by
+/// C standard library `malloc` (`libc::malloc` on the Rust side), independent of
+/// Rust's `#[global_allocator]`, and freed by the C wrapper with `std::free`.
 typedef ray_callback_result_t (*ray_func_callback_t)(const ray_bytes_t *args, size_t arg_count);
 
 /// Register a Rust function as a Ray remote task.
@@ -1172,8 +1174,9 @@ void ray_register_function(const char *func_name, ray_func_callback_t callback);
 /// Callback type for a Rust actor member function.
 /// `actor_ptr` is the raw pointer (uint64_t) stored by the factory (`Box<Mutex<T>>`).
 /// `args` / `arg_count` are the msgpack-serialized arguments (without `self`).
-/// Returns a `ray_callback_result_t` whose non-NULL `data` buffer is allocated on the
-/// heap and will be freed by the C wrapper with `free()`.
+/// Returns a `ray_callback_result_t` whose non-NULL `data` buffer is allocated by
+/// C standard library `malloc` (`libc::malloc` on the Rust side), independent of
+/// Rust's `#[global_allocator]`, and freed by the C wrapper with `std::free`.
 typedef ray_callback_result_t (*ray_member_callback_t)(uint64_t actor_ptr,
                                                         const ray_bytes_t *args,
                                                         size_t arg_count);
@@ -1184,6 +1187,30 @@ typedef ray_callback_result_t (*ray_member_callback_t)(uint64_t actor_ptr,
 void ray_register_member_function(const char *func_name, ray_member_callback_t callback);
 
 // ─── Memory Management ────────────────────────────────────────
+//
+// Cross-boundary heap ownership uses a single allocator per direction:
+//
+// 1. C -> Rust: Every heap buffer returned by `ray_*` (`ray_bytes_t.data`, the
+//    `ray_bytes_t *` array and each element's `data` from `ray_get_many`, and the
+//    `bool *` array from `ray_wait`) is allocated with `std::malloc` in `ray_c.cc`.
+//    Rust frees them exclusively via `ray_free_bytes`, `ray_free_bytes_array`,
+//    and `ray_free_bools` (all calling `std::free`).
+//
+// 2. Rust -> C: In `ray_callback_result_t` returned by `ray_func_callback_t` and
+//    `ray_member_callback_t`, every non-NULL `data` buffer must be allocated with
+//    C standard library `malloc` (`libc::malloc` in Rust), independent of Rust's
+//    `#[global_allocator]`. `unwrap_callback_result` releases it via
+//    `CallbackBufferGuard` calling `std::free`. Zero-length payloads pass
+//    `data = NULL, len = 0`.
+//
+// 3. Borrowed pointers and opaque handles: Input pointers passed to `ray_*` or
+//    into Rust callbacks (`const char *`, `const ray_bytes_t *`) are borrowed for
+//    the duration of the call only; `*data` written by `ray_last_error_bytes`
+//    borrows the thread-local error buffer until the next error write or
+//    `ray_clear_error` on the same thread; and `actor_ptr` (`uint64_t`) is an
+//    opaque Rust `Box<Mutex<T>>` address serialized as a msgpack integer and
+//    forwarded back to `ray_member_callback_t`. None of these are freed by the
+//    receiver or C wrapper.
 
 /// Free a ray_bytes_t returned by any ray_* function.
 void ray_free_bytes(ray_bytes_t *ptr);

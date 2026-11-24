@@ -33,7 +33,8 @@ pub struct RayActorHandleMeta {
 /// 与 `wrapper/ray_c.h` 的 `ray_callback_status_t` 及 `ray_callback_result_t` 一致。
 /// 正常返回时 `data`/`len` 为 msgpack 序列化的返回值；失败时为不含内部 NUL 字节的
 /// UTF-8 错误文本；两种退出状态传 `data = NULL, len = 0`。所有非空 `data` 缓冲区
-/// 由 C 侧调用 `free()` 释放。
+/// 由回调方通过 `libc::malloc` 分配（独立于 `#[global_allocator]`），由 C 侧
+/// 调用 `free()` 释放。
 #[repr(C)]
 pub struct RayCallbackResult {
     pub status: c_int,

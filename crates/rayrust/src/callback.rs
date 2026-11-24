@@ -1,7 +1,8 @@
 //! Rust 侧 `extern "C"` 回调运行时支撑：参数解包、反序列化、Actor 状态互斥与异常捕获。
 //!
 //! 本模块把过程宏生成的回调逻辑收敛成普通 Rust 函数：
-//! - 缓冲区分配集中在单一私有函数，便于后续替换分配器；
+//! - 回调返回缓冲区通过 `libc::malloc` 分配并与 C 侧 `std::free` 配对，独立于 Rust 的
+//!   `#[global_allocator]`；
 //! - `unpack_args` 与 `deserialize_arg` 将空指针、参数个数不符与解码失败转为 `Err(String)`；
 //! - `into_actor_ptr` / `with_actor_ref` / `with_actor_mut` 将 actor 状态包在
 //!   `Box<std::sync::Mutex<T>>` 内，约束 `T: Send + 'static` 并串行借用；
@@ -12,16 +13,15 @@ use std::os::raw::{c_char, c_int};
 
 use rayrust_sys::{RayBytes, RayCallbackResult};
 
-/// 将字节切片拷入 C 侧 `free()` 可释放的堆缓冲区（#28 的单一修改点）。
+/// 将字节切片拷入 C 标准库 `malloc` 分配的堆缓冲区，由 C 侧 `std::free` 释放。
 ///
-/// 当 `bytes` 为空时直接返回 `(null, 0)`，不调用零大小 `std::alloc::alloc`；布局计算或
-/// 内存分配失败时返回 `Err(())`，由调用方回退为无缓冲区的 `RAY_CALLBACK_ERROR`。
+/// 当 `bytes` 为空时直接返回 `(null, 0)`，不调用 `libc::malloc(0)`；分配失败时返回
+/// `Err(())`，由调用方回退为无缓冲区的 `RAY_CALLBACK_ERROR`。
 fn alloc_callback_bytes(bytes: &[u8]) -> Result<(*const c_char, usize), ()> {
     if bytes.is_empty() {
         return Ok((std::ptr::null(), 0));
     }
-    let layout = std::alloc::Layout::array::<u8>(bytes.len()).map_err(|_| ())?;
-    let ptr = unsafe { std::alloc::alloc(layout) };
+    let ptr = unsafe { libc::malloc(bytes.len()) as *mut u8 };
     if ptr.is_null() {
         return Err(());
     }
@@ -627,5 +627,29 @@ mod tests {
         let unaligned_err =
             unsafe { with_actor_mut::<i64, i64>(1, "unaligned_ctx", |v| *v) }.unwrap_err();
         assert!(unaligned_err.contains("aligned"), "got: {unaligned_err}");
+    }
+
+    #[test]
+    fn alloc_callback_bytes_and_result_helpers_handle_empty_and_full_byte_range() {
+        let (empty_ptr, empty_len) = alloc_callback_bytes(&[]).unwrap();
+        assert!(empty_ptr.is_null());
+        assert_eq!(empty_len, 0);
+
+        let all_bytes: Vec<u8> = (0u8..=255).collect();
+        let (ptr, len) = alloc_callback_bytes(&all_bytes).unwrap();
+        assert!(!ptr.is_null());
+        assert_eq!(len, 256);
+        let copied = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+        assert_eq!(copied, all_bytes.as_slice());
+        unsafe { libc::free(ptr as *mut libc::c_void) };
+
+        let (ok_status, ok_bytes) = unsafe { take_result(ok_result(&all_bytes)) };
+        assert_eq!(ok_status, rayrust_sys::RAY_CALLBACK_OK);
+        assert_eq!(ok_bytes, all_bytes);
+
+        let empty_err = error_result("");
+        assert_eq!(empty_err.status, rayrust_sys::RAY_CALLBACK_ERROR);
+        assert!(empty_err.data.is_null());
+        assert_eq!(empty_err.len, 0);
     }
 }
