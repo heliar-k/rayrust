@@ -27,16 +27,17 @@
 //! 检查项，每一项都打印实际结果：
 //! 1. 前置对照：建立运行时，`put` 一个整数再 `get` 回来等于原值。
 //! 2. 释放句柄后，`rayrust::sys::ray_is_initialized()` 返回 `false`。
-//! 3. 25 个取运行时的 C 入口逐个调用：均返回空值或错误码，`ray_last_error_kind()` 为
+//! 3. 29 个取运行时的 C 入口逐个调用：均返回空值或错误码，`ray_last_error_kind()` 为
 //!    `RAY_ERROR_KIND_RUNTIME`（8，`ErrorKind::Runtime`），`ray_last_error_bytes()` 包含关闭
 //!    拒绝消息。每个入口使用合法参数，排除参数校验提前拦截的干扰。
 //! 4. 两个引用计数入口（`ray_add_local_reference`、`ray_remove_local_reference`）在关闭
 //!    后返回 0，且 `ray_last_error_bytes()` 写出空指针与零长度。
-//! 5. `ray_is_local_mode()` 在关闭后照常返回对应模式的布尔值，且不记录错误。
+//! 5. `ray_is_local_mode()` 以及指标构造/名称读取/销毁入口（`ray_gauge_create`、
+//!    `ray_metric_get_name`、`ray_metric_destroy`）在关闭后不受关闭闸门拒绝且不记录错误。
 //! 6. 关闭进行中的拒绝（仅在 local 模式运行）：提交一个 `sleep_for(1.5)` 任务，在另一
-//!    个线程释放句柄触发本地排空，主线程等待 300 ms 后调用 `ray_put` 与 `ray_put_xlang`，
-//!    验证排空期间已被关闭闸门以 `RAY_ERROR_KIND_RUNTIME` 拒绝，随后会合关闭线程并打印
-//!    `DROP_MS=`。
+//!    个线程释放句柄触发本地排空，主线程等待 300 ms 后调用 `ray_put`、`ray_put_xlang` 与
+//!    `ray_gauge_set`，验证排空期间已被关闭闸门以 `RAY_ERROR_KIND_RUNTIME` 拒绝，随后会合
+//!    关闭线程并打印 `DROP_MS=`。
 //! 7. 复位：再次建立运行时，`put`/`get` 成功，验证 `ray_init` 已将关闭标志清除。
 
 use std::ffi::CString;
@@ -111,7 +112,21 @@ fn check_gate_rejection(name: &str, returned_empty: bool, failures: &mut Vec<Str
     }
 }
 
-fn check_25_entries() {
+fn raw_str_bytes(s: &[u8]) -> RayBytes {
+    RayBytes {
+        data: s.as_ptr() as *const c_char,
+        len: s.len(),
+    }
+}
+
+fn empty_ray_bytes() -> RayBytes {
+    RayBytes {
+        data: std::ptr::null(),
+        len: 0,
+    }
+}
+
+fn check_29_entries() {
     let mut failures: Vec<String> = Vec::new();
 
     let put_payload: [u8; 2] = [0x91, 0x01];
@@ -424,14 +439,85 @@ fn check_25_entries() {
         unsafe { sys::ray_cancel(obj_id.as_ptr() as *const c_char, obj_id.len(), true, false) };
     check_gate_rejection("ray_cancel", rc == -1, &mut failures);
 
+    // 预先构造四个合法指标句柄，验证关闭闸门拒绝四个录制入口
+    let hist_bounds = [1.0f64, 10.0f64];
+    let gauge_h = unsafe {
+        sys::ray_gauge_create(
+            raw_str_bytes(b"gate_gauge"),
+            empty_ray_bytes(),
+            empty_ray_bytes(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    let counter_h = unsafe {
+        sys::ray_counter_create(
+            raw_str_bytes(b"gate_counter"),
+            empty_ray_bytes(),
+            empty_ray_bytes(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    let hist_h = unsafe {
+        sys::ray_histogram_create(
+            raw_str_bytes(b"gate_hist"),
+            empty_ray_bytes(),
+            empty_ray_bytes(),
+            hist_bounds.as_ptr(),
+            hist_bounds.len(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    let sum_h = unsafe {
+        sys::ray_sum_create(
+            raw_str_bytes(b"gate_sum"),
+            empty_ray_bytes(),
+            empty_ray_bytes(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    if gauge_h.is_null() || counter_h.is_null() || hist_h.is_null() || sum_h.is_null() {
+        fail("构造关闭闸门测试用指标句柄失败".to_string());
+    }
+
+    // 26. ray_gauge_set
+    sys::clear_error();
+    let rc = unsafe { sys::ray_gauge_set(gauge_h, 1.0, std::ptr::null(), 0) };
+    check_gate_rejection("ray_gauge_set", rc == -1, &mut failures);
+
+    // 27. ray_counter_inc
+    sys::clear_error();
+    let rc = unsafe { sys::ray_counter_inc(counter_h, 1.0, std::ptr::null(), 0) };
+    check_gate_rejection("ray_counter_inc", rc == -1, &mut failures);
+
+    // 28. ray_histogram_observe
+    sys::clear_error();
+    let rc = unsafe { sys::ray_histogram_observe(hist_h, 1.0, std::ptr::null(), 0) };
+    check_gate_rejection("ray_histogram_observe", rc == -1, &mut failures);
+
+    // 29. ray_metric_record
+    sys::clear_error();
+    let rc = unsafe { sys::ray_metric_record(sum_h, 1.0, std::ptr::null(), 0) };
+    check_gate_rejection("ray_metric_record", rc == -1, &mut failures);
+
+    unsafe {
+        sys::ray_metric_destroy(gauge_h);
+        sys::ray_metric_destroy(counter_h);
+        sys::ray_metric_destroy(hist_h);
+        sys::ray_metric_destroy(sum_h);
+    }
+
     if !failures.is_empty() {
         fail(format!(
-            "25 个入口中有 {} 个未按预期拒绝: {}",
+            "29 个入口中有 {} 个未按预期拒绝: {}",
             failures.len(),
             failures.join("; ")
         ));
     }
-    println!("  25 个入口全部以 RAY_ERROR_KIND_RUNTIME 拒绝");
+    println!("  29 个入口全部以 RAY_ERROR_KIND_RUNTIME 拒绝");
 }
 
 fn main() {
@@ -475,9 +561,9 @@ fn main() {
         fail("释放句柄后 ray_is_initialized() 仍为 true".to_string());
     }
 
-    // 3. 25 个入口逐个调用
-    println!("\n--- 3. 关闭后 25 个入口逐个调用 ---");
-    check_25_entries();
+    // 3. 29 个入口逐个调用
+    println!("\n--- 3. 关闭后 29 个入口逐个调用 ---");
+    check_29_entries();
 
     // 4. 引用计数两个入口不被拒
     println!("\n--- 4. 引用计数两个入口返回 0 且无错误 ---");
@@ -547,9 +633,77 @@ fn main() {
         ));
     }
 
+    // 检查指标构造、名称读取与销毁不受关闭闸门拒绝且不留 last_error
+    sys::clear_error();
+    let post_gauge = unsafe {
+        sys::ray_gauge_create(
+            raw_str_bytes(b"post_close_gauge"),
+            empty_ray_bytes(),
+            empty_ray_bytes(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    let mut err_create: *const c_char = std::ptr::null();
+    let mut err_create_len: usize = 0;
+    unsafe { sys::ray_last_error_bytes(&mut err_create, &mut err_create_len) };
+    if post_gauge.is_null() || !err_create.is_null() || err_create_len != 0 {
+        fail(format!(
+            "关闭后 ray_gauge_create 失败或留下错误: ptr_is_null={}, len={}, err={:?}",
+            post_gauge.is_null(),
+            err_create_len,
+            sys::last_error()
+        ));
+    }
+
+    sys::clear_error();
+    let raw_name = unsafe { sys::ray_metric_get_name(post_gauge) };
+    let mut err_name: *const c_char = std::ptr::null();
+    let mut err_name_len: usize = 0;
+    unsafe { sys::ray_last_error_bytes(&mut err_name, &mut err_name_len) };
+    let name_guard = sys::CBytesGuard::from(raw_name)
+        .unwrap_or_else(|| fail("关闭后 ray_metric_get_name 返回空指针".to_string()));
+    if name_guard.as_slice() != b"post_close_gauge" || !err_name.is_null() || err_name_len != 0 {
+        fail(format!(
+            "关闭后 ray_metric_get_name 结果或错误异常: got={:?}, len={}, err={:?}",
+            std::str::from_utf8(name_guard.as_slice()),
+            err_name_len,
+            sys::last_error()
+        ));
+    }
+    drop(name_guard);
+
+    sys::clear_error();
+    unsafe { sys::ray_metric_destroy(post_gauge) };
+    let mut err_destroy: *const c_char = std::ptr::null();
+    let mut err_destroy_len: usize = 0;
+    unsafe { sys::ray_last_error_bytes(&mut err_destroy, &mut err_destroy_len) };
+    if !err_destroy.is_null() || err_destroy_len != 0 {
+        fail(format!(
+            "关闭后 ray_metric_destroy 留下错误: len={}, err={:?}",
+            err_destroy_len,
+            sys::last_error()
+        ));
+    }
+    println!(
+        "  ray_gauge_create / ray_metric_get_name / ray_metric_destroy 在关闭后正常完成且无错误"
+    );
+
     // 6. 关闭进行中的拒绝（仅在 local 模式跑）
     println!("\n--- 6. 关闭排空进行中的拒绝 ---");
     if is_local {
+        let drain_gauge = unsafe {
+            sys::ray_gauge_create(
+                raw_str_bytes(b"drain_gate_gauge"),
+                empty_ray_bytes(),
+                empty_ray_bytes(),
+                std::ptr::null(),
+                0,
+            )
+        };
+        if drain_gauge.is_null() {
+            fail("构造第 6 项 drain_gate_gauge 失败".to_string());
+        }
         let ray_drain =
             Ray::local().unwrap_or_else(|e| fail(format!("第 6 项 Ray::local 失败: {}", e)));
         let _pending = sleep_for_remote(&ray_drain, 1.5)
@@ -588,6 +742,13 @@ fn main() {
         let mid_xlang_raw_kind = unsafe { sys::ray_last_error_kind() };
         let mid_xlang_kind = sys::last_error_kind();
         let mid_xlang_msg = sys::last_error();
+
+        sys::clear_error();
+        let mid_gauge_rc = unsafe { sys::ray_gauge_set(drain_gauge, 2.5, std::ptr::null(), 0) };
+        let mid_gauge_raw_kind = unsafe { sys::ray_last_error_kind() };
+        let mid_gauge_kind = sys::last_error_kind();
+        let mid_gauge_msg = sys::last_error();
+        unsafe { sys::ray_metric_destroy(drain_gauge) };
 
         let drop_ms = drop_thread.join().expect("join drop thread");
         println!("  DROP_MS={:.2}", drop_ms);
@@ -630,6 +791,29 @@ fn main() {
             }
             other => fail(format!(
                 "排空进行中的 ray_put_xlang 错误消息不符: {:?}",
+                other
+            )),
+        }
+
+        if mid_gauge_rc != -1 {
+            fail(format!(
+                "排空进行中的 ray_gauge_set 未被拒绝（rc={}）",
+                mid_gauge_rc
+            ));
+        }
+        if mid_gauge_raw_kind != RAY_ERROR_KIND_RUNTIME_RAW || mid_gauge_kind != ErrorKind::Runtime
+        {
+            fail(format!(
+                "排空进行中的 ray_gauge_set 错误类别不符: raw={} ({:?}), msg={:?}",
+                mid_gauge_raw_kind, mid_gauge_kind, mid_gauge_msg
+            ));
+        }
+        match mid_gauge_msg {
+            Some(ref text) if text.contains(EXPECTED_CLOSING_MESSAGE) => {
+                println!("  排空期间 ray_gauge_set 被拒绝: Runtime({})", text);
+            }
+            other => fail(format!(
+                "排空进行中的 ray_gauge_set 错误消息不符: {:?}",
                 other
             )),
         }

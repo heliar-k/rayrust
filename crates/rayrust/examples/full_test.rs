@@ -261,6 +261,134 @@ async fn main() {
     drop(payload_1m);
     println!("1 MiB put_xlang + Rust/Python reads verified ✓");
 
+    // ── 10. Metrics (Driver, Remote Task, MetricActor) ─────
+    println!("\n--- 10. Metrics ---");
+    assert!(matches!(
+        Gauge::new("1invalid_driver_metric", "bad", "u", &[]),
+        Err(RayError::Ffi(_))
+    ));
+    assert!(matches!(
+        Histogram::new("driver_bad_hist", "bad", "ms", &[5.0, 1.0], &[]),
+        Err(RayError::Ffi(_))
+    ));
+
+    let drv_gauge =
+        Gauge::new("driver_active_jobs", "Active driver jobs", "jobs", &["env"]).unwrap();
+    let drv_counter = Counter::new(
+        "driver_requests_total",
+        "Total driver requests",
+        "count",
+        &["env"],
+    )
+    .unwrap();
+    let drv_hist = Histogram::new(
+        "driver_latency_ms",
+        "Driver operation latency",
+        "ms",
+        &[1.0, 5.0, 10.0, 50.0],
+        &["env"],
+    )
+    .unwrap();
+    let drv_sum = Sum::new("driver_payload_bytes", "Payload delta", "bytes", &["env"]).unwrap();
+
+    let drv_tags = &[("env", "cluster_e2e")];
+    drv_gauge.set(4.0, drv_tags).expect("driver gauge.set");
+    drv_counter.inc(1.0, drv_tags).expect("driver counter.inc");
+    drv_hist
+        .observe(7.5, drv_tags)
+        .expect("driver hist.observe");
+    drv_sum.record(128.0, drv_tags).expect("driver sum.record");
+    assert!(matches!(
+        drv_counter.inc(-1.0, drv_tags),
+        Err(RayError::Ffi(_))
+    ));
+    assert!(matches!(
+        drv_gauge.set(f64::NAN, drv_tags),
+        Err(RayError::Ffi(_))
+    ));
+    println!("Driver metrics recorded & invalid inputs rejected ✓");
+
+    let worker_val = rayrust::serialize(&12.5f64).unwrap();
+    let worker_metric_ref: ObjectRef<String> = ray
+        .task_call(
+            "record_worker_metrics",
+            &[&worker_val],
+            &[],
+            &TaskOptions::new(),
+        )
+        .expect("submit record_worker_metrics")
+        .cast();
+    let worker_metric_out = worker_metric_ref
+        .get_async()
+        .await
+        .expect("record_worker_metrics result");
+    assert_eq!(worker_metric_out, "ok:rayrust_worker_calls_total:12.50");
+    println!("Remote task record_worker_metrics: {} ✓", worker_metric_out);
+
+    let prefix_arg = rayrust::serialize(&"cluster_actor".to_string()).unwrap();
+    let metric_actor = ray
+        .actor_create(
+            "__rayrust_actor_factory_metricactor",
+            &[&prefix_arg],
+            &ActorOptions::new(),
+        )
+        .expect("create MetricActor");
+
+    for (delta, expected_total) in [(10.5f64, 10.5f64), (-3.0f64, 7.5f64), (4.25f64, 11.75f64)] {
+        let arg_d = rayrust::serialize(&delta).unwrap();
+        let step_ref: ObjectRef<f64> = ray
+            .actor_call(
+                metric_actor.id(),
+                "__rayrust_actor_factory_metricactor::record_step",
+                &[&arg_d],
+                &[],
+            )
+            .expect("call MetricActor::record_step")
+            .cast();
+        let got_total = step_ref.get_async().await.expect("record_step result");
+        assert!(
+            (got_total - expected_total).abs() < 1e-9,
+            "MetricActor total mismatch: got {got_total}, expected {expected_total}"
+        );
+    }
+
+    // 验证 MetricActor 内错误输入拒绝且 actor 继续可用
+    for bad_inc in [-2.0f64, f64::NAN] {
+        let arg_bad = rayrust::serialize(&bad_inc).unwrap();
+        let rej_ref: ObjectRef<Result<(), String>> = ray
+            .actor_call(
+                metric_actor.id(),
+                "__rayrust_actor_factory_metricactor::try_counter_inc",
+                &[&arg_bad],
+                &[],
+            )
+            .expect("call MetricActor::try_counter_inc")
+            .cast();
+        let rej_res = rej_ref.get_async().await.expect("try_counter_inc result");
+        assert!(
+            rej_res.is_err(),
+            "MetricActor::try_counter_inc({bad_inc}) should be rejected"
+        );
+    }
+
+    let arg_final = rayrust::serialize(&1.25f64).unwrap();
+    let final_ref: ObjectRef<f64> = ray
+        .actor_call(
+            metric_actor.id(),
+            "__rayrust_actor_factory_metricactor::record_step",
+            &[&arg_final],
+            &[],
+        )
+        .expect("call MetricActor::record_step after rejection")
+        .cast();
+    let final_total = final_ref.get_async().await.expect("final record_step");
+    assert!((final_total - 13.0).abs() < 1e-9);
+    let _ = ray.kill_actor(&metric_actor, true);
+    println!(
+        "MetricActor multi-step recording & input rejection verified (total={}) ✓",
+        final_total
+    );
+
     // ── Shutdown (automatic on drop) ──────────────────────
     println!("\n--- Shutdown ---");
     drop(ray);

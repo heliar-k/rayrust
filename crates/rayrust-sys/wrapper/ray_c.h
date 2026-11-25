@@ -214,7 +214,7 @@ void ray_shutdown(void);
 /// 或 `CoreWorkerProcess::EnsureInitialized`（同文件 `:842-856`）里调用 `QuickExit()`
 /// （`_Exit(1)`，`src/ray/util/process.cc:845-848`）终止进程，`RAY_CATCH` 无法捕获。
 ///
-/// - 关闭期间被拒绝的入口（共 25 个）：`ray_put`、`ray_put_xlang`、`ray_get`、
+/// - 关闭期间被拒绝的入口（共 29 个）：`ray_put`、`ray_put_xlang`、`ray_get`、
 ///   `ray_wait`、`ray_get_many`、`ray_task_call_with_options`、`ray_task_call_python`、
 ///   `ray_task_call_python_with_options`、`ray_actor_create_with_options`、
 ///   `ray_actor_create_python_with_options`、`ray_actor_call`、
@@ -223,12 +223,15 @@ void ray_shutdown(void);
 ///   `ray_placement_group_remove`、`ray_placement_group_wait_ready`、
 ///   `ray_placement_group_get_all`、`ray_placement_group_get_by_id`、
 ///   `ray_placement_group_get_by_name`、`ray_was_current_actor_restarted`、
-///   `ray_get_namespace`、`ray_get_actor`、`ray_cancel`。被拒绝时返回各自的空值或
-///   错误码，错误类别为 `RAY_ERROR_KIND_RUNTIME`，`ray_last_error_bytes()` 消息原文为：
+///   `ray_get_namespace`、`ray_get_actor`、`ray_cancel`、`ray_gauge_set`、
+///   `ray_counter_inc`、`ray_histogram_observe`、`ray_metric_record`。被拒绝时返回
+///   各自的空值或错误码，错误类别为 `RAY_ERROR_KIND_RUNTIME`，`ray_last_error_bytes()`
+///   消息原文为：
 ///   `the Ray runtime is shutting down or has shut down: calls are refused until a new runtime is initialized`。
-/// - 判定次序：名字、id 宽度与引用参数 id 在取运行时之前检查，所以它们与关闭状态同时
-///   不合法时报的是参数错误；选项 JSON 以及其中 `placement_group_id` 的查表在取运行时
-///   之后（查表需要运行时），所以畸形 options JSON 与正在关闭同时出现时报关闭错误。
+/// - 判定次序：名字、id 宽度、引用参数 id 以及指标录制入口的句柄、指标种类、数值与
+///   标签键值在取运行时之前检查，所以它们与关闭状态同时不合法时报的是参数错误；选项
+///   JSON 以及其中 `placement_group_id` 的查表在取运行时之后（查表需要运行时），所以
+///   畸形 options JSON 与正在关闭同时出现时报关闭错误。
 ///   本地模式判定在取运行时与关闭检查之后，所以关闭期间的本地模式调用报的是关闭错误。
 ///   从未初始化过运行时时报 `Ray runtime is not initialized`
 ///   （`RAY_ERROR_KIND_GENERIC`）。
@@ -255,8 +258,10 @@ void ray_shutdown(void);
 /// - 不被拒绝的入口：`ray_is_local_mode` 不被拒绝（无错误通道，`IsLocalMode()` 是对
 ///   运行时对象的 C++ virtual 调用，关闭之后照常可答）；`ray_register_function` 与
 ///   `ray_register_member_function` 只写 `FunctionManager`，不访问运行时；
-///   `ray_add_local_reference` 与 `ray_remove_local_reference` 在关闭开始后直接返回 0
-///   且不记录错误。
+///   `ray_gauge_create`、`ray_counter_create`、`ray_histogram_create`、
+///   `ray_sum_create`、`ray_metric_get_name` 与 `ray_metric_destroy` 只构造、读取或
+///   释放 `ray::Metric` 对象，不访问 `RayRuntime`；`ray_add_local_reference` 与
+///   `ray_remove_local_reference` 在关闭开始后直接返回 0 且不记录错误。
 
 // ─── Object Store ─────────────────────────────────────────────
 
@@ -1192,6 +1197,105 @@ ray_bytes_t *ray_get_many(const ray_bytes_t *ids, size_t count, int timeout_ms);
 /// Free an array returned by ray_get_many.
 void ray_free_bytes_array(ray_bytes_t *array, size_t count);
 
+// ─── Metrics ──────────────────────────────────────────────────
+
+/// Opaque handle owning a C++ `ray::Metric` subclass instance (`ray::Gauge`,
+/// `ray::Counter`, `ray::Histogram`, or `ray::Sum` from `<ray/api/metric.h>`).
+typedef struct ray_metric_s ray_metric_t;
+
+/// A single `(key, value)` tag pair passed to metric recording entries.
+typedef struct {
+    ray_bytes_t key;
+    ray_bytes_t value;
+} ray_metric_tag_t;
+
+/// Create a `ray::Gauge`, `ray::Counter`, `ray::Histogram`, or `ray::Sum` metric.
+///
+/// - `name` must be non-empty, free of interior NUL bytes, and match
+///   `^[a-zA-Z_:][a-zA-Z0-9_:]*$`, the exact pattern enforced by
+///   `ray::stats::Metric::Metric` (`src/ray/stats/metric.cc:86-109`). Checking it
+///   before entering C++ prevents `RAY_CHECK_WITH_DISPLAY` (`:95-100`) from
+///   calling `std::abort()`.
+/// - `description` and `unit` may be empty; when `len > 0`, `data` must be
+///   non-NULL and free of interior NUL bytes.
+/// - `tag_keys` (`tag_key_count` entries; `tag_keys` may be NULL when
+///   `tag_key_count == 0`): each key must be non-empty, free of interior NUL
+///   bytes, and pairwise distinct.
+/// - For `ray_histogram_create`, `boundaries` (`boundary_count` entries) must be
+///   non-empty (`boundary_count >= 1` and `boundaries != NULL`), finite, and
+///   strictly monotonically increasing (`boundaries[i - 1] < boundaries[i]`).
+///
+/// Construction does not access `RayRuntime` and is unaffected by the closing
+/// gate, allowing static initialization before `ray_init`.
+/// Returns an owned `ray_metric_t *` freed via `ray_metric_destroy`, or NULL on
+/// error with `RAY_ERROR_KIND_GENERIC` recorded in `ray_last_error_bytes()`.
+ray_metric_t *ray_gauge_create(ray_bytes_t name,
+                               ray_bytes_t description,
+                               ray_bytes_t unit,
+                               const ray_bytes_t *tag_keys,
+                               size_t tag_key_count);
+ray_metric_t *ray_counter_create(ray_bytes_t name,
+                                 ray_bytes_t description,
+                                 ray_bytes_t unit,
+                                 const ray_bytes_t *tag_keys,
+                                 size_t tag_key_count);
+ray_metric_t *ray_histogram_create(ray_bytes_t name,
+                                   ray_bytes_t description,
+                                   ray_bytes_t unit,
+                                   const double *boundaries,
+                                   size_t boundary_count,
+                                   const ray_bytes_t *tag_keys,
+                                   size_t tag_key_count);
+ray_metric_t *ray_sum_create(ray_bytes_t name,
+                             ray_bytes_t description,
+                             ray_bytes_t unit,
+                             const ray_bytes_t *tag_keys,
+                             size_t tag_key_count);
+
+/// Return the metric name from `ray::Metric::GetName()`.
+/// Unaffected by the closing gate. Caller frees the returned buffer via
+/// `ray_free_bytes`. Returns `{NULL, 0}` when `metric` is NULL or allocation fails.
+ray_bytes_t ray_metric_get_name(const ray_metric_t *metric);
+
+/// Destroy a metric handle created by `ray_*_create`. Passing NULL is a no-op.
+/// Unaffected by the closing gate.
+void ray_metric_destroy(ray_metric_t *metric);
+
+/// Record a value on a metric handle.
+///
+/// Validation runs before `runtime_for_call()`:
+/// 1. `metric` must be non-NULL, and type-specific entries require the matching
+///    metric kind (`ray_gauge_set` -> `Gauge`, `ray_counter_inc` -> `Counter`,
+///    `ray_histogram_observe` -> `Histogram`; `ray_metric_record` accepts all four).
+/// 2. `value` must be finite (`std::isfinite(value)`), and for `Counter` handles
+///    (both `ray_counter_inc` and `ray_metric_record`) `value >= 0.0`.
+/// 3. `tags` (`tag_count` entries; `tags` may be NULL when `tag_count == 0`): each
+///    `key` must be non-empty and free of interior NUL bytes; each `value` must be
+///    free of interior NUL bytes (empty `value` is allowed). Repeated keys within
+///    one slice keep the last value (`insert_or_assign`).
+/// 4. `runtime_for_call()` requires an initialized runtime and rejects calls while
+///    `ray_shutdown` is running or has completed (`RAY_ERROR_KIND_RUNTIME`, because
+///    `ray::stats::Shutdown` at `src/ray/stats/stats.h:133-150` stops the exporter
+///    threads without resetting `StatsConfig::is_stats_disabled_`).
+///
+/// Returns 0 on success, -1 on error.
+int ray_gauge_set(ray_metric_t *metric,
+                  double value,
+                  const ray_metric_tag_t *tags,
+                  size_t tag_count);
+int ray_counter_inc(ray_metric_t *metric,
+                    double value,
+                    const ray_metric_tag_t *tags,
+                    size_t tag_count);
+int ray_histogram_observe(ray_metric_t *metric,
+                          double value,
+                          const ray_metric_tag_t *tags,
+                          size_t tag_count);
+int ray_metric_record(ray_metric_t *metric,
+                      double value,
+                      const ray_metric_tag_t *tags,
+                      size_t tag_count);
+
 // ─── Function Registration ────────────────────────────────────
 
 /// Callback type for a Rust remote function.
@@ -1228,14 +1332,18 @@ void ray_register_member_function(const char *func_name, ray_member_callback_t c
 //
 // Cross-boundary heap ownership uses a single allocator per direction:
 //
-// 1. C -> Rust: Every heap buffer returned by `ray_*` (`ray_bytes_t.data`, the
-//    `ray_bytes_t *` array and each element's `data` from `ray_get_many`, and the
-//    `bool *` array from `ray_wait`) comes from the global C standard library
-//    `malloc` / `realloc` (`std::malloc` in `ray_c.cc`, or `msgpack::sbuffer`
-//    buffers allocated with `::malloc` / `::realloc` in `msgpack/v1/sbuffer.hpp:24-141`
-//    and handed off via `sbuffer::release()` in `ray_get` and `ray_get_many`).
-//    Rust frees them exclusively via `ray_free_bytes`, `ray_free_bytes_array`,
-//    and `ray_free_bools` (all calling `std::free`).
+// 1. C -> Rust: Every heap buffer returned by `ray_*` (`ray_bytes_t.data`
+//    including `ray_metric_get_name`, the `ray_bytes_t *` array and each
+//    element's `data` from `ray_get_many`, and the `bool *` array from `ray_wait`)
+//    comes from the global C standard library `malloc` / `realloc` (`std::malloc`
+//    in `ray_c.cc`, or `msgpack::sbuffer` buffers allocated with `::malloc` /
+//    `::realloc` in `msgpack/v1/sbuffer.hpp:24-141` and handed off via
+//    `sbuffer::release()` in `ray_get` and `ray_get_many`). Rust frees them
+//    exclusively via `ray_free_bytes`, `ray_free_bytes_array`, and `ray_free_bools`
+//    (all calling `std::free`). Opaque `ray_metric_t *` handles are allocated on
+//    the C++ heap by `ray_gauge_create`, `ray_counter_create`,
+//    `ray_histogram_create`, and `ray_sum_create`, and freed exclusively via
+//    `ray_metric_destroy`.
 //
 // 2. Rust -> C: In `ray_callback_result_t` returned by `ray_func_callback_t` and
 //    `ray_member_callback_t`, every non-NULL `data` buffer must be allocated with
