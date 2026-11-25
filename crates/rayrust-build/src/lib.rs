@@ -1,7 +1,7 @@
-//! Build-time Ray C++ SDK locator and opt-in PyPI wheel fetcher.
+//! Build-time Ray C++ SDK locator and opt-in PyPI wheel fetcher (requires Ray >= 2.56.1).
 //!
 //! SDK lookup order:
-//! 1. `RAY_CPP_DIR` (used as given; version is not checked during lookup)
+//! 1. `RAY_CPP_DIR` (probed for minimum supported version `>= 2.56.1`)
 //! 2. Shared cache `<cache_root>/ray-cpp-<version>-<platform>/` (with optional `.sha256` pin file)
 //! 3. `python3` (`ray/cpp` on `sys.path` whose `ray.__version__` equals `RAY_VERSION`)
 //! 4. Opt-in PyPI wheel download (`RAYRUST_DOWNLOAD=1`), verified against `digests.sha256`
@@ -32,7 +32,68 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
-pub const DEFAULT_RAY_VERSION: &str = "2.51.1";
+pub const DEFAULT_RAY_VERSION: &str = "2.56.1";
+pub const MIN_SUPPORTED_RAY_VERSION: &str = "2.56.1";
+pub const MIN_SUPPORTED_RAY_VERSION_TUPLE: (u32, u32, u32) = (2, 56, 1);
+
+pub fn parse_ray_version(raw: &str) -> Result<(u32, u32, u32), String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(format!(
+            "invalid Ray version '{trimmed}': expected '<major>.<minor>.<patch>'"
+        ));
+    }
+
+    let mut parts = trimmed.split('.');
+    let (Some(major_str), Some(minor_str), Some(patch_raw)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return Err(format!(
+            "invalid Ray version '{trimmed}': expected '<major>.<minor>.<patch>'"
+        ));
+    };
+    for extra in parts {
+        if extra.is_empty() {
+            return Err(format!(
+                "invalid Ray version '{trimmed}': empty component after patch version"
+            ));
+        }
+    }
+
+    let parse_component = |s: &str, name: &str| -> Result<u32, String> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!(
+                "invalid Ray version '{trimmed}': expected numeric {name} component, got '{s}'"
+            ));
+        }
+        s.parse::<u32>().map_err(|e| {
+            format!("invalid Ray version '{trimmed}': {name} component '{s}' out of range: {e}")
+        })
+    };
+
+    let major = parse_component(major_str, "major")?;
+    let minor = parse_component(minor_str, "minor")?;
+    let patch_digits_len = patch_raw.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if patch_digits_len == 0 {
+        return Err(format!(
+            "invalid Ray version '{trimmed}': expected numeric patch component, got '{patch_raw}'"
+        ));
+    }
+    let patch = parse_component(&patch_raw[..patch_digits_len], "patch")?;
+
+    Ok((major, minor, patch))
+}
+
+pub fn check_minimum_ray_version(version: &str) -> Result<(), String> {
+    let parsed = parse_ray_version(version)?;
+    if parsed < MIN_SUPPORTED_RAY_VERSION_TUPLE {
+        return Err(format!(
+            "Ray {} is unsupported; rayrust requires Ray >= {MIN_SUPPORTED_RAY_VERSION}",
+            version.trim()
+        ));
+    }
+    Ok(())
+}
 
 const FIX_HINT: &str = "Set RAY_CPP_DIR=/path/to/ray/cpp, install via `pip install ray[cpp]`, \
 or set RAYRUST_DOWNLOAD=1 to download the ray-cpp wheel from PyPI \
@@ -637,15 +698,32 @@ fn resolve_inner(
     report_download_disabled: bool,
 ) -> Result<(Sdk, Source), ResolveFailure> {
     if let Some(ref dir) = args.ray_cpp_dir {
-        return build_sdk(dir, args.ray_version.clone(), None)
-            .map(|sdk| (sdk, Source::Env))
-            .map_err(|reason| {
+        let mut sdk = build_sdk(dir, args.ray_version.clone(), None).map_err(|reason| {
+            ResolveFailure::Fatal(format!(
+                "invalid RAY_CPP_DIR ({}): {reason}. {FIX_HINT}",
+                dir.display()
+            ))
+        })?;
+        if let Some(probed) = probe_sdk_version(&sdk.cpp_dir) {
+            check_minimum_ray_version(&probed).map_err(|err| {
                 ResolveFailure::Fatal(format!(
-                    "invalid RAY_CPP_DIR ({}): {reason}. {FIX_HINT}",
+                    "unsupported RAY_CPP_DIR ({}): {err}",
                     dir.display()
                 ))
-            });
+            })?;
+            sdk.version = probed;
+        } else {
+            check_minimum_ray_version(&args.ray_version).map_err(|err| {
+                ResolveFailure::Fatal(format!(
+                    "unsupported RAY_CPP_DIR ({}): {err}",
+                    dir.display()
+                ))
+            })?;
+        }
+        return Ok((sdk, Source::Env));
     }
+
+    check_minimum_ray_version(&args.ray_version).map_err(ResolveFailure::Fatal)?;
 
     let mut checked = Vec::new();
     checked.push("RAY_CPP_DIR: not set".to_string());
@@ -655,6 +733,14 @@ fn resolve_inner(
             let cached = cache_dir(&args.cache_root, &args.ray_version, platform);
             match build_sdk(&cached, args.ray_version.clone(), None) {
                 Ok(mut sdk) => {
+                    if let Some(probed) = probe_sdk_version(&sdk.cpp_dir) {
+                        check_minimum_ray_version(&probed).map_err(|err| {
+                            ResolveFailure::Fatal(format!(
+                                "unsupported cached Ray C++ SDK ({}): {err}",
+                                cached.display()
+                            ))
+                        })?;
+                    }
                     let pin_path = pin_file_path(&args.cache_root, &args.ray_version, platform);
                     sdk.sha256 = read_pin_file(&pin_path).map_err(ResolveFailure::Fatal)?;
                     return Ok((sdk, Source::Cache));
@@ -675,7 +761,17 @@ fn resolve_inner(
                 if version_matches(&installed_ver, &args.ray_version) {
                     let resolved_ver = installed_ver.trim().to_string();
                     match build_sdk(&dir, resolved_ver, None) {
-                        Ok(sdk) => return Ok((sdk, Source::Python)),
+                        Ok(sdk) => {
+                            if let Some(probed) = probe_sdk_version(&sdk.cpp_dir) {
+                                check_minimum_ray_version(&probed).map_err(|err| {
+                                    ResolveFailure::Fatal(format!(
+                                        "unsupported Python Ray C++ SDK ({}): {err}",
+                                        dir.display()
+                                    ))
+                                })?;
+                            }
+                            return Ok((sdk, Source::Python));
+                        }
                         Err(e) => checked.push(format!("python3 ({}): {e}", py.display())),
                     }
                 } else {
@@ -727,6 +823,7 @@ fn unsupported_platform_panic(resolve_err: &str) -> String {
 }
 
 pub fn download(args: &Args, platform: &str) -> Result<Sdk, String> {
+    check_minimum_ray_version(&args.ray_version)?;
     let target_dir = cache_dir(&args.cache_root, &args.ray_version, platform);
     let pin_path = pin_file_path(&args.cache_root, &args.ray_version, platform);
     fs::create_dir_all(&args.cache_root).map_err(|e| {
@@ -768,6 +865,7 @@ fn download_into(
     target_dir: &Path,
     pin_path: &Path,
 ) -> Result<Sdk, String> {
+    check_minimum_ray_version(version)?;
     let index_json = fetch_index(version)?;
     let wheel = select_wheel(&index_json, version, platform)?;
 
@@ -901,6 +999,7 @@ pub struct Wheel {
 const WHEEL_TAGS: &[&str] = &["py3-none", "cp312-cp312", "cp311-cp311", "cp310-cp310"];
 
 pub fn select_wheel(json: &str, version: &str, platform: &str) -> Result<Wheel, String> {
+    check_minimum_ray_version(version)?;
     let index: PypiIndex = serde_json::from_str(json)
         .map_err(|e| format!("failed to parse PyPI metadata for ray-cpp {version}: {e}"))?;
 
@@ -1008,10 +1107,10 @@ mod tests {
     #[test]
     fn cache_dir_includes_version_and_platform() {
         let root = Path::new("cache-root");
-        let dir = cache_dir(root, "2.51.1", "manylinux2014_x86_64");
+        let dir = cache_dir(root, "2.56.1", "manylinux2014_x86_64");
         assert_eq!(
             dir,
-            PathBuf::from("cache-root/ray-cpp-2.51.1-manylinux2014_x86_64")
+            PathBuf::from("cache-root/ray-cpp-2.56.1-manylinux2014_x86_64")
         );
     }
 
@@ -1233,65 +1332,65 @@ mod tests {
 
     #[test]
     fn version_matches_cases() {
-        assert!(version_matches("2.51.1", "2.51.1"));
-        assert!(!version_matches("2.51.1", "2.50.0"));
-        assert!(!version_matches("", "2.51.1"));
-        assert!(!version_matches("2.51.1", ""));
+        assert!(version_matches("2.56.1", "2.56.1"));
+        assert!(!version_matches("2.56.1", "2.58.2"));
+        assert!(!version_matches("", "2.56.1"));
+        assert!(!version_matches("2.56.1", ""));
         assert!(!version_matches("", ""));
-        assert!(!version_matches("   ", "2.51.1"));
-        assert!(version_matches("  2.51.1\n", "2.51.1  "));
+        assert!(!version_matches("   ", "2.56.1"));
+        assert!(version_matches("  2.56.1\n", "2.56.1  "));
     }
 
     #[test]
     fn select_wheel_url_matches_py3_none_and_cp_wheels() {
-        let pypi_255 = concat!(
+        let pypi_2561 = concat!(
             r#"{"urls":["#,
-            r#"{"filename":"ray_cpp-2.55.0-py3-none-macosx_12_0_arm64.whl","url":"https://files.pythonhosted.org/packages/8f/38/640ada368f4d6554ffa5ed0719ee89d8787d1309448a39046aec44f5a3bc/ray_cpp-2.55.0-py3-none-macosx_12_0_arm64.whl","digests":{"sha256":"129e3862fbf6938c670c3b1bb91fe01d6001287c12cb1787750fec989cee434d"}},"#,
-            r#"{"filename":"ray_cpp-2.55.0-py3-none-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/61/64/4de4ad58dd50532aa2774462af8531395af55ff54c19e6d270c643611823/ray_cpp-2.55.0-py3-none-manylinux2014_x86_64.whl","digests":{"sha256":"fabf15f1403cfb3b4cc707b21eaaf7b80081763386393a87f9e392dd137c5849"}}"#,
+            r#"{"filename":"ray_cpp-2.56.1-py3-none-macosx_12_0_arm64.whl","url":"https://files.pythonhosted.org/packages/mac/ray_cpp-2.56.1-py3-none-macosx_12_0_arm64.whl","digests":{"sha256":"129e3862fbf6938c670c3b1bb91fe01d6001287c12cb1787750fec989cee434d"}},"#,
+            r#"{"filename":"ray_cpp-2.56.1-py3-none-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/linux/ray_cpp-2.56.1-py3-none-manylinux2014_x86_64.whl","digests":{"sha256":"fabf15f1403cfb3b4cc707b21eaaf7b80081763386393a87f9e392dd137c5849"}}"#,
             r#"]}"#,
         );
-        let w_255 = select_wheel(pypi_255, "2.55.0", "manylinux2014_x86_64").unwrap();
+        let w_2561 = select_wheel(pypi_2561, "2.56.1", "manylinux2014_x86_64").unwrap();
         assert_eq!(
-            w_255,
+            w_2561,
             Wheel {
-                filename: "ray_cpp-2.55.0-py3-none-manylinux2014_x86_64.whl".to_string(),
-                url: "https://files.pythonhosted.org/packages/61/64/4de4ad58dd50532aa2774462af8531395af55ff54c19e6d270c643611823/ray_cpp-2.55.0-py3-none-manylinux2014_x86_64.whl".to_string(),
+                filename: "ray_cpp-2.56.1-py3-none-manylinux2014_x86_64.whl".to_string(),
+                url: "https://files.pythonhosted.org/packages/linux/ray_cpp-2.56.1-py3-none-manylinux2014_x86_64.whl".to_string(),
                 sha256: "fabf15f1403cfb3b4cc707b21eaaf7b80081763386393a87f9e392dd137c5849".to_string(),
             }
         );
 
-        let pypi_260 = concat!(
+        let pypi_2601 = concat!(
             r#"{"urls":["#,
-            r#"{"filename":"ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/97/e0/099d1ea4558d3d7115a0b4143f25c20830d36dfd3e0f8200868d63a2aadf/ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl","digests":{"sha256":"43433cf59e2c5f41c0a4b2dbe3aa87a664a8ed1f00cbccf06967fd9819e1dac0"}}"#,
+            r#"{"filename":"ray_cpp-2.60.1-py3-none-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/2601/ray_cpp-2.60.1-py3-none-manylinux2014_x86_64.whl","digests":{"sha256":"43433cf59e2c5f41c0a4b2dbe3aa87a664a8ed1f00cbccf06967fd9819e1dac0"}}"#,
             r#"]}"#,
         );
-        let w_260 = select_wheel(pypi_260, "2.60.0", "manylinux2014_x86_64").unwrap();
+        let w_2601 = select_wheel(pypi_2601, "2.60.1", "manylinux2014_x86_64").unwrap();
         assert_eq!(
-            w_260,
+            w_2601,
             Wheel {
-                filename: "ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl".to_string(),
-                url: "https://files.pythonhosted.org/packages/97/e0/099d1ea4558d3d7115a0b4143f25c20830d36dfd3e0f8200868d63a2aadf/ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl".to_string(),
+                filename: "ray_cpp-2.60.1-py3-none-manylinux2014_x86_64.whl".to_string(),
+                url: "https://files.pythonhosted.org/packages/2601/ray_cpp-2.60.1-py3-none-manylinux2014_x86_64.whl".to_string(),
                 sha256: "43433cf59e2c5f41c0a4b2dbe3aa87a664a8ed1f00cbccf06967fd9819e1dac0".to_string(),
             }
         );
 
-        let pypi_2511 = concat!(
+        let pypi_2582_cp = concat!(
             r#"{"urls":["#,
-            r#"{"filename":"ray_cpp-2.51.1-cp310-cp310-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/cp310/ray_cpp-2.51.1-cp310-cp310-manylinux2014_x86_64.whl","digests":{"sha256":"0000000000000000000000000000000000000000000000000000000000000310"}},"#,
-            r#"{"filename":"ray_cpp-2.51.1-cp312-cp312-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/1c/84/c7aecb7867ca3b85dbcfa20808f698727c35163b76ad2baae94fcad9531c/ray_cpp-2.51.1-cp312-cp312-manylinux2014_x86_64.whl","digests":{"sha256":"9b9fd02af0e750a3dd8c4702d82551e83393d89fda9baa75c2513d22b079a9f6"}}"#,
+            r#"{"filename":"ray_cpp-2.58.2-cp310-cp310-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/cp310/ray_cpp-2.58.2-cp310-cp310-manylinux2014_x86_64.whl","digests":{"sha256":"0000000000000000000000000000000000000000000000000000000000000310"}},"#,
+            r#"{"filename":"ray_cpp-2.58.2-cp312-cp312-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/cp312/ray_cpp-2.58.2-cp312-cp312-manylinux2014_x86_64.whl","digests":{"sha256":"9b9fd02af0e750a3dd8c4702d82551e83393d89fda9baa75c2513d22b079a9f6"}}"#,
             r#"]}"#,
         );
-        let w_2511 = select_wheel(pypi_2511, "2.51.1", "manylinux2014_x86_64").unwrap();
+        let w_2582 = select_wheel(pypi_2582_cp, "2.58.2", "manylinux2014_x86_64").unwrap();
         assert_eq!(
-            w_2511,
+            w_2582,
             Wheel {
-                filename: "ray_cpp-2.51.1-cp312-cp312-manylinux2014_x86_64.whl".to_string(),
-                url: "https://files.pythonhosted.org/packages/1c/84/c7aecb7867ca3b85dbcfa20808f698727c35163b76ad2baae94fcad9531c/ray_cpp-2.51.1-cp312-cp312-manylinux2014_x86_64.whl".to_string(),
+                filename: "ray_cpp-2.58.2-cp312-cp312-manylinux2014_x86_64.whl".to_string(),
+                url: "https://files.pythonhosted.org/packages/cp312/ray_cpp-2.58.2-cp312-cp312-manylinux2014_x86_64.whl".to_string(),
                 sha256: "9b9fd02af0e750a3dd8c4702d82551e83393d89fda9baa75c2513d22b079a9f6".to_string(),
             }
         );
 
-        let err = select_wheel(pypi_260, "2.60.0", "win_amd64").unwrap_err();
+        let err = select_wheel(pypi_2601, "2.60.1", "win_amd64").unwrap_err();
         assert!(err.contains("py3-none"), "err was: {err}");
     }
 
@@ -1299,14 +1398,14 @@ mod tests {
     fn select_wheel_tag_priority_falls_back_to_cp312_when_py3_none_absent() {
         let only_cp = concat!(
             r#"{"urls":["#,
-            r#"{"filename":"ray_cpp-2.51.1-cp311-cp311-manylinux2014_x86_64.whl","url":"https://example.invalid/cp311.whl","digests":{"sha256":"1111111111111111111111111111111111111111111111111111111111111111"}},"#,
-            r#"{"filename":"ray_cpp-2.51.1-cp312-cp312-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/1c/84/c7aecb7867ca3b85dbcfa20808f698727c35163b76ad2baae94fcad9531c/ray_cpp-2.51.1-cp312-cp312-manylinux2014_x86_64.whl","digests":{"sha256":"9b9fd02af0e750a3dd8c4702d82551e83393d89fda9baa75c2513d22b079a9f6"}}"#,
+            r#"{"filename":"ray_cpp-2.58.2-cp311-cp311-manylinux2014_x86_64.whl","url":"https://example.invalid/cp311.whl","digests":{"sha256":"1111111111111111111111111111111111111111111111111111111111111111"}},"#,
+            r#"{"filename":"ray_cpp-2.58.2-cp312-cp312-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/cp312/ray_cpp-2.58.2-cp312-cp312-manylinux2014_x86_64.whl","digests":{"sha256":"9b9fd02af0e750a3dd8c4702d82551e83393d89fda9baa75c2513d22b079a9f6"}}"#,
             r#"]}"#,
         );
-        let selected = select_wheel(only_cp, "2.51.1", "manylinux2014_x86_64").unwrap();
+        let selected = select_wheel(only_cp, "2.58.2", "manylinux2014_x86_64").unwrap();
         assert_eq!(
             selected.filename,
-            "ray_cpp-2.51.1-cp312-cp312-manylinux2014_x86_64.whl"
+            "ray_cpp-2.58.2-cp312-cp312-manylinux2014_x86_64.whl"
         );
         assert_eq!(
             selected.sha256,
@@ -1315,40 +1414,40 @@ mod tests {
 
         let both_py3_and_cp = concat!(
             r#"{"urls":["#,
-            r#"{"filename":"ray_cpp-2.60.0-cp312-cp312-manylinux2014_x86_64.whl","url":"https://example.invalid/cp312.whl","digests":{"sha256":"2222222222222222222222222222222222222222222222222222222222222222"}},"#,
-            r#"{"filename":"ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/97/e0/099d1ea4558d3d7115a0b4143f25c20830d36dfd3e0f8200868d63a2aadf/ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl","digests":{"sha256":"43433cf59e2c5f41c0a4b2dbe3aa87a664a8ed1f00cbccf06967fd9819e1dac0"}}"#,
+            r#"{"filename":"ray_cpp-2.60.1-cp312-cp312-manylinux2014_x86_64.whl","url":"https://example.invalid/cp312.whl","digests":{"sha256":"2222222222222222222222222222222222222222222222222222222222222222"}},"#,
+            r#"{"filename":"ray_cpp-2.60.1-py3-none-manylinux2014_x86_64.whl","url":"https://files.pythonhosted.org/packages/2601/ray_cpp-2.60.1-py3-none-manylinux2014_x86_64.whl","digests":{"sha256":"43433cf59e2c5f41c0a4b2dbe3aa87a664a8ed1f00cbccf06967fd9819e1dac0"}}"#,
             r#"]}"#,
         );
-        let preferred = select_wheel(both_py3_and_cp, "2.60.0", "manylinux2014_x86_64").unwrap();
+        let preferred = select_wheel(both_py3_and_cp, "2.60.1", "manylinux2014_x86_64").unwrap();
         assert_eq!(
             preferred.filename,
-            "ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl"
+            "ray_cpp-2.60.1-py3-none-manylinux2014_x86_64.whl"
         );
     }
 
     #[test]
     fn select_wheel_invalid_json_mentions_package_and_version() {
-        let err = select_wheel("{not-json", "2.60.0", "manylinux2014_x86_64").unwrap_err();
+        let err = select_wheel("{not-json", "2.60.1", "manylinux2014_x86_64").unwrap_err();
         assert!(
-            err.contains("ray-cpp 2.60.0"),
-            "err should mention 'ray-cpp 2.60.0', got: {err}"
+            err.contains("ray-cpp 2.60.1"),
+            "err should mention 'ray-cpp 2.60.1', got: {err}"
         );
     }
 
     #[test]
     fn select_wheel_missing_sha256_mentions_filename_and_sha256() {
-        let no_digests = r#"{"urls":[{"filename":"ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl","url":"https://example.invalid/w.whl"}]}"#;
-        let err1 = select_wheel(no_digests, "2.60.0", "manylinux2014_x86_64").unwrap_err();
+        let no_digests = r#"{"urls":[{"filename":"ray_cpp-2.60.1-py3-none-manylinux2014_x86_64.whl","url":"https://example.invalid/w.whl"}]}"#;
+        let err1 = select_wheel(no_digests, "2.60.1", "manylinux2014_x86_64").unwrap_err();
         assert!(
-            err1.contains("ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl"),
+            err1.contains("ray_cpp-2.60.1-py3-none-manylinux2014_x86_64.whl"),
             "err was: {err1}"
         );
         assert!(err1.contains("sha256"), "err was: {err1}");
 
-        let empty_sha = r#"{"urls":[{"filename":"ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl","url":"https://example.invalid/w.whl","digests":{"sha256":""}}]}"#;
-        let err2 = select_wheel(empty_sha, "2.60.0", "manylinux2014_x86_64").unwrap_err();
+        let empty_sha = r#"{"urls":[{"filename":"ray_cpp-2.60.1-py3-none-manylinux2014_x86_64.whl","url":"https://example.invalid/w.whl","digests":{"sha256":""}}]}"#;
+        let err2 = select_wheel(empty_sha, "2.60.1", "manylinux2014_x86_64").unwrap_err();
         assert!(
-            err2.contains("ray_cpp-2.60.0-py3-none-manylinux2014_x86_64.whl"),
+            err2.contains("ray_cpp-2.60.1-py3-none-manylinux2014_x86_64.whl"),
             "err was: {err2}"
         );
         assert!(err2.contains("sha256"), "err was: {err2}");
@@ -1411,10 +1510,10 @@ mod tests {
         let cache_root = base.join("cache");
         fs::create_dir_all(&cache_root).expect("create cache_root");
         let host_platform = platform_tag(env::consts::OS, env::consts::ARCH).unwrap();
-        let cached_sdk = cache_dir(&cache_root, "2.60.0", host_platform);
+        let cached_sdk = cache_dir(&cache_root, "2.60.1", host_platform);
         populate_fake_sdk(&cached_sdk);
 
-        let pin = pin_file_path(&cache_root, "2.60.0", host_platform);
+        let pin = pin_file_path(&cache_root, "2.60.1", host_platform);
         let digest = "43433cf59e2c5f41c0a4b2dbe3aa87a664a8ed1f00cbccf06967fd9819e1dac0";
         write_pin_file(&pin, digest, 4242).expect("write pin file");
         assert_eq!(fs::read_to_string(&pin).unwrap(), format!("{digest}\n"));
@@ -1422,14 +1521,14 @@ mod tests {
 
         let args = Args {
             ray_cpp_dir: None,
-            ray_version: "2.60.0".to_string(),
+            ray_version: "2.60.1".to_string(),
             cache_root: cache_root.clone(),
             python3: None,
             download: false,
         };
         let (sdk, source) = resolve(&args).expect("resolve cached sdk with pin");
         assert_eq!(source, Source::Cache);
-        assert_eq!(sdk.version, "2.60.0");
+        assert_eq!(sdk.version, "2.60.1");
         assert_eq!(sdk.sha256.as_deref(), Some(digest));
 
         fs::write(&pin, "deadbeef\n").expect("corrupt pin file");
@@ -1466,7 +1565,7 @@ mod tests {
         let base = test_case_dir("require_hint");
         let args = Args {
             ray_cpp_dir: None,
-            ray_version: "2.60.0".to_string(),
+            ray_version: "2.60.1".to_string(),
             cache_root: base.join("empty-cache"),
             python3: None,
             download: false,
@@ -1521,7 +1620,7 @@ mod tests {
         let base = test_case_dir("download_disabled_and_warnings");
         let disabled_args = Args {
             ray_cpp_dir: None,
-            ray_version: "2.60.0".to_string(),
+            ray_version: "2.60.1".to_string(),
             cache_root: base.join("empty-cache"),
             python3: None,
             download: false,
@@ -1529,7 +1628,7 @@ mod tests {
         let err_disabled = resolve(&disabled_args).unwrap_err();
         assert!(
             err_disabled.contains(
-                "download: disabled (set RAYRUST_DOWNLOAD=1 to download ray-cpp 2.60.0 from PyPI)"
+                "download: disabled (set RAYRUST_DOWNLOAD=1 to download ray-cpp 2.60.1 from PyPI)"
             ),
             "err was: {err_disabled}"
         );
@@ -1550,7 +1649,7 @@ mod tests {
             format_warning(
                 &Sdk {
                     cpp_dir: dir.clone(),
-                    version: "2.51.1".to_string(),
+                    version: "2.56.1".to_string(),
                     sha256: None,
                 },
                 Source::Env,
@@ -1561,48 +1660,48 @@ mod tests {
             format_warning(
                 &Sdk {
                     cpp_dir: dir.clone(),
-                    version: "2.60.0".to_string(),
+                    version: "2.60.1".to_string(),
                     sha256: None,
                 },
                 Source::Cache,
             ),
-            "cargo:warning=Using Ray C++ SDK at /opt/ray/cpp (from cache, Ray 2.60.0)"
+            "cargo:warning=Using Ray C++ SDK at /opt/ray/cpp (from cache, Ray 2.60.1)"
         );
         assert_eq!(
             format_warning(
                 &Sdk {
                     cpp_dir: dir.clone(),
-                    version: "2.60.0".to_string(),
+                    version: "2.60.1".to_string(),
                     sha256: Some(digest.to_string()),
                 },
                 Source::Cache,
             ),
             format!(
-                "cargo:warning=Using Ray C++ SDK at /opt/ray/cpp (from cache, Ray 2.60.0, sha256 {digest})"
+                "cargo:warning=Using Ray C++ SDK at /opt/ray/cpp (from cache, Ray 2.60.1, sha256 {digest})"
             )
         );
         assert_eq!(
             format_warning(
                 &Sdk {
                     cpp_dir: dir.clone(),
-                    version: "2.51.1".to_string(),
+                    version: "2.56.1".to_string(),
                     sha256: None,
                 },
                 Source::Python,
             ),
-            "cargo:warning=Using Ray C++ SDK at /opt/ray/cpp (from python3, Ray 2.51.1)"
+            "cargo:warning=Using Ray C++ SDK at /opt/ray/cpp (from python3, Ray 2.56.1)"
         );
         assert_eq!(
             format_warning(
                 &Sdk {
                     cpp_dir: dir,
-                    version: "2.60.0".to_string(),
+                    version: "2.60.1".to_string(),
                     sha256: Some(digest.to_string()),
                 },
                 Source::Download,
             ),
             format!(
-                "cargo:warning=Using Ray C++ SDK at /opt/ray/cpp (from download, Ray 2.60.0, sha256 {digest})"
+                "cargo:warning=Using Ray C++ SDK at /opt/ray/cpp (from download, Ray 2.60.1, sha256 {digest})"
             )
         );
     }
@@ -1711,18 +1810,18 @@ mod tests {
 
         // Fallback to ../_version.py with double and single quotes.
         let version_py = ray_pkg.join("_version.py");
-        fs::write(&version_py, "commit = \"abc\"\nversion = \"2.60.0\"\n")
+        fs::write(&version_py, "commit = \"abc\"\nversion = \"2.60.1\"\n")
             .expect("write _version.py");
-        assert_eq!(probe_sdk_version(&cpp_dir).as_deref(), Some("2.60.0"));
+        assert_eq!(probe_sdk_version(&cpp_dir).as_deref(), Some("2.60.1"));
 
-        fs::write(&version_py, "version = '2.49.0'\n").expect("write single-quoted _version.py");
-        assert_eq!(probe_sdk_version(&cpp_dir).as_deref(), Some("2.49.0"));
+        fs::write(&version_py, "version = '2.56.1'\n").expect("write single-quoted _version.py");
+        assert_eq!(probe_sdk_version(&cpp_dir).as_deref(), Some("2.56.1"));
 
         // Valid ELF64 .symtab takes priority over ../_version.py.
-        let elf_bytes = build_minimal_elf64_with_kray_version("2.55.0");
+        let elf_bytes = build_minimal_elf64_with_kray_version("2.58.2");
         let so_path = cpp_dir.join("lib").join("libray_api.so");
         fs::write(&so_path, &elf_bytes).expect("write minimal ELF64");
-        assert_eq!(probe_sdk_version(&cpp_dir).as_deref(), Some("2.55.0"));
+        assert_eq!(probe_sdk_version(&cpp_dir).as_deref(), Some("2.58.2"));
 
         // Truncated ELF prefixes fall back cleanly without panicking.
         let _ = fs::remove_file(&version_py);
@@ -1743,5 +1842,170 @@ mod tests {
                 assert!(!probed.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn parse_ray_version_and_check_minimum_ray_version_cases() {
+        assert_eq!(parse_ray_version("2.56.1").unwrap(), (2, 56, 1));
+        assert_eq!(parse_ray_version("  2.58.2\n").unwrap(), (2, 58, 2));
+        assert_eq!(parse_ray_version("2.60.0rc1").unwrap(), (2, 60, 0));
+        assert_eq!(parse_ray_version("2.60.1.post1").unwrap(), (2, 60, 1));
+        assert_eq!(parse_ray_version("3.0.0dev0").unwrap(), (3, 0, 0));
+
+        for malformed in [
+            "",
+            "   ",
+            "2",
+            "2.56",
+            "2.56.",
+            "2.56.rc1",
+            "+2.56.1",
+            "2.56.1.",
+            "2.56.1 foo",
+            "v2.56.1",
+        ] {
+            assert!(
+                parse_ray_version(malformed).is_err(),
+                "expected parse_ray_version({malformed:?}) to fail"
+            );
+            assert!(
+                check_minimum_ray_version(malformed).is_err(),
+                "expected check_minimum_ray_version({malformed:?}) to fail"
+            );
+        }
+
+        for unsupported in ["1.13.0", "2.49.0", "2.51.1", "2.55.0", "2.56.0"] {
+            let err = check_minimum_ray_version(unsupported).unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "Ray {unsupported} is unsupported; rayrust requires Ray >= {MIN_SUPPORTED_RAY_VERSION}"
+                )
+            );
+        }
+
+        for supported in ["2.56.1", "2.58.2", "2.60.0", "2.60.0rc1", "2.60.1", "3.0.0"] {
+            check_minimum_ray_version(supported)
+                .unwrap_or_else(|e| panic!("expected {supported} to pass, got: {e}"));
+        }
+    }
+
+    #[test]
+    fn resolve_and_download_reject_versions_below_minimum() {
+        let base = test_case_dir("reject_below_minimum");
+        let cache_root = base.join("cache");
+        let host_platform = platform_tag(env::consts::OS, env::consts::ARCH).unwrap();
+
+        // Populate a cache entry for 2.51.1 to prove version rejection happens before cache hit.
+        populate_fake_sdk(&cache_dir(&cache_root, "2.51.1", host_platform));
+
+        for old_ver in ["2.49.0", "2.51.1", "2.55.0", "2.56.0"] {
+            let args = Args {
+                ray_cpp_dir: None,
+                ray_version: old_ver.to_string(),
+                cache_root: cache_root.clone(),
+                python3: None,
+                download: false,
+            };
+            let err = resolve(&args).unwrap_err();
+            assert!(
+                err.contains(&format!(
+                    "Ray {old_ver} is unsupported; rayrust requires Ray >= 2.56.1"
+                )),
+                "unexpected error for RAY_VERSION={old_ver}: {err}"
+            );
+
+            let dl_err = download(&args, host_platform).unwrap_err();
+            assert!(
+                dl_err.contains("requires Ray >= 2.56.1"),
+                "unexpected download error for {old_ver}: {dl_err}"
+            );
+            let wheel_err = select_wheel(r#"{"urls":[]}"#, old_ver, host_platform).unwrap_err();
+            assert!(
+                wheel_err.contains("requires Ray >= 2.56.1"),
+                "unexpected select_wheel error for {old_ver}: {wheel_err}"
+            );
+        }
+
+        // RAY_CPP_DIR with embedded ELF64 _ZL11kRayVersion = "2.51.1" is rejected even when RAY_VERSION is 2.56.1.
+        let elf_old_sdk = base.join("elf-2511").join("ray").join("cpp");
+        populate_fake_sdk(&elf_old_sdk);
+        fs::write(
+            elf_old_sdk.join("lib").join("libray_api.so"),
+            build_minimal_elf64_with_kray_version("2.51.1"),
+        )
+        .expect("write 2.51.1 ELF");
+        let elf_old_args = Args {
+            ray_cpp_dir: Some(elf_old_sdk.clone()),
+            ray_version: DEFAULT_RAY_VERSION.to_string(),
+            cache_root: cache_root.clone(),
+            python3: None,
+            download: false,
+        };
+        let elf_err = resolve(&elf_old_args).unwrap_err();
+        assert!(
+            elf_err.contains("unsupported RAY_CPP_DIR")
+                && elf_err.contains("Ray 2.51.1 is unsupported; rayrust requires Ray >= 2.56.1"),
+            "unexpected error for 2.51.1 ELF RAY_CPP_DIR: {elf_err}"
+        );
+
+        // RAY_CPP_DIR with parent _version.py = "2.56.0" is rejected.
+        let py_old_pkg = base.join("py-2560").join("ray");
+        let py_old_sdk = py_old_pkg.join("cpp");
+        populate_fake_sdk(&py_old_sdk);
+        fs::write(py_old_pkg.join("_version.py"), "version = \"2.56.0\"\n")
+            .expect("write 2.56.0 _version.py");
+        let py_old_args = Args {
+            ray_cpp_dir: Some(py_old_sdk),
+            ray_version: DEFAULT_RAY_VERSION.to_string(),
+            cache_root: cache_root.clone(),
+            python3: None,
+            download: false,
+        };
+        let py_err = resolve(&py_old_args).unwrap_err();
+        assert!(
+            py_err.contains("unsupported RAY_CPP_DIR")
+                && py_err.contains("Ray 2.56.0 is unsupported; rayrust requires Ray >= 2.56.1"),
+            "unexpected error for 2.56.0 _version.py RAY_CPP_DIR: {py_err}"
+        );
+
+        // Stripped RAY_CPP_DIR (probe_sdk_version == None) falls back to checking args.ray_version.
+        let stripped_sdk = base.join("stripped-sdk");
+        populate_fake_sdk(&stripped_sdk);
+        let stripped_old_args = Args {
+            ray_cpp_dir: Some(stripped_sdk),
+            ray_version: "2.51.1".to_string(),
+            cache_root: cache_root.clone(),
+            python3: None,
+            download: false,
+        };
+        let stripped_err = resolve(&stripped_old_args).unwrap_err();
+        assert!(
+            stripped_err.contains("unsupported RAY_CPP_DIR")
+                && stripped_err
+                    .contains("Ray 2.51.1 is unsupported; rayrust requires Ray >= 2.56.1"),
+            "unexpected error for stripped RAY_CPP_DIR with RAY_VERSION=2.51.1: {stripped_err}"
+        );
+
+        // Cache directory named 2.56.1 containing an old 2.51.1 ELF binary is also rejected.
+        let poisoned_cache = cache_dir(&cache_root, "2.56.1", host_platform);
+        populate_fake_sdk(&poisoned_cache);
+        fs::write(
+            poisoned_cache.join("lib").join("libray_api.so"),
+            build_minimal_elf64_with_kray_version("2.51.1"),
+        )
+        .expect("write poisoned cache ELF");
+        let poisoned_args = Args {
+            ray_cpp_dir: None,
+            ray_version: "2.56.1".to_string(),
+            cache_root,
+            python3: None,
+            download: false,
+        };
+        let poisoned_err = resolve(&poisoned_args).unwrap_err();
+        assert!(
+            poisoned_err.contains("Ray 2.51.1 is unsupported; rayrust requires Ray >= 2.56.1"),
+            "unexpected error for poisoned cache: {poisoned_err}"
+        );
     }
 }

@@ -1,5 +1,6 @@
 /// Private ABI declarations, build-time layout assertions, runtime `dlsym`
-/// symbol resolution, and ELF `kRayVersion` verification for `rayrust-sys`.
+/// symbol resolution, and ELF `kRayVersion` verification for `rayrust-sys`
+/// (targets Ray >= 2.56.1).
 ///
 /// Public headers shipped in `ray-cpp` (`include/ray/api.h`, `include/ray/api/*.h`)
 /// omit internal classes (`Buffer`, `ObjectID`, `Status`, `RayObject`,
@@ -176,11 +177,8 @@ static_assert(!std::is_trivially_destructible_v<ray::Status>,
 
 struct __attribute__((visibility("hidden"))) OpaqueObjectReference {};
 
-/// Stand-in for `ray::RayObject` (`src/ray/common/ray_object.h:28-177`, fields
-/// at `:163-176`), whose tail fields after `creation_time_nanos_` are selected
-/// by `build.rs` from `libray_api.so` symbols (112 bytes with enum on Ray 2.49.0
-/// and 2.51.1, 136 bytes with two `std::optional<std::string>` fields on Ray
-/// 2.55.0 and 2.60.0).
+/// Stand-in for `ray::RayObject` (`src/ray/common/ray_object.h`) on Ray >= 2.56.1
+/// (136 bytes with `tensor_transport_` and `direct_transport_metadata_`).
 class __attribute__((visibility("hidden"))) RayObject {
 public:
     RayObject(std::shared_ptr<Buffer> data, std::shared_ptr<Buffer> metadata)
@@ -196,23 +194,12 @@ private:
     bool has_data_copy_ = false;
     bool accessed_ = false;
     int64_t creation_time_nanos_ = 0;
-#if defined(RAYRUST_RAY_OBJECT_LAYOUT_OPTIONAL_STR)
     std::optional<std::string> tensor_transport_;
     std::optional<std::string> direct_transport_metadata_;
-#elif defined(RAYRUST_RAY_OBJECT_LAYOUT_ENUM)
-    int32_t tensor_transport_ = 0;
-#else
-#error "ray::RayObject layout macro not defined by build.rs"
-#endif
 };
 
-#if defined(RAYRUST_RAY_OBJECT_LAYOUT_OPTIONAL_STR)
 static_assert(sizeof(ray::RayObject) == 136,
-              "ray::RayObject stand-in size must be 136 bytes for optional<string> layout");
-#elif defined(RAYRUST_RAY_OBJECT_LAYOUT_ENUM)
-static_assert(sizeof(ray::RayObject) == 112,
-              "ray::RayObject stand-in size must be 112 bytes for enum layout");
-#endif
+              "ray::RayObject stand-in size must be 136 bytes (Ray >= 2.56.1)");
 
 }  // namespace ray
 
@@ -783,13 +770,101 @@ inline const LoadedSdkVersionState &loaded_sdk_version_state() {
     return state;
 }
 
+inline constexpr const char *kMinSupportedRayVersion = "2.56.1";
+
+inline bool parse_ray_version_tuple(const std::string &raw,
+                                    uint32_t &major_out,
+                                    uint32_t &minor_out,
+                                    uint32_t &patch_out) {
+    size_t start = 0;
+    size_t end = raw.size();
+    while (start < end && (raw[start] == ' ' || raw[start] == '\t' ||
+                           raw[start] == '\r' || raw[start] == '\n')) {
+        ++start;
+    }
+    while (end > start && (raw[end - 1] == ' ' || raw[end - 1] == '\t' ||
+                           raw[end - 1] == '\r' || raw[end - 1] == '\n')) {
+        --end;
+    }
+    if (start >= end) {
+        return false;
+    }
+    const std::string s = raw.substr(start, end - start);
+    const size_t dot1 = s.find('.');
+    if (dot1 == std::string::npos) {
+        return false;
+    }
+    const size_t dot2 = s.find('.', dot1 + 1);
+    if (dot2 == std::string::npos) {
+        return false;
+    }
+
+    auto parse_digits = [](const char *p, size_t len, uint32_t &out) -> bool {
+        if (len == 0) {
+            return false;
+        }
+        uint64_t acc = 0;
+        for (size_t i = 0; i < len; ++i) {
+            const char ch = p[i];
+            if (ch < '0' || ch > '9') {
+                return false;
+            }
+            acc = acc * 10 + static_cast<uint64_t>(ch - '0');
+            if (acc > UINT32_MAX) {
+                return false;
+            }
+        }
+        out = static_cast<uint32_t>(acc);
+        return true;
+    };
+
+    if (!parse_digits(s.data(), dot1, major_out)) {
+        return false;
+    }
+    if (!parse_digits(s.data() + dot1 + 1, dot2 - (dot1 + 1), minor_out)) {
+        return false;
+    }
+    const size_t patch_start = dot2 + 1;
+    const size_t dot3 = s.find('.', patch_start);
+    const size_t patch_seg_end = (dot3 == std::string::npos) ? s.size() : dot3;
+    size_t patch_digits = 0;
+    while (patch_start + patch_digits < patch_seg_end) {
+        const char ch = s[patch_start + patch_digits];
+        if (ch < '0' || ch > '9') {
+            break;
+        }
+        ++patch_digits;
+    }
+    return parse_digits(s.data() + patch_start, patch_digits, patch_out);
+}
+
+inline bool is_below_minimum_ray_version(const std::string &ver) {
+    uint32_t major = 0, minor = 0, patch = 0;
+    if (!parse_ray_version_tuple(ver, major, minor, patch)) {
+        return false;
+    }
+    if (major != 2) {
+        return major < 2;
+    }
+    if (minor != 56) {
+        return minor < 56;
+    }
+    return patch < 1;
+}
+
 inline bool verify_loaded_sdk_version(std::string &err_out) {
     const auto &state = loaded_sdk_version_state();
     if (!state.loaded_version.empty() &&
-        state.loaded_version != RAYRUST_BUILD_RAY_VERSION) {
+        (state.loaded_version != RAYRUST_BUILD_RAY_VERSION ||
+         is_below_minimum_ray_version(state.loaded_version))) {
         err_out = "Ray SDK shared library version mismatch: loaded libray_api.so (" +
                   state.loaded_path + ") is Ray " + state.loaded_version +
                   ", built against Ray C++ SDK " RAYRUST_BUILD_RAY_VERSION;
+        if (is_below_minimum_ray_version(state.loaded_version)) {
+            err_out += std::string("; Ray ") + state.loaded_version +
+                       " is unsupported; rayrust requires Ray >= " +
+                       kMinSupportedRayVersion;
+        }
         return false;
     }
     return true;

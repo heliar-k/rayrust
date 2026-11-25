@@ -23,10 +23,9 @@ jobs:
       fail-fast: false
       matrix:
         ray:
-          - "2.49.0"
-          - "2.51.1"
-          - "2.55.0"
-          - "2.60.0"
+          - "2.56.1"
+          - "2.58.2"
+          - "2.60.1"
     env:
       RAY_VERSION: ${{ matrix.ray }}
     steps:
@@ -58,7 +57,7 @@ jobs:
         run: cargo doc --no-deps
 
       - name: Resolve the SDK through the opt-in download branch
-        if: matrix.ray == '2.60.0'
+        if: matrix.ray == '2.60.1'
         env:
           RAYRUST_CACHE_DIR: ${{ runner.temp }}/sdk-cache
           RAYRUST_DOWNLOAD: '1'
@@ -67,14 +66,14 @@ jobs:
           cargo clean -p rayrust-sys
           first="$(env -u RAY_CPP_DIR cargo build -p rayrust-sys -v 2>&1)"
           printf '%s\n' "$first"
-          grep -q '(from download, Ray 2.60.0, sha256 ' <<< "$first"
+          grep -q '(from download, Ray 2.60.1, sha256 ' <<< "$first"
           cargo clean -p rayrust-sys
           second="$(env -u RAY_CPP_DIR cargo build -p rayrust-sys -v 2>&1)"
           printf '%s\n' "$second"
-          grep -q '(from cache, Ray 2.60.0, sha256 ' <<< "$second"
+          grep -q '(from cache, Ray 2.60.1, sha256 ' <<< "$second"
 
   cluster:
-    name: Cluster E2E (Ray 2.51.1)
+    name: Cluster E2E (Ray 2.56.1)
     runs-on: ubuntu-24.04
     needs: build
     timeout-minutes: 30
@@ -89,7 +88,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install ray[cpp]
-        run: python3 -m pip install "ray[cpp]==2.51.1"
+        run: python3 -m pip install "ray[cpp]==2.56.1"
 
       - name: Build all targets
         run: cargo build --release --all-targets
