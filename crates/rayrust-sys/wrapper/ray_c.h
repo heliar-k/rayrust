@@ -307,7 +307,12 @@ ray_bytes_t ray_put_xlang(const char *data, size_t len);
 /// `timeout_ms` is -1 for infinite wait; any value below -1 is rejected before
 /// Ray is entered, because `src/ray/core_worker/store_provider/memory_store/memory_store.cc:97`
 /// RAY_CHECKs `timeout_ms >= 0 || timeout_ms == -1` and ends the process.
-/// Returns a ray_bytes_t containing the serialized object data.
+/// Returns a ray_bytes_t containing the serialized object data. The underlying
+/// buffer from the unique `msgpack::sbuffer` returned by `RayRuntime::Get`
+/// (allocated with global C standard library `::malloc` / `::realloc` in
+/// `msgpack/v1/sbuffer.hpp:24-141`) is transferred directly via
+/// `sbuffer::release()` (`:93-100`); caller frees it with `ray_free_bytes`
+/// (`std::free`).
 /// On error, returns ray_bytes_t with data=NULL.
 /// A zero-length buffer from `Get` means Ray failed the object with an error
 /// type outside the seven the C++ SDK translates and recorded no error text:
@@ -1171,12 +1176,17 @@ int ray_cancel(const char *id_data, size_t id_len, bool force_kill, bool recursi
 ///   reports as `RayError::Unclassified`), and sets that element to
 ///   `data=NULL, len=0` with `RAY_ERROR_KIND_UNCLASSIFIED` and a message naming
 ///   `TASK_CANCELLED`.
-/// - When the object store returns no buffer for an element or copying it fails,
-///   that element has `data=NULL, len=0` with a `RAY_ERROR_KIND_GENERIC` message.
+/// - Each ready element transfers the buffer of the unique `msgpack::sbuffer`
+///   returned by `RayRuntime::Get` directly via `sbuffer::release()`
+///   (`msgpack/v1/sbuffer.hpp:93-100`).
+/// - When the object store returns no buffer for an element or buffer transfer
+///   falls back to a failed allocation, that element has `data=NULL, len=0`
+///   with a `RAY_ERROR_KIND_GENERIC` message.
 /// The first failing element's kind and message are recorded for
 /// `ray_last_error_bytes()` and `ray_last_error_kind()`; later failing elements
 /// leave the thread-local error channel untouched.
-/// Caller must free the returned array with `ray_free_bytes_array(out, count)`.
+/// Caller must free the returned array and element buffers with
+/// `ray_free_bytes_array(out, count)`.
 ray_bytes_t *ray_get_many(const ray_bytes_t *ids, size_t count, int timeout_ms);
 
 /// Free an array returned by ray_get_many.
@@ -1220,7 +1230,10 @@ void ray_register_member_function(const char *func_name, ray_member_callback_t c
 //
 // 1. C -> Rust: Every heap buffer returned by `ray_*` (`ray_bytes_t.data`, the
 //    `ray_bytes_t *` array and each element's `data` from `ray_get_many`, and the
-//    `bool *` array from `ray_wait`) is allocated with `std::malloc` in `ray_c.cc`.
+//    `bool *` array from `ray_wait`) comes from the global C standard library
+//    `malloc` / `realloc` (`std::malloc` in `ray_c.cc`, or `msgpack::sbuffer`
+//    buffers allocated with `::malloc` / `::realloc` in `msgpack/v1/sbuffer.hpp:24-141`
+//    and handed off via `sbuffer::release()` in `ray_get` and `ray_get_many`).
 //    Rust frees them exclusively via `ray_free_bytes`, `ray_free_bytes_array`,
 //    and `ray_free_bools` (all calling `std::free`).
 //

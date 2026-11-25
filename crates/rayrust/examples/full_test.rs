@@ -9,15 +9,13 @@ fn add(a: i32, b: i32) -> i32 {
 
 #[tokio::main]
 async fn main() {
-    let address = std::env::var("RAY_ADDRESS")
-        .unwrap_or_else(|_| "192.168.42.141:6379".to_string());
-    let node_ip = std::env::var("RAY_NODE_IP")
-        .unwrap_or_else(|_| "192.168.42.106".to_string());
-    let worker_so = std::env::var("RAY_WORKER_SO")
-        .unwrap_or_else(|_| {
-            eprintln!("ERROR: RAY_WORKER_SO not set.");
-            std::process::exit(1);
-        });
+    let address =
+        std::env::var("RAY_ADDRESS").unwrap_or_else(|_| "192.168.42.141:6379".to_string());
+    let node_ip = std::env::var("RAY_NODE_IP").unwrap_or_else(|_| "192.168.42.106".to_string());
+    let worker_so = std::env::var("RAY_WORKER_SO").unwrap_or_else(|_| {
+        eprintln!("ERROR: RAY_WORKER_SO not set.");
+        std::process::exit(1);
+    });
 
     println!("=== Comprehensive Feature Test ===\n");
 
@@ -31,8 +29,7 @@ async fn main() {
     println!("--- 1. Wait ---");
     let obj1 = ray.put(&10i32).unwrap();
     let obj2 = ray.put(&20i32).unwrap();
-    let (ready, unready) = ray.wait(&[obj1, obj2], 2, 5000)
-        .expect("wait failed");
+    let (ready, unready) = ray.wait(&[obj1, obj2], 2, 5000).expect("wait failed");
     println!("wait: {} ready, {} unready ✓", ready.len(), unready.len());
     assert_eq!(
         (ready.len(), unready.len()),
@@ -164,6 +161,105 @@ async fn main() {
     let obj = ray.put(&42i32).unwrap();
     println!("ObjectRef id_hex: {} ✓", obj.id_hex());
     println!("is_initialized: {} ✓", ray.is_initialized());
+
+    // ── 9. Large Payload & Repeated Reads ──────────────────
+    println!("\n--- 9. Large Payload & Repeated Reads ---");
+    let build_ascii = |len: usize, seed: usize| -> String {
+        const ALPHABET: &[u8; 64] =
+            b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_";
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            let idx = (i.wrapping_mul(131).wrapping_add(seed).wrapping_add(i >> 11)) & 63;
+            out.push(ALPHABET[idx]);
+        }
+        String::from_utf8(out).expect("ASCII payload")
+    };
+
+    let four_mib = 4 * 1024 * 1024;
+    let payload_4m = build_ascii(four_mib, 17);
+    let r = ray.put(&payload_4m).expect("put 4 MiB string");
+    assert_eq!(r.get().expect("4 MiB get()"), payload_4m);
+    assert_eq!(
+        r.get_timeout(10_000).expect("4 MiB get_timeout(10_000)"),
+        payload_4m
+    );
+    assert_eq!(r.get_async().await.expect("4 MiB get_async()"), payload_4m);
+    assert_eq!(
+        r.get_value().expect("4 MiB get_value()").as_str(),
+        Some(payload_4m.as_str())
+    );
+    assert_eq!(
+        r.get_value_async()
+            .await
+            .expect("4 MiB get_value_async()")
+            .as_str(),
+        Some(payload_4m.as_str())
+    );
+    let raw_4m = r.get_raw_bytes().expect("4 MiB get_raw_bytes()");
+    let expected_raw_4m = rayrust::serialize(&payload_4m).expect("serialize 4 MiB string");
+    assert_eq!(raw_4m, expected_raw_4m, "4 MiB raw msgpack bytes");
+    drop(raw_4m);
+    drop(expected_raw_4m);
+
+    let dup_sync = ray
+        .get_many(&[r.clone(), r.clone()])
+        .expect("4 MiB get_many duplicate refs");
+    assert_eq!(dup_sync.len(), 2);
+    assert_eq!(dup_sync[0], payload_4m);
+    assert_eq!(dup_sync[1], payload_4m);
+    drop(dup_sync);
+
+    let dup_async = ray
+        .get_many_async(&[r.clone(), r])
+        .await
+        .expect("4 MiB get_many_async duplicate refs");
+    assert_eq!(dup_async.len(), 2);
+    assert_eq!(dup_async[0], payload_4m);
+    assert_eq!(dup_async[1], payload_4m);
+    drop(dup_async);
+    drop(payload_4m);
+    println!("4 MiB put + repeated sync/async/batch reads verified ✓");
+
+    let one_mib = 1024 * 1024;
+    let payload_1m = build_ascii(one_mib, 53);
+    let xlang_ref = ray.put_xlang(&payload_1m).expect("put_xlang 1 MiB string");
+    assert!(xlang_ref.is_xlang(), "put_xlang must mark is_xlang");
+    assert_eq!(xlang_ref.get().expect("1 MiB xlang get()"), payload_1m);
+    assert_eq!(
+        xlang_ref
+            .get_async()
+            .await
+            .expect("1 MiB xlang get_async()"),
+        payload_1m
+    );
+    assert_eq!(
+        xlang_ref
+            .get_value()
+            .expect("1 MiB xlang get_value()")
+            .as_str(),
+        Some(payload_1m.as_str())
+    );
+    let xlang_batch = ray
+        .get_many(&[xlang_ref.clone(), xlang_ref.clone()])
+        .expect("1 MiB xlang get_many()");
+    assert_eq!(xlang_batch.len(), 2);
+    assert_eq!(xlang_batch[0], payload_1m);
+    assert_eq!(xlang_batch[1], payload_1m);
+    drop(xlang_batch);
+
+    let py_greet: ObjectRef<String> = ray
+        .task_call_python("rayrust_test", "greet", &[xlang_ref.id()], &[true])
+        .expect("submit rayrust_test.greet(&put_xlang 1 MiB)")
+        .cast();
+    let py_out = py_greet
+        .get_async()
+        .await
+        .expect("await rayrust_test.greet(&put_xlang 1 MiB)");
+    assert_eq!(py_out, format!("Hello, {} from Python!", payload_1m));
+    drop(py_out);
+    drop(xlang_ref);
+    drop(payload_1m);
+    println!("1 MiB put_xlang + Rust/Python reads verified ✓");
 
     // ── Shutdown (automatic on drop) ──────────────────────
     println!("\n--- Shutdown ---");

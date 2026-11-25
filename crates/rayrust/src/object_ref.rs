@@ -411,8 +411,8 @@ impl<T> ObjectRef<T> {
         T: serde::de::DeserializeOwned,
     {
         check_epoch(self.epoch)?;
-        let bytes = crate::runtime::get_raw(&self.id)?;
-        decode_value(&bytes, self.is_xlang)
+        let guard = crate::runtime::get_raw(&self.id)?;
+        decode_value(guard.as_slice(), self.is_xlang)
     }
 
     /// Retrieve the object as a generic msgpack Value (blocks until ready).
@@ -425,8 +425,8 @@ impl<T> ObjectRef<T> {
     /// `get_value_timeout_async`。
     pub fn get_value(&self) -> Result<rmpv::Value, RayError> {
         check_epoch(self.epoch)?;
-        let bytes = crate::runtime::get_raw(&self.id)?;
-        decode_value_generic(&bytes, self.is_xlang)
+        let guard = crate::runtime::get_raw(&self.id)?;
+        decode_value_generic(guard.as_slice(), self.is_xlang)
     }
 
     /// Retrieve the object value with a timeout (in milliseconds).
@@ -439,8 +439,8 @@ impl<T> ObjectRef<T> {
         T: serde::de::DeserializeOwned,
     {
         check_epoch(self.epoch)?;
-        let bytes = crate::runtime::get_raw_timeout(&self.id, timeout_ms)?;
-        decode_value(&bytes, self.is_xlang)
+        let guard = crate::runtime::get_raw_timeout(&self.id, timeout_ms)?;
+        decode_value(guard.as_slice(), self.is_xlang)
     }
 
     /// Asynchronously retrieve the object value.
@@ -467,21 +467,23 @@ impl<T> ObjectRef<T> {
     /// down does not wait for that thread, so a `Get` that already entered C++
     /// runs to its own deadline; the epoch check runs inside the blocking-pool
     /// closure and rejects a call that starts after the shutdown.
+    /// Deserialization runs in place on the blocking-pool thread over the
+    /// `CBytesGuard` slice before releasing the C buffer.
     pub async fn get_timeout_async(&self, timeout: std::time::Duration) -> Result<T, RayError>
     where
         T: serde::de::DeserializeOwned + Send + 'static,
     {
         let id = self.id.clone();
         let epoch = self.epoch;
+        let is_xlang = self.is_xlang;
         let timeout_ms = crate::runtime::duration_to_ms(timeout);
-        let bytes = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             check_epoch(epoch)?;
-            crate::runtime::get_raw_timeout(&id, timeout_ms)
+            let guard = crate::runtime::get_raw_timeout(&id, timeout_ms)?;
+            decode_value(guard.as_slice(), is_xlang)
         })
         .await
-        .map_err(|e| RayError::Runtime(format!("spawn_blocking join error: {}", e)))??;
-
-        decode_value(&bytes, self.is_xlang)
+        .map_err(|e| RayError::Runtime(format!("spawn_blocking join error: {}", e)))?
     }
 
     /// Asynchronously retrieve the object as a generic msgpack Value.
@@ -500,15 +502,15 @@ impl<T> ObjectRef<T> {
     ) -> Result<rmpv::Value, RayError> {
         let id = self.id.clone();
         let epoch = self.epoch;
+        let is_xlang = self.is_xlang;
         let timeout_ms = crate::runtime::duration_to_ms(timeout);
-        let bytes = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             check_epoch(epoch)?;
-            crate::runtime::get_raw_timeout(&id, timeout_ms)
+            let guard = crate::runtime::get_raw_timeout(&id, timeout_ms)?;
+            decode_value_generic(guard.as_slice(), is_xlang)
         })
         .await
-        .map_err(|e| RayError::Runtime(format!("spawn_blocking join error: {}", e)))??;
-
-        decode_value_generic(&bytes, self.is_xlang)
+        .map_err(|e| RayError::Runtime(format!("spawn_blocking join error: {}", e)))?
     }
 
     /// Get raw bytes from the object store (for debugging).
@@ -518,7 +520,8 @@ impl<T> ObjectRef<T> {
     /// 或者先用 `wait(..., timeout_ms)` 确认就绪再读。
     pub fn get_raw_bytes(&self) -> Result<Vec<u8>, RayError> {
         check_epoch(self.epoch)?;
-        crate::runtime::get_raw(&self.id)
+        let guard = crate::runtime::get_raw(&self.id)?;
+        Ok(guard.as_slice().to_vec())
     }
 
     /// Cast the phantom type parameter.
