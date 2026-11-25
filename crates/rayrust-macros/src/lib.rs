@@ -202,7 +202,8 @@ pub fn remote(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         /// Register this function with Ray's FunctionManager.
         pub fn #register_fn_name() {
-            let name_c = ::rayrust::sys::to_cstring(#fn_name_str);
+            let name_c = ::rayrust::sys::to_cstring(#fn_name_str)
+                .expect("Rust identifier contains no interior NUL byte");
             unsafe {
                 ::rayrust::sys::ray_register_function(name_c.as_ptr(), #callback_fn_name);
             }
@@ -535,7 +536,8 @@ pub fn actor(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let cb_name = callback_name(&type_name, &method_ident.to_string());
             let cb_ident = format_ident!("{}", cb_name);
             quote! {
-                let name_c = ::rayrust::sys::to_cstring(#name);
+                let name_c = ::rayrust::sys::to_cstring(#name)
+                    .expect("Rust identifier contains no interior NUL byte");
                 unsafe {
                     ::rayrust::sys::ray_register_member_function(name_c.as_ptr(), #cb_ident);
                 }
@@ -687,7 +689,8 @@ pub fn actor(_attr: TokenStream, item: TokenStream) -> TokenStream {
         // Registration
         pub fn #register_ident() {
             // Register factory
-            let name_c = ::rayrust::sys::to_cstring(#factory_str);
+            let name_c = ::rayrust::sys::to_cstring(#factory_str)
+                .expect("Rust identifier contains no interior NUL byte");
             unsafe {
                 ::rayrust::sys::ray_register_function(name_c.as_ptr(), #factory_ident);
             }

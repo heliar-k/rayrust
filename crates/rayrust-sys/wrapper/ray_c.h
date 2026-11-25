@@ -488,12 +488,12 @@ ray_bytes_t ray_task_call_with_options(const char *func_name,
 /// other name — including a method of a `#[rayrust::actor]` type, which registers
 /// in the member function map — is submitted as a C++ task and fails at the C++
 /// function lookup.
-/// `module_name` must be non-empty. An empty one — and a name with an interior NUL
-/// byte, which reaches this entry as an empty C string — is refused here with
-/// RAY_ERROR_KIND_GENERIC before the runtime is looked up and before any task is
-/// submitted. That check also comes before the runtime-not-initialized check and
-/// before the local mode refusal above, so an empty module name reports the name
-/// error in both modes and without a runtime.
+/// `module_name` must be non-NULL and non-empty. A null pointer
+/// (`module_name is null`) and an empty C string (`module_name[0] == '\0'`) are
+/// refused here with RAY_ERROR_KIND_GENERIC before the runtime is looked up and
+/// before any task is submitted. That check also comes before the
+/// runtime-not-initialized check and before the local mode refusal above, so an
+/// empty module name reports the name error in both modes and without a runtime.
 /// An empty module name can never run. The worker imports the module by name
 /// (`python/ray/_private/function_manager.py:138`, `importlib.import_module`) and
 /// importlib raises `ValueError: Empty module name` for an empty string — it
@@ -503,7 +503,8 @@ ray_bytes_t ray_task_call_with_options(const char *func_name,
 /// `RAY_ERROR_KIND_WORKER` (whose `RayErrorInfo` message Rust's `last_error()`
 /// extracts from the recorded payload, falling back to UTF-8 lossy bytes), and
 /// the worker pool starts a replacement worker afterwards.
-/// `function_name` is not checked. The loader splits it on dots and throws the
+/// `function_name` must be non-NULL (`function_name is null`); an empty C string
+/// is accepted. The loader splits it on dots and throws the
 /// empty pieces away (`function_manager.py:139`), so an empty name resolves to the
 /// module object itself, which `_load_function_from_local` registers as the task's
 /// function (`:391-395`). An ordinary module is not callable, so the task then
@@ -512,9 +513,8 @@ ray_bytes_t ray_task_call_with_options(const char *func_name,
 /// with `__call__` assigned to the module's `__class__`, or any callable placed in
 /// `sys.modules` under that name — and then the task runs and returns that
 /// object's result (measured on 2.51.1: such a module returned 3 for a call with
-/// an empty function name). Refusing the name would reject that call, so the entry
-/// submits it. An interior NUL byte makes it an empty function name as well, and
-/// the submission goes through the same way.
+/// an empty function name). Refusing the empty name would reject that call, so
+/// the entry submits it.
 /// A non-empty name nobody registered keeps Ray's asynchronous semantics: the
 /// driver holds no function table and cannot tell a valid name from an invalid
 /// one, so the submission returns an `ObjectRef` and the first read waits until it
@@ -558,10 +558,11 @@ ray_bytes_t ray_task_call_python(const char *module_name,
 /// (`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:138-140`).
 /// The name checks and the reference-argument requirements are the ones
 /// `ray_task_call_python` documents above, because both entries share the same
-/// submission path: `module_name` must be non-empty (an empty one, or one with an
-/// interior NUL byte, is refused with RAY_ERROR_KIND_GENERIC before the runtime is
-/// looked up and before any task is submitted), and `function_name` is not checked
-/// (an empty one resolves to the module object, which can be callable). A
+/// submission path: `module_name` must be non-NULL and non-empty (a null pointer
+/// or an empty C string is refused with RAY_ERROR_KIND_GENERIC before the runtime
+/// is looked up and before any task is submitted), and `function_name` must be
+/// non-NULL (an empty C string resolves to the module object, which can be
+/// callable). A
 /// reference argument must be a 28-byte id this process holds, whose owner Ray
 /// knows, and it must carry cross-language or Python metadata (written by
 /// `ray_put_xlang` or produced by a Python worker).
@@ -639,10 +640,10 @@ ray_bytes_t ray_task_call_python_with_options(const char *module_name,
 /// terminate the process. A group without a `bundle_index` key means -1 (any
 /// bundle).
 /// Constructor arguments are always values: there is no `is_ref` here.
-/// `func_name` must be a non-empty name. An empty name — and a name with an
-/// interior NUL byte, which reaches this entry as an empty C string — is refused
-/// here with RAY_ERROR_KIND_GENERIC before the runtime is looked up and before any
-/// task is submitted: every name a `#[rayrust::actor]` type registers is non-empty,
+/// `func_name` must be non-NULL and non-empty. A null pointer (`func_name is
+/// null`) and an empty C string (`func_name[0] == '\0'`) are refused here with
+/// RAY_ERROR_KIND_GENERIC before the runtime is looked up and before any task is
+/// submitted: every name a `#[rayrust::actor]` type registers is non-empty,
 /// and an empty one can never run. Local mode constructs only a driver
 /// (`cpp/src/ray/runtime/local_mode_ray_runtime.cc:30-34`), runs the creation task
 /// in the calling thread before `CreateActor` returns
@@ -686,8 +687,8 @@ ray_bytes_t ray_actor_create_with_options(const char *func_name,
 /// `TypeError: module.__new__(X): X is not a type object (module)` before
 /// `load_actor_class` is reached (the measured traceback holds only
 /// `_raylet.pyx:2432` and `:2253`). In both cases the worker exits with
-/// `SYSTEM_ERROR`. A name with an interior NUL byte reaches this entry as an
-/// empty C string as well (`crates/rayrust-sys/src/lib.rs:253-255`, #27).
+/// `SYSTEM_ERROR`. A null pointer or an empty C string (`ptr[0] == '\0'`) on
+/// either parameter is refused with RAY_ERROR_KIND_GENERIC.
 /// The two name checks run right after `ray_clear_error()` and before the runtime
 /// lookup, so a refused call builds no runtime and submits nothing, and they run
 /// before the local mode rejection below, so local mode with an empty name
@@ -790,11 +791,10 @@ ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
 /// empty name in the driver as well: its single-argument `RemoteFunctionHolder`
 /// constructor throws `Function not found. Please use RAY_REMOTE to register this
 /// function.` (`cpp/include/ray/api/ray_runtime.h:41-47`) before any task is
-/// submitted, so its actor keeps running. A name with an interior NUL byte reaches
-/// this entry as an empty C string as well (`crates/rayrust-sys/src/lib.rs:253-255`,
-/// #27). The null and empty checks run after the actor id width check and before the
-/// runtime lookup, so local mode with an empty method name reports `the method name is
-/// empty` while local mode with a non-empty one still reports the local mode error.
+/// submitted, so its actor keeps running. The null and empty checks run after the
+/// actor id width check and before the runtime lookup, so local mode with an empty
+/// method name reports `the method name is empty` while local mode with a
+/// non-empty one still reports the local mode error.
 /// A non-empty method name the actor does not have is not rejected here: the driver
 /// holds no method table and cannot tell a valid name from an invalid one. Measured
 /// on 2.51.1 such a name ends the actor's worker with the same traceback as an empty
@@ -1132,8 +1132,7 @@ ray_bytes_t ray_get_namespace(void);
 /// reports the error where it used to answer `Ok(None)`. The empty name reaches
 /// `CoreWorker::GetNamedActorHandle`, whose first statement is
 /// `RAY_CHECK(!name.empty())` (`src/ray/core_worker/core_worker.cc:2594`), and
-/// that RAY_CHECK terminates the process. A name with an interior NUL byte reads
-/// as an empty C string on the Rust side, so it is rejected the same way (#27).
+/// that RAY_CHECK terminates the process.
 /// A name of only whitespace characters is legal and is not trimmed.
 /// `namespace` can be NULL or an empty string for the current namespace: with an
 /// empty namespace `NativeTaskSubmitter::GetActor` falls back to the job config's

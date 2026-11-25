@@ -133,6 +133,10 @@ pub use serialize::{
 /// Register a Rust actor member function with Ray's FunctionManager.
 /// This is used by the `#[rayrust::actor]` macro for member function registration.
 /// Must be called before `Ray::connect` or before the first actor call.
+///
+/// # Panics
+///
+/// Panics if `func_name` contains an interior NUL byte.
 pub fn register_member_function(
     func_name: &str,
     callback: extern "C" fn(
@@ -141,7 +145,12 @@ pub fn register_member_function(
         usize,
     ) -> rayrust_sys::RayCallbackResult,
 ) {
-    let name_c = rayrust_sys::to_cstring(func_name);
+    let name_c = rayrust_sys::to_cstring(func_name).unwrap_or_else(|e| {
+        panic!(
+            "register_member_function: func_name contains an interior NUL byte at byte {}",
+            e.nul_position()
+        )
+    });
     unsafe {
         rayrust_sys::ray_register_member_function(name_c.as_ptr(), callback);
     }

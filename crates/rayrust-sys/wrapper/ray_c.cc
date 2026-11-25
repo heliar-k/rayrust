@@ -1843,9 +1843,7 @@ static ray_bytes_t submit_python_task(const char *module_name,
         // （详见 ray_c.h），任务必然在 worker 里失败并且 worker 退出。function 名不在这里
         // 判定：空 function 名查到的是 module 对象本身，那个对象可以可调用，这种情况下
         // 任务真能跑，拒它就会拒掉能跑通的调用。只拦空指针（std::string(nullptr) 是未定义
-        // 行为）。带内部 NUL 的名字经 to_cstring 变成空串
-        // （crates/rayrust-sys/src/lib.rs:253-255），所以带 NUL 的 module 名归到空名字那条
-        // 检查上，带 NUL 的 function 名就是一个空 function 名，照原样提交。
+        // 行为）。
         if (!module_name) {
             set_last_error("module_name is null");
             return ray_bytes_t{nullptr, 0};
@@ -1990,8 +1988,7 @@ ray_bytes_t ray_actor_create_with_options(const char *func_name,
             "task_executor.cc:101-111): the actor worker stops at "
             "src/ray/core_worker/core_worker_shutdown_executor.cc:40 and the driver's "
             "first read fails with an actor error whose message Rust extracts from the "
-            "recorded error payload (or renders lossily as UTF-8). A name with an interior NUL byte "
-            "arrives here as an empty C string as well (#27). A whitespace-only name is "
+            "recorded error payload (or renders lossily as UTF-8). A whitespace-only name is "
             "not trimmed and is submitted as it is, as ray_get_actor does; a "
             "non-empty name nobody registered keeps Ray's asynchronous semantics, "
             "because the driver has no way to learn which names are registered.");
@@ -2054,9 +2051,7 @@ ray_bytes_t ray_actor_create_python_with_options(const char *module_name,
             "Rust extracts from the recorded error payload (or renders lossily as "
             "UTF-8). Either empty name is refused here. Local mode refuses "
             "every Python actor creation, and these checks run before that refusal, "
-            "so an empty name reports this error in both modes. A name with an "
-            "interior NUL byte arrives here as an empty C "
-            "string as well (crates/rayrust-sys/src/lib.rs:253-255, #27).");
+            "so an empty name reports this error in both modes.");
         return ray_bytes_t{nullptr, 0};
     }
     if (!class_name) {
@@ -2076,9 +2071,7 @@ ray_bytes_t ray_actor_create_python_with_options(const char *module_name,
             "renders lossily as UTF-8). Either empty name is refused "
             "here. Local mode refuses every Python actor creation, and these checks "
             "run before that refusal, so an empty name reports this error in both "
-            "modes. A name with an interior NUL byte "
-            "arrives here as an empty C string as well "
-            "(crates/rayrust-sys/src/lib.rs:253-255, #27).");
+            "modes.");
         return ray_bytes_t{nullptr, 0};
     }
     try {
@@ -2208,9 +2201,7 @@ ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len
                 "constructor throws \"Function not found. Please use RAY_REMOTE to "
                 "register this function.\" "
                 "(cpp/include/ray/api/ray_runtime.h:41-45) before any task is "
-                "submitted, so its actor keeps running. A name with an interior NUL "
-                "byte arrives here as an empty C string as well "
-                "(crates/rayrust-sys/src/lib.rs:253-255, #27). A non-empty method "
+                "submitted, so its actor keeps running. A non-empty method "
                 "name the actor does not have is not refused here: the driver holds "
                 "no method table and cannot tell a valid name from an invalid one, "
                 "and measured on 2.51.1 such a name also ends the actor's worker with "
@@ -3113,14 +3104,11 @@ ray_bytes_t ray_get_actor(const char *name, const char *ray_namespace,
     if (name[0] == '\0') {
         // 集群模式把名字交给 `CoreWorker::GetNamedActorHandle`，它的第一句是
         // `RAY_CHECK(!name.empty())`（src/ray/core_worker/core_worker.cc:2594），
-        // RAY_CATCH 拦不住，进程直接终止。带内部 NUL 的名字经 Rust 侧的 to_cstring
-        // 也变成空串（#27），所以两者都在这里拒掉。只有空白字符的名字是合法的，
-        // 不做 trim。
+        // RAY_CATCH 拦不住，进程直接终止。只有空白字符的名字是合法的，不做 trim。
         set_last_error(
             "actor name is empty: the core worker requires a non-empty name "
             "(RAY_CHECK(!name.empty()) at src/ray/core_worker/core_worker.cc:2594) and "
-            "stops the process on the empty one. A name with an interior NUL byte "
-            "arrives here as an empty C string as well (#27); a whitespace-only name "
+            "stops the process on the empty one; a whitespace-only name "
             "is not trimmed and is looked up as it is");
         return ray_bytes_t{nullptr, 0};
     }

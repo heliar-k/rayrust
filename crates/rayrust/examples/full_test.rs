@@ -400,6 +400,54 @@ async fn main() {
         final_total
     );
 
+    // ── 11. Interior NUL Boundary Validation ───────────────
+    println!("\n--- 11. Interior NUL Boundary Validation ---");
+    let assert_nul_err = |label: &str, err: RayError, field: &str| match err {
+        RayError::Ffi(msg) => {
+            assert!(
+                msg.contains(field) && msg.contains("interior NUL"),
+                "{label}: expected field {field:?} and interior NUL in {msg:?}"
+            );
+        }
+        other => panic!("{label}: expected RayError::Ffi, got {other:?}"),
+    };
+    assert_nul_err(
+        "get_actor bad name",
+        ray.get_actor("bad\0actor", "").unwrap_err(),
+        "name",
+    );
+    assert_nul_err(
+        "get_actor bad namespace",
+        ray.get_actor("valid_actor", "bad\0ns").unwrap_err(),
+        "namespace",
+    );
+    assert_nul_err(
+        "task_call bad func_name",
+        ray.task_call("ad\0d", &[], &[], &TaskOptions::new())
+            .unwrap_err(),
+        "func_name",
+    );
+    let nul_arg_a = rayrust::serialize(&19i32).unwrap();
+    let nul_arg_b = rayrust::serialize(&23i32).unwrap();
+    assert_nul_err(
+        "task_call bad TaskOptions::name",
+        ray.task_call(
+            "add",
+            &[&nul_arg_a, &nul_arg_b],
+            &[],
+            &TaskOptions::new().name("bad\0task"),
+        )
+        .unwrap_err(),
+        "name",
+    );
+    let post_nul_ref = add_remote(&ray, 19, 23).expect("submit add(19, 23) after NUL checks");
+    let post_nul_val: i32 = post_nul_ref
+        .get_async()
+        .await
+        .expect("await add(19, 23) after NUL checks");
+    assert_eq!(post_nul_val, 42);
+    println!("Interior NUL boundary rejections verified & cluster remains healthy ✓");
+
     // ── Shutdown (automatic on drop) ──────────────────────
     println!("\n--- Shutdown ---");
     drop(ray);
