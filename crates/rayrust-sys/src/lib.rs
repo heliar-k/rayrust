@@ -28,6 +28,19 @@ pub struct RayActorHandleMeta {
     pub creation_descriptor: c_int,
 }
 
+/// Opaque C handle to a `ray::Metric` instance (`wrapper/ray_c.h` `ray_metric_t`).
+#[repr(C)]
+pub struct RayMetric {
+    _private: [u8; 0],
+}
+
+/// Single `(key, value)` tag entry (`wrapper/ray_c.h` `ray_metric_tag_t`).
+#[repr(C)]
+pub struct RayMetricTag {
+    pub key: RayBytes,
+    pub value: RayBytes,
+}
+
 // ─── Rust 回调状态与结果结构体 ────────────────────────────────
 
 /// 与 `wrapper/ray_c.h` 的 `ray_callback_status_t` 及 `ray_callback_result_t` 一致。
@@ -195,6 +208,64 @@ extern "C" {
     ) -> c_int;
     pub fn ray_get_many(ids: *const RayBytes, count: usize, timeout_ms: c_int) -> *mut RayBytes;
     pub fn ray_free_bytes_array(array: *mut RayBytes, count: usize);
+
+    // Metrics
+    pub fn ray_gauge_create(
+        name: RayBytes,
+        description: RayBytes,
+        unit: RayBytes,
+        tag_keys: *const RayBytes,
+        tag_key_count: usize,
+    ) -> *mut RayMetric;
+    pub fn ray_counter_create(
+        name: RayBytes,
+        description: RayBytes,
+        unit: RayBytes,
+        tag_keys: *const RayBytes,
+        tag_key_count: usize,
+    ) -> *mut RayMetric;
+    pub fn ray_histogram_create(
+        name: RayBytes,
+        description: RayBytes,
+        unit: RayBytes,
+        boundaries: *const f64,
+        boundary_count: usize,
+        tag_keys: *const RayBytes,
+        tag_key_count: usize,
+    ) -> *mut RayMetric;
+    pub fn ray_sum_create(
+        name: RayBytes,
+        description: RayBytes,
+        unit: RayBytes,
+        tag_keys: *const RayBytes,
+        tag_key_count: usize,
+    ) -> *mut RayMetric;
+    pub fn ray_metric_get_name(metric: *const RayMetric) -> RayBytes;
+    pub fn ray_metric_destroy(metric: *mut RayMetric);
+    pub fn ray_gauge_set(
+        metric: *mut RayMetric,
+        value: f64,
+        tags: *const RayMetricTag,
+        tag_count: usize,
+    ) -> c_int;
+    pub fn ray_counter_inc(
+        metric: *mut RayMetric,
+        value: f64,
+        tags: *const RayMetricTag,
+        tag_count: usize,
+    ) -> c_int;
+    pub fn ray_histogram_observe(
+        metric: *mut RayMetric,
+        value: f64,
+        tags: *const RayMetricTag,
+        tag_count: usize,
+    ) -> c_int;
+    pub fn ray_metric_record(
+        metric: *mut RayMetric,
+        value: f64,
+        tags: *const RayMetricTag,
+        tag_count: usize,
+    ) -> c_int;
 
     // Memory Management
     pub fn ray_free_bytes(ptr: *mut RayBytes);

@@ -437,3 +437,144 @@ impl CtorExiting {
         self.value
     }
 }
+
+// ─── Metrics 远程任务与 Actor 验证 ──────────────────────────
+
+static WORKER_METRIC_COUNTER: std::sync::LazyLock<rayrust::Counter> =
+    std::sync::LazyLock::new(|| {
+        rayrust::Counter::new(
+            "rayrust_worker_calls_total",
+            "Remote metric task invocations",
+            "calls",
+            &["source"],
+        )
+        .expect("LazyLock Counter::new in worker")
+    });
+
+/// 在工人进程中验证非法指标名与负增量被干净拦截，并上报四种指标。
+#[remote]
+pub fn record_worker_metrics(val: f64) -> String {
+    match rayrust::Gauge::new("1invalid_worker_metric", "bad", "u", &[]) {
+        Err(rayrust::RayError::Ffi(_)) => {}
+        other => panic!(
+            "expected invalid metric name to fail with Ffi, got {:?}",
+            other
+        ),
+    }
+    match WORKER_METRIC_COUNTER.inc(-1.0, &[("source", "remote_task")]) {
+        Err(rayrust::RayError::Ffi(_)) => {}
+        other => panic!(
+            "expected negative counter inc to fail with Ffi, got {:?}",
+            other
+        ),
+    }
+
+    WORKER_METRIC_COUNTER
+        .inc(1.0, &[("source", "remote_task")])
+        .expect("worker LazyLock Counter::inc");
+
+    let gauge = rayrust::Gauge::new(
+        "rayrust_worker_gauge",
+        "Worker instant value",
+        "units",
+        &["source"],
+    )
+    .expect("worker Gauge::new");
+    let hist = rayrust::Histogram::new(
+        "rayrust_worker_hist",
+        "Worker value distribution",
+        "ms",
+        &[0.0, 10.0, 50.0, 100.0],
+        &["source"],
+    )
+    .expect("worker Histogram::new");
+    let sum = rayrust::Sum::new(
+        "rayrust_worker_sum",
+        "Worker cumulative delta",
+        "units",
+        &["source"],
+    )
+    .expect("worker Sum::new");
+
+    let tags = &[("source", "remote_task")];
+    gauge.set(val, tags).expect("worker Gauge::set");
+    hist.observe(val, tags).expect("worker Histogram::observe");
+    sum.record(val, tags).expect("worker Sum::record");
+
+    format!("ok:{}:{:.2}", WORKER_METRIC_COUNTER.name(), val)
+}
+
+/// 字段直接持有四个指标类型的 actor，验证 `Box<Mutex<MetricActor>>` 下的 `Send + Sync` 与集群录制。
+struct MetricActor {
+    total: f64,
+    gauge: rayrust::Gauge,
+    counter: rayrust::Counter,
+    histogram: rayrust::Histogram,
+    sum: rayrust::Sum,
+}
+
+#[rayrust::actor]
+impl MetricActor {
+    fn new(prefix: String) -> Self {
+        let gauge = rayrust::Gauge::new(
+            &format!("{}_gauge", prefix),
+            "Actor state gauge",
+            "units",
+            &["actor"],
+        )
+        .expect("MetricActor Gauge::new");
+        let counter = rayrust::Counter::new(
+            &format!("{}_steps_total", prefix),
+            "Actor step counter",
+            "steps",
+            &["actor"],
+        )
+        .expect("MetricActor Counter::new");
+        let histogram = rayrust::Histogram::new(
+            &format!("{}_delta_hist", prefix),
+            "Actor delta magnitude",
+            "units",
+            &[0.0, 1.0, 5.0, 20.0, 100.0],
+            &["actor"],
+        )
+        .expect("MetricActor Histogram::new");
+        let sum = rayrust::Sum::new(
+            &format!("{}_delta_sum", prefix),
+            "Actor cumulative delta",
+            "units",
+            &["actor"],
+        )
+        .expect("MetricActor Sum::new");
+        MetricActor {
+            total: 0.0,
+            gauge,
+            counter,
+            histogram,
+            sum,
+        }
+    }
+
+    fn record_step(&mut self, delta: f64) -> f64 {
+        let tags = &[("actor", "metric_actor")];
+        self.gauge
+            .set(self.total + delta, tags)
+            .expect("MetricActor Gauge::set");
+        self.counter
+            .inc(1.0, tags)
+            .expect("MetricActor Counter::inc");
+        self.histogram
+            .observe(delta.abs(), tags)
+            .expect("MetricActor Histogram::observe");
+        self.sum
+            .record(delta, tags)
+            .expect("MetricActor Sum::record");
+        self.total += delta;
+        self.total
+    }
+
+    fn try_counter_inc(&self, value: f64) -> Result<(), String> {
+        self.counter
+            .inc(value, &[("actor", "metric_actor")])
+            .map_err(|e| e.to_string())
+    }
+}

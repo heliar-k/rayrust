@@ -7,6 +7,7 @@
 //! - Cross-language calls (Python tasks + actors)
 //! - Actors
 //! - Placement groups
+//! - Metrics (Gauge, Counter, Histogram, Sum)
 //!
 //! ## Quick start
 //! ```no_run
@@ -89,6 +90,7 @@ pub(crate) mod actor_registry;
 pub mod async_runtime;
 pub mod callback;
 pub mod error;
+pub mod metric;
 pub mod object_ref;
 pub mod runtime;
 pub mod serialize;
@@ -101,6 +103,7 @@ pub use rayrust_sys as sys;
 pub use ctor;
 
 pub use error::RayError;
+pub use metric::{Counter, Gauge, Histogram, Sum};
 pub use object_ref::ObjectRef;
 pub use runtime::{
     ActorHandle, ActorLifetime, ActorOptions, PlacementGroupInfo, Ray, RayConfig, TaskOptions,
@@ -147,6 +150,7 @@ pub fn register_member_function(
 /// Convenience module for common imports.
 pub mod prelude {
     pub use crate::error::RayError;
+    pub use crate::metric::{Counter, Gauge, Histogram, Sum};
     pub use crate::object_ref::ObjectRef;
     pub use crate::runtime::{
         ActorHandle, ActorLifetime, ActorOptions, PlacementGroupInfo, Ray, RayConfig, TaskOptions,

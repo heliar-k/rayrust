@@ -10,6 +10,7 @@
 #include "ray_c.h"
 
 #include <ray/api.h>
+#include <ray/api/metric.h>
 #include <ray/api/ray_exception.h>
 #include <ray/api/ray_runtime.h>
 #include <ray/api/ray_runtime_holder.h>
@@ -68,6 +69,7 @@ static_assert(alignof(RayIntentionalSystemExitException) == alignof(RayException
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -1094,7 +1096,7 @@ bool ray_is_initialized(void) {
 /// （`_Exit(1)`，`src/ray/util/process.cc:845-848`）直接终止进程，Rust 侧没有捕获机会。
 ///
 /// 关闭标志 `runtime_closing()` 有两类读者：
-/// - 25 个取运行时的入口经 `runtime_for_call()` 读这个原子标志，命中时写入
+/// - 29 个取运行时的入口经 `runtime_for_call()` 读这个原子标志，命中时写入
 ///   `RAY_ERROR_KIND_RUNTIME` 并立即拒绝，不等待也不计入在途计数（`get`/`put`/`wait`
 ///   等阻塞调用不能让关闭等待，例如无期限的 `Get`）；
 /// - 两个引用计数入口在 `ref_count_gate_mutex()` 下读这个标志并计入 `ref_count_in_flight()`，
@@ -3329,6 +3331,449 @@ void ray_free_bytes_array(ray_bytes_t *array, size_t count) {
         if (array[i].data) std::free(const_cast<char *>(array[i].data));
     }
     std::free(array);
+}
+
+// ─── Metrics ──────────────────────────────────────────────────
+
+namespace {
+
+enum class MetricKind {
+    Gauge,
+    Counter,
+    Histogram,
+    Sum,
+};
+
+const char *metric_kind_name(MetricKind kind) {
+    switch (kind) {
+        case MetricKind::Gauge:
+            return "Gauge";
+        case MetricKind::Counter:
+            return "Counter";
+        case MetricKind::Histogram:
+            return "Histogram";
+        case MetricKind::Sum:
+            return "Sum";
+    }
+    return "Metric";
+}
+
+bool is_metric_name_start(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == ':';
+}
+
+bool is_metric_name_cont(unsigned char c) {
+    return is_metric_name_start(c) || (c >= '0' && c <= '9');
+}
+
+/// 校验指标名称：匹配 `^[a-zA-Z_:][a-zA-Z0-9_:]*$`，与 `ray::stats::Metric::Metric`
+/// （`src/ray/stats/metric.cc:86-109`）一致。上游在构造函数内执行
+/// `RAY_CHECK_WITH_DISPLAY(std::regex_match(name, Metric::name_regex_), ...)`
+/// （`:95-100`），失败会调用 `std::abort()` 终止进程，`try/catch` 无法拦截。
+bool validate_metric_name(ray_bytes_t name, std::string &out) {
+    if (name.len == 0 || name.data == nullptr) {
+        set_last_error(
+            "metric name must be non-empty (expected ^[a-zA-Z_:][a-zA-Z0-9_:]*$)");
+        return false;
+    }
+    if (std::memchr(name.data, '\0', name.len) != nullptr) {
+        set_last_error("metric name contains an interior NUL byte");
+        return false;
+    }
+    const auto first = static_cast<unsigned char>(name.data[0]);
+    if (!is_metric_name_start(first)) {
+        set_last_error(
+            "invalid metric name: first byte must be an ASCII letter, '_', or ':'");
+        return false;
+    }
+    for (size_t i = 1; i < name.len; ++i) {
+        const auto ch = static_cast<unsigned char>(name.data[i]);
+        if (!is_metric_name_cont(ch)) {
+            set_last_error(
+                "invalid metric name: bytes must be ASCII letters, digits, '_', or ':'");
+            return false;
+        }
+    }
+    out.assign(name.data, name.len);
+    return true;
+}
+
+bool validate_text_bytes(const char *field, ray_bytes_t bytes, std::string &out) {
+    if (bytes.len > 0 && bytes.data == nullptr) {
+        std::string msg = std::string(field) + " has null data pointer with non-zero length";
+        set_last_error(msg.c_str());
+        return false;
+    }
+    if (bytes.len > 0 && std::memchr(bytes.data, '\0', bytes.len) != nullptr) {
+        std::string msg = std::string(field) + " contains an interior NUL byte";
+        set_last_error(msg.c_str());
+        return false;
+    }
+    if (bytes.len == 0) {
+        out.clear();
+    } else {
+        out.assign(bytes.data, bytes.len);
+    }
+    return true;
+}
+
+bool validate_tag_keys(const ray_bytes_t *tag_keys,
+                       size_t count,
+                       std::vector<std::string> &out) {
+    if (count > 0 && tag_keys == nullptr) {
+        set_last_error("metric tag_keys pointer is null with non-zero count");
+        return false;
+    }
+    out.clear();
+    out.reserve(count);
+    std::unordered_set<std::string> seen;
+    seen.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        const ray_bytes_t &raw = tag_keys[i];
+        if (raw.len == 0 || raw.data == nullptr) {
+            set_last_error("metric tag_key must be non-empty");
+            return false;
+        }
+        if (std::memchr(raw.data, '\0', raw.len) != nullptr) {
+            set_last_error("metric tag_key contains an interior NUL byte");
+            return false;
+        }
+        std::string key(raw.data, raw.len);
+        if (!seen.insert(key).second) {
+            std::string msg = "duplicate metric tag_key: " + key;
+            set_last_error(msg.c_str());
+            return false;
+        }
+        out.push_back(std::move(key));
+    }
+    return true;
+}
+
+bool validate_boundaries(const double *boundaries,
+                         size_t count,
+                         std::vector<double> &out) {
+    if (count == 0 || boundaries == nullptr) {
+        set_last_error("histogram boundaries must be non-empty");
+        return false;
+    }
+    out.clear();
+    out.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        const double b = boundaries[i];
+        if (!std::isfinite(b)) {
+            set_last_error("histogram boundary must be finite");
+            return false;
+        }
+        if (i > 0 && !(boundaries[i - 1] < b)) {
+            set_last_error("histogram boundaries must be strictly monotonically increasing");
+            return false;
+        }
+        out.push_back(b);
+    }
+    return true;
+}
+
+bool validate_and_build_tags(const ray_metric_tag_t *tags,
+                             size_t count,
+                             std::unordered_map<std::string, std::string> &out) {
+    if (count > 0 && tags == nullptr) {
+        set_last_error("metric tags pointer is null with non-zero count");
+        return false;
+    }
+    out.clear();
+    out.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        const ray_bytes_t &rk = tags[i].key;
+        const ray_bytes_t &rv = tags[i].value;
+        if (rk.len == 0 || rk.data == nullptr) {
+            set_last_error("metric tag key must be non-empty");
+            return false;
+        }
+        if (std::memchr(rk.data, '\0', rk.len) != nullptr) {
+            set_last_error("metric tag key contains an interior NUL byte");
+            return false;
+        }
+        if (rv.len > 0 && rv.data == nullptr) {
+            set_last_error("metric tag value pointer is null with non-zero length");
+            return false;
+        }
+        if (rv.len > 0 && std::memchr(rv.data, '\0', rv.len) != nullptr) {
+            set_last_error("metric tag value contains an interior NUL byte");
+            return false;
+        }
+        std::string k(rk.data, rk.len);
+        std::string v = rv.len == 0 ? std::string() : std::string(rv.data, rv.len);
+        out.insert_or_assign(std::move(k), std::move(v));
+    }
+    return true;
+}
+
+}  // namespace
+
+struct ray_metric_s {
+    MetricKind kind;
+    std::unique_ptr<ray::Metric> inner;
+};
+
+ray_metric_t *ray_gauge_create(ray_bytes_t name,
+                               ray_bytes_t description,
+                               ray_bytes_t unit,
+                               const ray_bytes_t *tag_keys,
+                               size_t tag_key_count) {
+    ray_clear_error();
+    try {
+        std::string name_s;
+        std::string desc_s;
+        std::string unit_s;
+        std::vector<std::string> keys_v;
+        if (!validate_metric_name(name, name_s)) return nullptr;
+        if (!validate_text_bytes("metric description", description, desc_s)) return nullptr;
+        if (!validate_text_bytes("metric unit", unit, unit_s)) return nullptr;
+        if (!validate_tag_keys(tag_keys, tag_key_count, keys_v)) return nullptr;
+        auto inner = std::make_unique<ray::Gauge>(name_s, desc_s, unit_s, keys_v);
+        return new ray_metric_s{MetricKind::Gauge, std::move(inner)};
+    } RAY_CATCH
+    catch (...) {
+        set_last_error("unknown exception in ray_gauge_create");
+    }
+    return nullptr;
+}
+
+ray_metric_t *ray_counter_create(ray_bytes_t name,
+                                 ray_bytes_t description,
+                                 ray_bytes_t unit,
+                                 const ray_bytes_t *tag_keys,
+                                 size_t tag_key_count) {
+    ray_clear_error();
+    try {
+        std::string name_s;
+        std::string desc_s;
+        std::string unit_s;
+        std::vector<std::string> keys_v;
+        if (!validate_metric_name(name, name_s)) return nullptr;
+        if (!validate_text_bytes("metric description", description, desc_s)) return nullptr;
+        if (!validate_text_bytes("metric unit", unit, unit_s)) return nullptr;
+        if (!validate_tag_keys(tag_keys, tag_key_count, keys_v)) return nullptr;
+        auto inner = std::make_unique<ray::Counter>(name_s, desc_s, unit_s, keys_v);
+        return new ray_metric_s{MetricKind::Counter, std::move(inner)};
+    } RAY_CATCH
+    catch (...) {
+        set_last_error("unknown exception in ray_counter_create");
+    }
+    return nullptr;
+}
+
+ray_metric_t *ray_histogram_create(ray_bytes_t name,
+                                   ray_bytes_t description,
+                                   ray_bytes_t unit,
+                                   const double *boundaries,
+                                   size_t boundary_count,
+                                   const ray_bytes_t *tag_keys,
+                                   size_t tag_key_count) {
+    ray_clear_error();
+    try {
+        std::string name_s;
+        std::string desc_s;
+        std::string unit_s;
+        std::vector<double> bounds_v;
+        std::vector<std::string> keys_v;
+        if (!validate_metric_name(name, name_s)) return nullptr;
+        if (!validate_text_bytes("metric description", description, desc_s)) return nullptr;
+        if (!validate_text_bytes("metric unit", unit, unit_s)) return nullptr;
+        if (!validate_boundaries(boundaries, boundary_count, bounds_v)) return nullptr;
+        if (!validate_tag_keys(tag_keys, tag_key_count, keys_v)) return nullptr;
+        auto inner = std::make_unique<ray::Histogram>(
+            name_s, desc_s, unit_s, std::move(bounds_v), keys_v);
+        return new ray_metric_s{MetricKind::Histogram, std::move(inner)};
+    } RAY_CATCH
+    catch (...) {
+        set_last_error("unknown exception in ray_histogram_create");
+    }
+    return nullptr;
+}
+
+ray_metric_t *ray_sum_create(ray_bytes_t name,
+                             ray_bytes_t description,
+                             ray_bytes_t unit,
+                             const ray_bytes_t *tag_keys,
+                             size_t tag_key_count) {
+    ray_clear_error();
+    try {
+        std::string name_s;
+        std::string desc_s;
+        std::string unit_s;
+        std::vector<std::string> keys_v;
+        if (!validate_metric_name(name, name_s)) return nullptr;
+        if (!validate_text_bytes("metric description", description, desc_s)) return nullptr;
+        if (!validate_text_bytes("metric unit", unit, unit_s)) return nullptr;
+        if (!validate_tag_keys(tag_keys, tag_key_count, keys_v)) return nullptr;
+        auto inner = std::make_unique<ray::Sum>(name_s, desc_s, unit_s, keys_v);
+        return new ray_metric_s{MetricKind::Sum, std::move(inner)};
+    } RAY_CATCH
+    catch (...) {
+        set_last_error("unknown exception in ray_sum_create");
+    }
+    return nullptr;
+}
+
+ray_bytes_t ray_metric_get_name(const ray_metric_t *metric) {
+    ray_clear_error();
+    try {
+        if (!metric || !metric->inner) {
+            set_last_error("metric handle is null");
+            return ray_bytes_t{nullptr, 0};
+        }
+        std::string name = metric->inner->GetName();
+        ray_bytes_t out = dup_bytes(name);
+        if (!out.data) {
+            set_last_error("out of memory copying metric name");
+        }
+        return out;
+    } RAY_CATCH
+    catch (...) {
+        set_last_error("unknown exception in ray_metric_get_name");
+    }
+    return ray_bytes_t{nullptr, 0};
+}
+
+void ray_metric_destroy(ray_metric_t *metric) {
+    delete metric;
+}
+
+int ray_gauge_set(ray_metric_t *metric,
+                  double value,
+                  const ray_metric_tag_t *tags,
+                  size_t tag_count) {
+    ray_clear_error();
+    try {
+        if (!metric || !metric->inner) {
+            set_last_error("metric handle is null");
+            return -1;
+        }
+        if (metric->kind != MetricKind::Gauge) {
+            std::string msg = std::string("ray_gauge_set requires a Gauge handle, got ") +
+                              metric_kind_name(metric->kind);
+            set_last_error(msg.c_str());
+            return -1;
+        }
+        if (!std::isfinite(value)) {
+            set_last_error("metric value must be finite");
+            return -1;
+        }
+        std::unordered_map<std::string, std::string> tags_map;
+        if (!validate_and_build_tags(tags, tag_count, tags_map)) return -1;
+        auto runtime = runtime_for_call();
+        if (!runtime) return -1;
+        static_cast<ray::Gauge *>(metric->inner.get())->Set(value, tags_map);
+        return 0;
+    } RAY_CATCH
+    catch (...) {
+        set_last_error("unknown exception in ray_gauge_set");
+    }
+    return -1;
+}
+
+int ray_counter_inc(ray_metric_t *metric,
+                    double value,
+                    const ray_metric_tag_t *tags,
+                    size_t tag_count) {
+    ray_clear_error();
+    try {
+        if (!metric || !metric->inner) {
+            set_last_error("metric handle is null");
+            return -1;
+        }
+        if (metric->kind != MetricKind::Counter) {
+            std::string msg =
+                std::string("ray_counter_inc requires a Counter handle, got ") +
+                metric_kind_name(metric->kind);
+            set_last_error(msg.c_str());
+            return -1;
+        }
+        if (!std::isfinite(value)) {
+            set_last_error("metric value must be finite");
+            return -1;
+        }
+        if (value < 0.0) {
+            set_last_error("counter increment value must be non-negative");
+            return -1;
+        }
+        std::unordered_map<std::string, std::string> tags_map;
+        if (!validate_and_build_tags(tags, tag_count, tags_map)) return -1;
+        auto runtime = runtime_for_call();
+        if (!runtime) return -1;
+        static_cast<ray::Counter *>(metric->inner.get())->Inc(value, tags_map);
+        return 0;
+    } RAY_CATCH
+    catch (...) {
+        set_last_error("unknown exception in ray_counter_inc");
+    }
+    return -1;
+}
+
+int ray_histogram_observe(ray_metric_t *metric,
+                          double value,
+                          const ray_metric_tag_t *tags,
+                          size_t tag_count) {
+    ray_clear_error();
+    try {
+        if (!metric || !metric->inner) {
+            set_last_error("metric handle is null");
+            return -1;
+        }
+        if (metric->kind != MetricKind::Histogram) {
+            std::string msg =
+                std::string("ray_histogram_observe requires a Histogram handle, got ") +
+                metric_kind_name(metric->kind);
+            set_last_error(msg.c_str());
+            return -1;
+        }
+        if (!std::isfinite(value)) {
+            set_last_error("metric value must be finite");
+            return -1;
+        }
+        std::unordered_map<std::string, std::string> tags_map;
+        if (!validate_and_build_tags(tags, tag_count, tags_map)) return -1;
+        auto runtime = runtime_for_call();
+        if (!runtime) return -1;
+        static_cast<ray::Histogram *>(metric->inner.get())->Observe(value, tags_map);
+        return 0;
+    } RAY_CATCH
+    catch (...) {
+        set_last_error("unknown exception in ray_histogram_observe");
+    }
+    return -1;
+}
+
+int ray_metric_record(ray_metric_t *metric,
+                      double value,
+                      const ray_metric_tag_t *tags,
+                      size_t tag_count) {
+    ray_clear_error();
+    try {
+        if (!metric || !metric->inner) {
+            set_last_error("metric handle is null");
+            return -1;
+        }
+        if (!std::isfinite(value)) {
+            set_last_error("metric value must be finite");
+            return -1;
+        }
+        if (metric->kind == MetricKind::Counter && value < 0.0) {
+            set_last_error("counter increment value must be non-negative");
+            return -1;
+        }
+        std::unordered_map<std::string, std::string> tags_map;
+        if (!validate_and_build_tags(tags, tag_count, tags_map)) return -1;
+        auto runtime = runtime_for_call();
+        if (!runtime) return -1;
+        metric->inner->Record(value, tags_map);
+        return 0;
+    } RAY_CATCH
+    catch (...) {
+        set_last_error("unknown exception in ray_metric_record");
+    }
+    return -1;
 }
 
 // ─── Memory Management ────────────────────────────────────────

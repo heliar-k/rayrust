@@ -33,7 +33,7 @@ fn error_from_kind(kind: ErrorKind, msg: String) -> RayError {
 }
 
 /// Build an FFI error with the C-side last_error message if available.
-fn ffi_error(context: &str) -> RayError {
+pub(crate) fn ffi_error(context: &str) -> RayError {
     let msg = rayrust_sys::last_error().unwrap_or_else(|| "unknown FFI error".to_string());
     error_from_kind(
         rayrust_sys::last_error_kind(),
