@@ -1436,6 +1436,34 @@ ray_bytes_t ray_put_xlang(const char *data, size_t len) {
     }
 }
 
+/// 将 `RayRuntime::Get` 返回的非空 `msgpack::sbuffer` 底层字节缓冲区移交给 `out`。
+///
+/// `NativeObjectStore::GetRaw`（`cpp/src/ray/runtime/object/native_object_store.cc:61-68, 90-134`）
+/// 与 `LocalModeObjectStore::GetRaw`（`cpp/src/ray/runtime/object/local_mode_object_store.cc:48-55, 57-80`）
+/// 每次调用均构造独立的 `std::make_shared<msgpack::sbuffer>`。`msgpack::sbuffer`
+/// （`msgpack/v1/sbuffer.hpp:24-141`）在构造（`:26-36`，`:31`）与扩容（`:108-129`，`:122`）时使用
+/// 全局 C 标准库 `::malloc` / `::realloc` 分配 `m_data`，析构（`:38-41`，`:40`）调用 `::free(m_data)`，
+/// 与 `ray_free_bytes` / `ray_free_bytes_array` 的 `std::free` 属于同一分配器。当 `buffer`
+/// 由当前调用独占（`use_count() == 1`）且 `data()` 非空时，通过 `sbuffer::release()`（`:93-100`）
+/// 直接交出 `m_data` 并将 `sbuffer` 内部指针清零；共享缓冲区的防御分支退回 `std::malloc` + `std::memcpy`。
+static bool take_sbuffer_bytes(std::shared_ptr<msgpack::sbuffer> &buffer,
+                               ray_bytes_t &out) {
+    const size_t size = buffer->size();
+    if (buffer.use_count() == 1 && buffer->data() != nullptr) {
+        char *data = buffer->release();
+        out = ray_bytes_t{data, size};
+        return true;
+    }
+    char *data = static_cast<char *>(std::malloc(size));
+    if (!data) {
+        out = ray_bytes_t{nullptr, 0};
+        return false;
+    }
+    std::memcpy(data, buffer->data(), size);
+    out = ray_bytes_t{data, size};
+    return true;
+}
+
 ray_bytes_t ray_get(const char *id_data, size_t id_len, int timeout_ms) {
     ray_clear_error();
     try {
@@ -1461,13 +1489,12 @@ ray_bytes_t ray_get(const char *id_data, size_t id_len, int timeout_ms) {
             set_last_error_kind(kUntranslatedObjectError, RAY_ERROR_KIND_UNCLASSIFIED);
             return ray_bytes_t{nullptr, 0};
         }
-        char *data = static_cast<char *>(std::malloc(size));
-        if (!data) {
+        ray_bytes_t out{nullptr, 0};
+        if (!take_sbuffer_bytes(buffer, out)) {
             set_last_error("out of memory copying the object");
             return ray_bytes_t{nullptr, 0};
         }
-        std::memcpy(data, buffer->data(), size);
-        return ray_bytes_t{data, size};
+        return out;
     } catch (const std::exception &e) {
         set_last_error_exception(e);
         return ray_bytes_t{nullptr, 0};
@@ -3171,16 +3198,13 @@ static void fetch_single_element(ray::internal::RayRuntime &runtime,
             }
             return;
         }
-        char *data = static_cast<char *>(std::malloc(size));
-        if (!data) {
+        if (!take_sbuffer_bytes(buffer, slot)) {
             if (!failure_recorded) {
                 set_last_error("out of memory copying an object in the batch");
                 failure_recorded = true;
             }
             return;
         }
-        std::memcpy(data, buffer->data(), size);
-        slot = ray_bytes_t{data, size};
     } catch (const std::exception &e) {
         if (!failure_recorded) {
             set_last_error_exception(e);

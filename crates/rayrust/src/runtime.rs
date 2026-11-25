@@ -1658,17 +1658,19 @@ pub(crate) fn put_xlang_raw(data: &[u8]) -> Result<Vec<u8>, RayError> {
     Ok(guard.as_slice().to_vec())
 }
 
-/// Get raw bytes from the object store by binary ID. Blocks until ready.
-pub(crate) fn get_raw(id: &[u8]) -> Result<Vec<u8>, RayError> {
+/// Get raw object bytes from the object store by binary ID. Blocks until ready.
+///
+/// 返回持有 C 缓冲区的 [`CBytesGuard`]，调用方可在其切片上原地解码并在作用域结束时释放。
+pub(crate) fn get_raw(id: &[u8]) -> Result<CBytesGuard, RayError> {
     get_raw_timeout(id, -1)
 }
 
-/// Get raw bytes from the object store by binary ID with timeout.
+/// Get raw object bytes from the object store by binary ID with timeout.
 ///
-/// 收到零长度缓冲区（不带错误文本的未翻译失败对象）时由 C 侧记录并返回
-/// `RayError::Unclassified`；携带未翻译错误帧的对象有非空载荷，这里原样返回字节，
-/// 由上层读取入口在解码之前识别为 `RayError::Unclassified`。
-pub(crate) fn get_raw_timeout(id: &[u8], timeout_ms: i32) -> Result<Vec<u8>, RayError> {
+/// 返回持有 C 缓冲区的 [`CBytesGuard`]。收到零长度缓冲区（不带错误文本的未翻译失败对象）
+/// 时由 C 侧记录并返回 `RayError::Unclassified`；携带未翻译错误帧的对象有非空载荷，这里
+/// 原样返回缓冲区守卫，由上层读取入口在解码之前识别为 `RayError::Unclassified`。
+pub(crate) fn get_raw_timeout(id: &[u8], timeout_ms: i32) -> Result<CBytesGuard, RayError> {
     validate_timeout(timeout_ms)?;
 
     // Clear first so the kind read below belongs to this call.
@@ -1690,7 +1692,7 @@ pub(crate) fn get_raw_timeout(id: &[u8], timeout_ms: i32) -> Result<Vec<u8>, Ray
             ffi_error("ray_get")
         }
     })?;
-    Ok(guard.as_slice().to_vec())
+    Ok(guard)
 }
 
 // ─── Task ─────────────────────────────────────────────────────

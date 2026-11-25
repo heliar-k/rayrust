@@ -71,22 +71,56 @@ pub fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, RayError> {
     Ok(buf)
 }
 
+/// 探测 `rmp_serde::Deserializer` 是否已经到达输入切片末尾，不继续解析后续元素。
+struct TrailingByteProbe;
+
+impl<'de> serde::de::Visitor<'de> for TrailingByteProbe {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("end of msgpack slice")
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(
+        self,
+        _deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        Ok(())
+    }
+}
+
 /// Deserialize a single value from msgpack bytes.
 ///
-/// The entire `data` slice must be consumed by that single msgpack value; any
-/// trailing bytes after the first value return [`RayError::Serialization`].
+/// Reads directly from `data` via `Deserializer::from_read_ref` without allocating
+/// an intermediate scratch buffer. The entire `data` slice must be consumed by
+/// that single msgpack value; any trailing bytes after the first value return
+/// [`RayError::Serialization`].
 pub fn deserialize<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T, RayError> {
-    let mut de = rmp_serde::Deserializer::new(data);
+    let mut de = rmp_serde::Deserializer::from_read_ref(data);
     let value = T::deserialize(&mut de)?;
-    let remaining = de.into_inner();
-    if !remaining.is_empty() {
-        return Err(RayError::Serialization(format!(
-            "trailing bytes after msgpack value: {} unconsumed byte(s) out of {}",
-            remaining.len(),
-            data.len()
-        )));
+    match serde::Deserializer::deserialize_option(&mut de, TrailingByteProbe) {
+        Err(rmp_serde::decode::Error::InvalidMarkerRead(ref io_err))
+            if io_err.kind() == std::io::ErrorKind::UnexpectedEof =>
+        {
+            Ok(value)
+        }
+        Ok(()) | Err(_) => {
+            let mut cursor = data;
+            let unconsumed = match rmpv::decode::read_value_ref(&mut cursor) {
+                Ok(_) => cursor.len().max(1),
+                Err(_) => 1,
+            };
+            Err(RayError::Serialization(format!(
+                "trailing bytes after msgpack value: {} unconsumed byte(s) out of {}",
+                unconsumed,
+                data.len()
+            )))
+        }
     }
-    Ok(value)
 }
 
 // ─── Cross-language (XLANG) support ────────────────────────────
@@ -241,11 +275,13 @@ pub fn deserialize_xlang_value(data: &[u8]) -> Result<rmpv::Value, RayError> {
 
 /// Deserialize raw msgpack bytes into a generic msgpack Value (no XLANG header).
 ///
-/// The entire `data` slice must be consumed by a single msgpack value; any
-/// trailing bytes after the first value return [`RayError::Serialization`].
+/// Scans `data` via `read_value_ref` before materializing owned buffers so each
+/// string or binary payload allocates its exact target capacity once. The entire
+/// `data` slice must be consumed by a single msgpack value; any trailing bytes
+/// after the first value return [`RayError::Serialization`].
 pub fn deserialize_value(data: &[u8]) -> Result<rmpv::Value, RayError> {
     let mut reader = data;
-    let value = rmpv::decode::read_value(&mut reader)
+    let value_ref = rmpv::decode::read_value_ref(&mut reader)
         .map_err(|e| RayError::Serialization(format!("msgpack value decode error: {}", e)))?;
     if !reader.is_empty() {
         return Err(RayError::Serialization(format!(
@@ -254,7 +290,7 @@ pub fn deserialize_value(data: &[u8]) -> Result<rmpv::Value, RayError> {
             data.len()
         )));
     }
-    Ok(value)
+    Ok(value_ref.to_owned())
 }
 
 // ─── Tests ─────────────────────────────────────────────────────
