@@ -177,7 +177,7 @@ fn cluster_config() -> RayConfig {
 /// 1. runtime_env：env_vars 到达工人进程；同步与异步调用器各一次正向断言，
 /// 不带 runtime_env 的对照读到 None。
 async fn runtime_env_check(ray: &Ray, cluster: bool) {
-    println!("\n--- 1. runtime_env 的 env_vars ---");
+    println!("\n--- 1. runtime_env env_vars ---");
     let opts = TaskOptions::new().runtime_env(r#"{"env_vars":{"RAYRUST_TASK_ENV":"hello"}}"#);
 
     let sync = env_check_remote_with_options(ray, &opts, ENV_VAR.to_string())
@@ -194,20 +194,20 @@ async fn runtime_env_check(ray: &Ray, cluster: bool) {
         assert_eq!(
             (sync.as_deref(), asynchronous.as_deref()),
             (Some("hello"), Some("hello")),
-            "带 env_vars 的同步/异步调用器读到 (sync {:?}, async {:?})",
+            "with env_vars sync/async callers returned (sync {:?}, async {:?})",
             sync,
             asynchronous
         );
-        println!("  同步 _with_options + env_vars → {:?}", sync);
-        println!("  异步 _with_options + env_vars → {:?}", asynchronous);
+        println!("  sync _with_options + env_vars -> {:?}", sync);
+        println!("  async _with_options + env_vars -> {:?}", asynchronous);
     } else {
         // 本地模式丢弃 CallOptions，这里只要求提交与读取不失败。
         println!(
-            "  同步 _with_options + env_vars → {:?}（本地模式丢弃 CallOptions）",
+            "  sync _with_options + env_vars -> {:?} (local mode drops CallOptions)",
             sync
         );
         println!(
-            "  异步 _with_options + env_vars → {:?}（本地模式丢弃 CallOptions）",
+            "  async _with_options + env_vars -> {:?} (local mode drops CallOptions)",
             asynchronous
         );
     }
@@ -224,18 +224,18 @@ async fn runtime_env_check(ray: &Ray, cluster: bool) {
     assert_eq!(
         (plain_sync, plain_async),
         (None, None),
-        "不带 runtime_env 的任务读到了不该存在的值"
+        "task without runtime_env read unexpected env var"
     );
-    println!("  对照（不带 runtime_env）→ 同步 None，异步 None");
+    println!("  control (no runtime_env) -> sync None, async None");
 }
 
 /// 2. name + placement group + 异步 options：一段流程三个证据。
 async fn name_and_placement_group_check(ray: &Ray, cluster: bool) {
-    println!("\n--- 2. name + placement group + 异步 options ---");
+    println!("\n--- 2. name + placement group + async options ---");
     if !cluster {
-        println!("  本地模式跳过：LocalModeTaskSubmitter 丢弃 CallOptions，PG 绑定");
-        println!("  无从谈起；AbstractRayRuntime 的 GetPlacementGroupById 在本地模式");
-        println!("  解引用空的 GCS accessor 会终止进程，C 侧直接报错（第 3 项）。");
+        println!("  skipped in local mode: LocalModeTaskSubmitter drops CallOptions;");
+        println!("  GetPlacementGroupById in AbstractRayRuntime would dereference a null");
+        println!("  GCS accessor in local mode, so C side returns an error (checked in step 3).");
         return;
     }
 
@@ -243,7 +243,7 @@ async fn name_and_placement_group_check(ray: &Ray, cluster: bool) {
     let pg_id = ray
         .placement_group_create("rayrust_task_options_pg", r#"[{"CPU":1}]"#, 0)
         .expect("create the placement group");
-    println!("  placement_group_create → {} 字节 id", pg_id.len());
+    println!("  placement_group_create -> {}-byte id", pg_id.len());
 
     // a) 先证明组已经生效：绑 bundle 0 + CPU 1。这个任务只能在 bundle 里跑，它完成
     // 就说明 raylet 已经把 bundle 建好、CPU 也从节点可用资源里扣掉了。不先做这一步
@@ -259,9 +259,9 @@ async fn name_and_placement_group_check(ray: &Ray, cluster: bool) {
     let value = bound
         .get_timeout(PG_BOUND_TIMEOUT_MS)
         .expect("the bound task must finish within its deadline");
-    assert_eq!(value, 0, "sleep_for 返回了 {}", value);
+    assert_eq!(value, 0, "sleep_for returned {}", value);
     println!(
-        "  绑 bundle 0 + CPU 1（异步 _with_options）→ 完成，耗时 {:?}（组已生效）",
+        "  bound to bundle 0 + CPU 1 (async _with_options) -> finished in {:?} (group active)",
         started.elapsed()
     );
 
@@ -273,20 +273,20 @@ async fn name_and_placement_group_check(ray: &Ray, cluster: bool) {
             .await
             .expect("submit the named queued sleep_for")
             .cast();
-    println!("  已提交排队任务，名字 {}", name);
+    println!("  submitted queued task with name {}", name);
 
     // c) 期限内拿不到结果：返回的是 Timeout。
     let started = Instant::now();
     match queued.get_timeout(WAIT_TIMEOUT_MS) {
         Err(RayError::Timeout(msg)) => println!(
-            "  排队任务 get_timeout({}ms) → Timeout（{:?}）：{}",
+            "  queued task get_timeout({}ms) -> Timeout ({:?}): {}",
             WAIT_TIMEOUT_MS,
             started.elapsed(),
             msg
         ),
-        Err(other) => panic!("排队任务返回了别的错误变体: {}", other),
+        Err(other) => panic!("queued task returned unexpected error variant: {}", other),
         Ok(v) => panic!(
-            "组已经生效，不绑组的任务却完成了（{}）——绑定的对照不成立",
+            "unbound task finished ({}) while placement group held the CPU",
             v
         ),
     }
@@ -294,32 +294,32 @@ async fn name_and_placement_group_check(ray: &Ray, cluster: bool) {
     // d) 句柄存活时取消：返回 Ok。
     ray.cancel(queued.id(), false, true)
         .expect("cancel the queued task with its handle alive");
-    println!("  句柄存活时 cancel → Ok");
+    println!("  cancel while handle alive -> Ok");
 
     // e) 引用变成失败，不再继续等资源。
     match queued.get_timeout(PG_BOUND_TIMEOUT_MS) {
-        Err(RayError::Timeout(_)) => panic!("cancel 之后任务还在等资源，没有变成失败"),
-        Err(other) => println!("  cancel 之后读取 → {}（引用已失败）", other),
-        Ok(v) => panic!("被 cancel 的任务返回了 Ok({})", v),
+        Err(RayError::Timeout(_)) => panic!("task still timed out waiting for resources after cancel"),
+        Err(other) => println!("  read after cancel -> {} (ref failed)", other),
+        Ok(v) => panic!("cancelled task unexpectedly returned Ok({})", v),
     }
 
     // f) 名字进入任务规格：本轮驱动日志里有 task_name=<本轮名字>。
     let needle = format!("task_name={}", name);
     let line = wait_driver_log_line(&needle).await.unwrap_or_else(|| {
         panic!(
-            "驱动日志 {} 里没有本轮（pid {}）的 {}",
+            "driver log {} for pid {} missing {}",
             DRIVER_LOG_DIR,
             std::process::id(),
             needle
         )
     });
-    println!("  日志证据: {}", line);
+    println!("  log evidence: {}", line);
 
     // g) 移除组，再把同一个不绑组的任务提交一次：这次它应该能跑完。这一步把
     //「b/c 的不就绪」归因到组本身，而不是任务或调用器有问题。
     ray.placement_group_remove(&pg_id)
         .expect("remove the placement group after the cancel check");
-    println!("  placement group 已 remove，资源归还");
+    println!("  placement group removed, resources freed");
 
     let unbound_after = sleep_for_remote_async_with_options(ray, &queued_opts, TASK_SLEEP_S)
         .await
@@ -328,27 +328,27 @@ async fn name_and_placement_group_check(ray: &Ray, cluster: bool) {
     let value = unbound_after
         .get_timeout(PG_BOUND_TIMEOUT_MS)
         .expect("the same task must finish once the group is gone");
-    assert_eq!(value, 0, "sleep_for 返回了 {}", value);
+    assert_eq!(value, 0, "sleep_for returned {}", value);
     println!(
-        "  移除组后同一个不绑组任务 → 完成，耗时 {:?}",
+        "  same unbound task after group removal -> finished in {:?}",
         started.elapsed()
     );
 }
 
 /// 3. 未知 placement group 与孤立的 bundle_index：提交时立即报错，不静默调度。
 async fn unknown_pg_check(ray: &Ray) {
-    println!("\n--- 3. 未知 placement group ---");
+    println!("\n--- 3. Unknown placement group ---");
     // PlacementGroupID 的长度是 18（14 唯一字节 + 4 字节 JobID）。集群模式：查不到
     // 的 group 报错；本地模式：直接不支持。两者都是提交侧的 Ffi。
     let unknown: Vec<u8> = (0..18u8).collect();
     let opts = TaskOptions::new().placement_group(unknown, 0);
     let name = serialize(&ENV_VAR.to_string()).expect("serialize");
     match ray.task_call("env_check", &[&name], &[], &opts) {
-        Err(RayError::Ffi(msg)) => println!("  随机 18 字节 group id → Ffi({})", msg),
-        Err(other) => panic!("未知 group 返回了别的错误变体: {}", other),
-        Ok(_) => panic!("未知 group 的任务被提交了（静默退回默认调度）"),
+        Err(RayError::Ffi(msg)) => println!("  random 18-byte group id -> Ffi({})", msg),
+        Err(other) => panic!("unknown group returned unexpected error variant: {}", other),
+        Ok(_) => panic!("task with unknown group was submitted (fell back to default scheduling)"),
     }
-    println!("  进程存活：错误发生在提交侧，没有 abort");
+    println!("  process alive: error reported on submission without aborting");
 
     // 孤立的 bundle_index：`to_json` 不输出它，提交前必须被拒，不能静默丢掉字段。
     let standalone = TaskOptions {
@@ -356,19 +356,21 @@ async fn unknown_pg_check(ray: &Ray) {
         ..Default::default()
     };
     match ray.task_call("env_check", &[&name], &[], &standalone) {
-        Err(RayError::Ffi(msg)) => println!("  孤立 bundle_index=0（无 group）→ Ffi({})", msg),
-        Err(other) => panic!("孤立 bundle_index 返回了别的错误变体: {}", other),
-        Ok(_) => panic!("孤立 bundle_index 被静默丢掉了，任务照常提交"),
+        Err(RayError::Ffi(msg)) => println!("  standalone bundle_index=0 (no group) -> Ffi({})", msg),
+        Err(other) => panic!(
+            "standalone bundle_index returned unexpected error variant: {}",
+            other
+        ),
+        Ok(_) => panic!("standalone bundle_index was silently dropped and task submitted"),
     }
-    println!("  进程存活：孤立 bundle_index 在提交前就被拒");
+    println!("  process alive: standalone bundle_index refused before submission");
 }
 
 /// 4. resources：`CPU 2.0` 在这台 1 CPU 的集群上永远不就绪，`CPU 1.0` 正常完成。
 async fn resources_check(ray: &Ray, cluster: bool) {
     println!("\n--- 4. resources ---");
     if !cluster {
-        println!("  本地模式跳过：LocalModeTaskSubmitter 丢弃资源需求，CPU 2.0 与");
-        println!("  CPU 1.0 没有区别，构不成对照。");
+        println!("  skipped in local mode: LocalModeTaskSubmitter drops resource requirements.");
         return;
     }
 
@@ -380,16 +382,20 @@ async fn resources_check(ray: &Ray, cluster: bool) {
     let (ready, unready) = ray
         .wait(&[oversize.clone()], 1, WAIT_TIMEOUT_MS)
         .expect("wait on the CPU 2.0 task");
-    assert_eq!(ready.len(), 0, "CPU 2.0 的任务在 1 CPU 集群上就绪了");
+    assert_eq!(
+        ready.len(),
+        0,
+        "CPU 2.0 task unexpectedly became ready on 1-CPU cluster"
+    );
     assert_eq!(unready.len(), 1);
     println!(
-        "  resource(\"CPU\", 2.0) → wait({}ms) 后仍不就绪（{:?}）",
+        "  resource(\"CPU\", 2.0) -> still unready after wait({}ms) ({:?})",
         WAIT_TIMEOUT_MS,
         started.elapsed()
     );
     ray.cancel(oversize.id(), false, true)
         .expect("cancel the CPU 2.0 task with its handle alive");
-    println!("  句柄存活时 cancel → Ok");
+    println!("  cancel while handle alive -> Ok");
 
     let opts = TaskOptions::new().resource("CPU", 1.0);
     let fits = sleep_for_remote_with_options(ray, &opts, TASK_SLEEP_S)
@@ -398,20 +404,19 @@ async fn resources_check(ray: &Ray, cluster: bool) {
     let value = fits
         .get_timeout(PG_BOUND_TIMEOUT_MS)
         .expect("the CPU 1.0 task must finish");
-    assert_eq!(value, 0, "sleep_for 返回了 {}", value);
+    assert_eq!(value, 0, "sleep_for returned {}", value);
     println!(
-        "  resource(\"CPU\", 1.0) → 完成，耗时 {:?}",
+        "  resource(\"CPU\", 1.0) -> finished in {:?}",
         started.elapsed()
     );
 }
 
 /// 5. 默认资源：不给 resources 的任务要 1 个 CPU。
 async fn default_cpu_check(ray: &Ray, cluster: bool) {
-    println!("\n--- 5. 默认资源 = 1 个 CPU ---");
+    println!("\n--- 5. Default resource = 1 CPU ---");
     if !cluster {
-        println!("  本地模式跳过：LocalModeTaskSubmitter 丢弃 CallOptions，资源需求");
-        println!("  不生效，「占住 CPU 后默认任务排队」无从观察。");
-        println!("  to_json() 为空串由单元测试覆盖（cargo test -p rayrust --lib）");
+        println!("  skipped in local mode: LocalModeTaskSubmitter drops CallOptions.");
+        println!("  empty to_json() is covered by unit tests (cargo test -p rayrust --lib)");
         return;
     }
 
@@ -426,8 +431,8 @@ async fn default_cpu_check(ray: &Ray, cluster: bool) {
         .expect("submit the bound sleep_for")
         .get_timeout(PG_BOUND_TIMEOUT_MS)
         .expect("the bound task must finish within its deadline");
-    assert_eq!(value, 0, "sleep_for 返回了 {}", value);
-    println!("  绑组任务完成（组已占住唯一 CPU）");
+    assert_eq!(value, 0, "sleep_for returned {}", value);
+    println!("  bound task finished (group holds the sole CPU)");
 
     // a) 空资源表 = Ray 的默认值 1 个 CPU：此刻没有空闲 CPU。
     let default_task: ObjectRef<i64> =
@@ -436,10 +441,14 @@ async fn default_cpu_check(ray: &Ray, cluster: bool) {
     let (ready, unready) = ray
         .wait(&[default_task.clone()], 1, DEFAULT_CPU_WAIT_MS)
         .expect("wait on the default-options task");
-    assert_eq!(ready.len(), 0, "默认任务在 CPU 被占住时就绪了");
+    assert_eq!(
+        ready.len(),
+        0,
+        "default task became ready while CPU was held"
+    );
     assert_eq!(unready.len(), 1);
     println!(
-        "  TaskOptions::new() → wait({}ms) 后仍不就绪（默认要 1 个 CPU）",
+        "  TaskOptions::new() -> unready after wait({}ms) (requests 1 CPU by default)",
         DEFAULT_CPU_WAIT_MS
     );
 
@@ -449,8 +458,8 @@ async fn default_cpu_check(ray: &Ray, cluster: bool) {
         .expect("submit the CPU 0.0 sleep_for")
         .get_timeout(PG_BOUND_TIMEOUT_MS)
         .expect("the CPU 0.0 task must finish while the CPU is taken");
-    assert_eq!(value, 0, "sleep_for 返回了 {}", value);
-    println!("  resource(\"CPU\", 0.0) → 完成（零 CPU 的任务不受占住的 CPU 影响）");
+    assert_eq!(value, 0, "sleep_for returned {}", value);
+    println!("  resource(\"CPU\", 0.0) -> finished (zero-CPU task not blocked by held CPU)");
 
     // c) 只给别的资源、不给 CPU 时，Ray 会合并 1.0 个 CPU。
     let custom_only: ObjectRef<i64> = sleep_for_remote_with_options(
@@ -462,15 +471,19 @@ async fn default_cpu_check(ray: &Ray, cluster: bool) {
     let (ready, unready) = ray
         .wait(&[custom_only.clone()], 1, DEFAULT_CPU_WAIT_MS)
         .expect("wait on the Custom-only task");
-    assert_eq!(ready.len(), 0, "只写 Custom 的任务在 CPU 被占住时就绪了");
+    assert_eq!(
+        ready.len(),
+        0,
+        "Custom-only task became ready while CPU was held"
+    );
     assert_eq!(unready.len(), 1);
     println!(
-        "  resource(\"Custom\", 1.0)（没有 CPU 键）→ wait({}ms) 后仍不就绪（合并了 CPU）",
+        "  resource(\"Custom\", 1.0) (no CPU key) -> unready after wait({}ms) (merged default CPU)",
         DEFAULT_CPU_WAIT_MS
     );
     ray.cancel(custom_only.id(), false, true)
         .expect("cancel the Custom-only task with its handle alive");
-    println!("  句柄存活时 cancel → Ok");
+    println!("  cancel while handle alive -> Ok");
 
     // 对照：同样要 Custom，显式写 CPU 0.0 就能跑，所以节点上确实有 1 个 Custom，
     // c) 的不就绪来自合并进来的 CPU。
@@ -481,8 +494,8 @@ async fn default_cpu_check(ray: &Ray, cluster: bool) {
         .expect("submit the Custom + CPU 0.0 sleep_for")
         .get_timeout(PG_BOUND_TIMEOUT_MS)
         .expect("the Custom + CPU 0.0 task must finish");
-    assert_eq!(value, 0, "sleep_for 返回了 {}", value);
-    println!("  resource(\"Custom\", 1.0) + resource(\"CPU\", 0.0) → 完成");
+    assert_eq!(value, 0, "sleep_for returned {}", value);
+    println!("  resource(\"Custom\", 1.0) + resource(\"CPU\", 0.0) -> finished");
 
     // d) Python 任务入口没有 options，所以它总是要 1 个 CPU。
     let arg = serialize(&SHORT_TASK_SLEEP_S).expect("serialize the Python sleep_for argument");
@@ -492,31 +505,35 @@ async fn default_cpu_check(ray: &Ray, cluster: bool) {
     let (ready, unready) = ray
         .wait(&[python_task.clone()], 1, DEFAULT_CPU_WAIT_MS)
         .expect("wait on the Python sleep_for");
-    assert_eq!(ready.len(), 0, "Python 任务在 CPU 被占住时就绪了");
+    assert_eq!(
+        ready.len(),
+        0,
+        "Python task became ready while CPU was held"
+    );
     assert_eq!(unready.len(), 1);
     println!(
-        "  task_call_python(sleep_for) → wait({}ms) 后仍不就绪（总是要 1 个 CPU）",
+        "  task_call_python(sleep_for) -> unready after wait({}ms) (always requests 1 CPU)",
         DEFAULT_CPU_WAIT_MS
     );
 
     // e) 移除组：a) 与 d) 里不就绪的任务都该跑完，不就绪确实来自被占住的 CPU。
     ray.placement_group_remove(&pg_id)
         .expect("remove the placement group after the Custom resource check");
-    println!("  placement group 已 remove，资源归还");
+    println!("  placement group removed, resources freed");
 
     let value = python_task
         .cast::<i64>()
         .get_timeout(PG_BOUND_TIMEOUT_MS)
         .expect("the Python task must finish once the group is gone");
-    assert_eq!(value, 0, "Python sleep_for 返回了 {}", value);
-    println!("  移除组后同一个 Python 任务 → 完成");
+    assert_eq!(value, 0, "Python sleep_for returned {}", value);
+    println!("  same Python task after group removal -> finished");
 
     let value = default_task
         .get_timeout(PG_BOUND_TIMEOUT_MS)
         .expect("the default-options task must finish once the group is gone");
-    assert_eq!(value, 0, "sleep_for 返回了 {}", value);
-    println!("  移除组后 TaskOptions::new() 的任务 → 完成");
-    println!("  to_json() 为空串由单元测试覆盖（cargo test -p rayrust --lib）");
+    assert_eq!(value, 0, "sleep_for returned {}", value);
+    println!("  TaskOptions::new() task after group removal -> finished");
+    println!("  empty to_json() is covered by unit tests (cargo test -p rayrust --lib)");
 }
 
 #[tokio::main]
@@ -524,7 +541,7 @@ async fn main() {
     let mode = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "cluster".to_string());
-    println!("=== TaskOptions 五个字段 ({}) ===", mode);
+    println!("=== TaskOptions five fields ({}) ===", mode);
     clean_own_output();
     let cluster = mode == "cluster";
     let config = if cluster {
@@ -544,5 +561,5 @@ async fn main() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     clean_own_output();
-    println!("\n✓ TaskOptions 检查全部通过");
+    println!("\nPASS: all TaskOptions checks passed");
 }

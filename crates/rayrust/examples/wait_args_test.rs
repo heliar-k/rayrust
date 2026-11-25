@@ -76,16 +76,16 @@ fn expect_rejected<T>(
     match result {
         Err(RayError::Ffi(message)) => {
             if !message.contains(sentence) {
-                fail(format!("{}: 错误文本里没有那句话: {}", label, message));
+                fail(format!("{}: error message missing expected phrase: {}", label, message));
             }
             if !message.contains("ray_wait") {
-                fail(format!("{}: 错误文本里没有入口名: {}", label, message));
+                fail(format!("{}: error message missing entry name: {}", label, message));
             }
-            println!("  {} → Ffi({})", label, message);
+            println!("  {} -> Ffi({})", label, message);
         }
-        Err(other) => fail(format!("{}: 返回了别的错误变体: {}", label, other)),
+        Err(other) => fail(format!("{}: returned unexpected error variant: {}", label, other)),
         Ok((ready, unready)) => fail(format!(
-            "{}: 被接受了, ready {} 个, unready {} 个",
+            "{}: unexpectedly succeeded, ready={}, unready={}",
             label,
             ready.len(),
             unready.len()
@@ -100,18 +100,18 @@ fn assert_runtime_alive(ray: &Ray, after: &str) {
         Ok((ready, unready)) => {
             if ready.len() != 1 || !unready.is_empty() {
                 fail(format!(
-                    "{} 之后的合法等待: ready {} 个, unready {} 个",
+                    "valid wait after {}: ready={}, unready={}",
                     after,
                     ready.len(),
                     unready.len()
                 ));
             }
             println!(
-                "  {} 之后合法 wait([a], 1, {}) → Ok，ready 1 个",
-                after, LEGAL_TIMEOUT_MS
+                "  valid wait([a], 1, {}) after {} -> Ok, ready=1",
+                LEGAL_TIMEOUT_MS, after
             );
         }
-        Err(e) => fail(format!("{} 之后的合法等待返回了错误: {}", after, e)),
+        Err(e) => fail(format!("valid wait after {} returned error: {}", after, e)),
     }
 }
 
@@ -120,7 +120,7 @@ async fn main() {
     let mode = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "cluster".to_string());
-    println!("=== Ray::wait 的数量与重复 id ({}) ===", mode);
+    println!("=== Ray::wait count and duplicate id ({}) ===", mode);
     let config = match mode.as_str() {
         "local" => RayConfig::local(),
         "cluster" => cluster_config(),
@@ -134,48 +134,48 @@ async fn main() {
     // 被拒绝的那几次等待都用同一个引用。
     let r = ray.put(&7i64).expect("put(7)");
 
-    println!("\n--- 1. num_objects 大于引用数 ---");
+    println!("\n--- 1. num_objects greater than refs len ---");
     expect_rejected(
         "wait([r], 2, 20)",
         ray.wait(&[r.clone()], 2, REJECT_TIMEOUT_MS),
         COUNT_SENTENCE,
     );
-    assert_runtime_alive(&ray, "数量大于引用数");
+    assert_runtime_alive(&ray, "count > refs len");
 
-    println!("\n--- 2. 同一个引用传两次 ---");
+    println!("\n--- 2. duplicate ref passed twice ---");
     expect_rejected(
         "wait([r.clone(), r], 2, 20)",
         ray.wait(&[r.clone(), r.clone()], 2, REJECT_TIMEOUT_MS),
         DUPLICATE_SENTENCE,
     );
-    assert_runtime_alive(&ray, "重复 id");
+    assert_runtime_alive(&ray, "duplicate id");
 
-    println!("\n--- 3. num_objects 为 0 ---");
+    println!("\n--- 3. num_objects is 0 ---");
     expect_rejected(
         "wait([r], 0, 20)",
         ray.wait(&[r.clone()], 0, REJECT_TIMEOUT_MS),
         COUNT_SENTENCE,
     );
-    assert_runtime_alive(&ray, "数量为 0");
+    assert_runtime_alive(&ray, "count == 0");
 
-    println!("\n--- 4. 空引用表 ---");
+    println!("\n--- 4. empty ref slice ---");
     let empty: [ObjectRef<i64>; 0] = [];
     expect_rejected(
         "wait([], 0, 20)",
         ray.wait(&empty, 0, REJECT_TIMEOUT_MS),
         COUNT_SENTENCE,
     );
-    assert_runtime_alive(&ray, "空引用表");
+    assert_runtime_alive(&ray, "empty refs");
 
-    println!("\n--- 5. num_objects 超过 i32::MAX ---");
+    println!("\n--- 5. num_objects exceeds i32::MAX ---");
     expect_rejected(
         "wait([r], usize::MAX, 20)",
         ray.wait(&[r.clone()], usize::MAX, REJECT_TIMEOUT_MS),
         COUNT_SENTENCE,
     );
-    assert_runtime_alive(&ray, "数量超过 i32::MAX");
+    assert_runtime_alive(&ray, "count > i32::MAX");
 
-    println!("\n--- 6. 异步入口 ---");
+    println!("\n--- 6. async entry point ---");
     let async_result = ray
         .wait_async(
             &[r.clone()],
@@ -184,30 +184,30 @@ async fn main() {
         )
         .await;
     expect_rejected("wait_async([r], 2, 20ms)", async_result, COUNT_SENTENCE);
-    assert_runtime_alive(&ray, "异步入口");
+    assert_runtime_alive(&ray, "wait_async");
 
-    println!("\n--- 7. 正向对照：两个引用都就绪 ---");
+    println!("\n--- 7. Control: both refs ready ---");
     let a = ray.put(&1i64).expect("put(1)");
     let b = ray.put(&2i64).expect("put(2)");
     match ray.wait(&[a.clone(), b.clone()], 2, READY_TIMEOUT_MS) {
         Ok((ready, unready)) => {
             if ready.len() != 2 || !unready.is_empty() {
                 fail(format!(
-                    "wait([a, b], 2, {}) 返回 ready {} 个, unready {} 个",
+                    "wait([a, b], 2, {}) returned ready={}, unready={}",
                     READY_TIMEOUT_MS,
                     ready.len(),
                     unready.len()
                 ));
             }
-            println!("  wait([a, b], 2, {}) → 两个都就绪", READY_TIMEOUT_MS);
+            println!("  wait([a, b], 2, {}) -> both ready", READY_TIMEOUT_MS);
         }
-        Err(e) => fail(format!("wait([a, b], 2, ...) 返回了错误: {}", e)),
+        Err(e) => fail(format!("wait([a, b], 2, ...) returned error: {}", e)),
     }
     match ray.wait(&[a.clone(), b.clone()], 1, READY_TIMEOUT_MS) {
         Ok((ready, unready)) => {
             if ready.len() != 1 || unready.len() != 1 {
                 fail(format!(
-                    "wait([a, b], 1, {}) 返回 ready {} 个, unready {} 个",
+                    "wait([a, b], 1, {}) returned ready={}, unready={}",
                     READY_TIMEOUT_MS,
                     ready.len(),
                     unready.len()
@@ -216,18 +216,17 @@ async fn main() {
             let ready_id = ready[0].id_hex();
             if ready_id != a.id_hex() && ready_id != b.id_hex() {
                 fail(format!(
-                    "wait([a, b], 1, ...) 报就绪的 id 不在这一批里: {}",
+                    "wait([a, b], 1, ...) reported unknown ready id: {}",
                     ready_id
                 ));
             }
             println!(
-                "  wait([a, b], 1, {}) → ready 1 个（ready 被限制在 num_objects 个）, \
-                 unready 1 个，合计仍是两个",
+                "  wait([a, b], 1, {}) -> ready=1 (capped at num_objects), unready=1, total=2",
                 READY_TIMEOUT_MS
             );
         }
-        Err(e) => fail(format!("wait([a, b], 1, ...) 返回了错误: {}", e)),
+        Err(e) => fail(format!("wait([a, b], 1, ...) returned error: {}", e)),
     }
 
-    println!("\n✓ wait 的参数规则在 {} 模式下成立", mode);
+    println!("\nPASS: wait argument rules passed in {} mode", mode);
 }

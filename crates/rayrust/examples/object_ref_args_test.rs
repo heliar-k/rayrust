@@ -112,22 +112,22 @@ fn cluster_config() -> RayConfig {
 
 /// 1. 值参数与引用参数混合，两个方向各一次；非交换任务钉住参数位置。
 async fn mixed_value_and_ref(ray: &Ray) {
-    println!("\n--- 1. 值参数与引用参数混合 ---");
+    println!("\n--- 1. Mixed value and ref arguments ---");
     let ten = ray.put(&10i32).expect("put(10)");
 
     let sum = add_remote(ray, 32, &ten)
         .expect("submit add(32, &ref(10))")
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("read add(32, &ref(10))");
-    assert_eq!(sum, 42, "add(32, &ref(10)) 返回了 {}", sum);
-    println!("  add(32, &ref(10)) → {}", sum);
+    assert_eq!(sum, 42, "add(32, &ref(10)) returned {}", sum);
+    println!("  add(32, &ref(10)) -> {}", sum);
 
     let sum = add_remote(ray, &ten, 32)
         .expect("submit add(&ref(10), 32)")
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("read add(&ref(10), 32)");
-    assert_eq!(sum, 42, "add(&ref(10), 32) 返回了 {}", sum);
-    println!("  add(&ref(10), 32) → {}（加法对照，交换律）", sum);
+    assert_eq!(sum, 42, "add(&ref(10), 32) returned {}", sum);
+    println!("  add(&ref(10), 32) -> {} (commutative control)", sum);
 
     // 引用放在第一个参数位置的两种写法：位置被挪动时 sub 的结果会变成 -7。
     let three = ray.put(&3i32).expect("put(3)");
@@ -135,20 +135,20 @@ async fn mixed_value_and_ref(ray: &Ray) {
         .expect("submit sub(10, &ref(3))")
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("read sub(10, &ref(3))");
-    assert_eq!(value, 7, "sub(10, &ref(3)) 返回了 {}", value);
-    println!("  sub(10, &ref(3)) → {}", value);
+    assert_eq!(value, 7, "sub(10, &ref(3)) returned {}", value);
+    println!("  sub(10, &ref(3)) -> {}", value);
 
     let value = sub_remote(ray, &ten, 3)
         .expect("submit sub(&ref(10), 3)")
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("read sub(&ref(10), 3)");
-    assert_eq!(value, 7, "sub(&ref(10), 3) 返回了 {}", value);
-    println!("  sub(&ref(10), 3) → {}（引用在前，参数位置不交换）", value);
+    assert_eq!(value, 7, "sub(&ref(10), 3) returned {}", value);
+    println!("  sub(&ref(10), 3) -> {} (ref first, arg order preserved)", value);
 }
 
 /// 2. 两步任务图：中间结果只以引用的形式出现在第二个任务的参数里。
 async fn two_step_graph(ray: &Ray) {
-    println!("\n--- 2. 两步任务图（驱动中途不 get）---");
+    println!("\n--- 2. Two-step task graph (no driver get in between) ---");
     let product = multiply_remote(ray, 6, 7).expect("submit multiply(6, 7)");
     // add 的参数是 i32，multiply 的结果是 i64：只换幻影类型，引用仍是同一个 id。
     let product: ObjectRef<i32> = product.cast();
@@ -156,13 +156,13 @@ async fn two_step_graph(ray: &Ray) {
         .expect("submit add(&multiply(6, 7), 1)")
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("read the second task");
-    assert_eq!(sum, 43, "两步任务图返回了 {}", sum);
-    println!("  multiply(6, 7) → add(&乘积, 1) = {}", sum);
+    assert_eq!(sum, 43, "two-step task graph returned {}", sum);
+    println!("  multiply(6, 7) -> add(&product, 1) = {}", sum);
 }
 
 /// 3. 扇出：两个任务消费同一个引用。
 async fn fan_out(ray: &Ray) {
-    println!("\n--- 3. 扇出：两个任务消费同一个引用 ---");
+    println!("\n--- 3. Fan-out: two tasks consume the same ref ---");
     let seven = ray.put(&7i32).expect("put(7)");
     let first = add_remote(ray, &seven, 100)
         .expect("submit add(&ref(7), 100)")
@@ -172,25 +172,25 @@ async fn fan_out(ray: &Ray) {
         .expect("submit add(&ref(7), 200)")
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("read add(&ref(7), 200)");
-    assert_eq!(first, 107, "add(&ref(7), 100) 返回了 {}", first);
-    assert_eq!(second, 207, "add(&ref(7), 200) 返回了 {}", second);
+    assert_eq!(first, 107, "add(&ref(7), 100) returned {}", first);
+    assert_eq!(second, 207, "add(&ref(7), 200) returned {}", second);
     println!(
-        "  add(&ref(7), 100) = {}，add(&ref(7), 200) = {}",
+        "  add(&ref(7), 100) = {}, add(&ref(7), 200) = {}",
         first, second
     );
 }
 
 /// 4. 异步调用带引用参数；包括「future 先建、引用先 drop、再轮询」。
 async fn async_call_with_ref(ray: &Ray, cluster: bool) {
-    println!("\n--- 4. 异步调用带引用参数 ---");
+    println!("\n--- 4. Async call with ref argument ---");
     let seven = ray.put(&7i32).expect("put(7)");
     let sum = add_remote_async(ray, &seven, 35)
         .await
         .expect("submit the async call")
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("read the async call result");
-    assert_eq!(sum, 42, "异步调用返回了 {}", sum);
-    println!("  add_remote_async(&ref(7), 35).await → {}", sum);
+    assert_eq!(sum, 42, "async call returned {}", sum);
+    println!("  add_remote_async(&ref(7), 35).await -> {}", sum);
 
     // future 是 'static 的，提交发生在第一次轮询；调用器自己保活到提交返回，
     // 所以「先 drop 调用方的句柄、再轮询」是合法写法。
@@ -203,15 +203,15 @@ async fn async_call_with_ref(ray: &Ray, cluster: bool) {
         .expect("submit after dropping the caller's handle")
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("read after dropping the caller's handle");
-    assert_eq!(sum, 39, "future 先建、引用先 drop 之后读到 {}", sum);
+    assert_eq!(sum, 39, "future created before drop returned {}", sum);
     println!(
-        "  future 先建、引用先 drop、等 {}ms 再轮询 → {}{}",
+        "  future created, ref dropped, polled after {}ms -> {}{}",
         KEEP_ALIVE_GAP_MS,
         sum,
         if cluster {
             ""
         } else {
-            "（本地模式不参与引用计数，这一条在集群模式下才有区分力）"
+            " (local mode does not ref-count; cluster mode differentiates this)"
         }
     );
 }
@@ -222,7 +222,7 @@ async fn async_call_with_ref(ray: &Ray, cluster: bool) {
 /// （`abstract_ray_runtime.cc:265-272`），而本地模式不初始化 core worker，进程会在
 /// 那里终止。本地模式下的 actor 随进程退出而消失。
 async fn actor_with_ref(ray: &Ray, cluster: bool) {
-    println!("\n--- 5. actor 方法带引用参数 ---");
+    println!("\n--- 5. Actor methods with ref argument ---");
     let handle =
         counter_actor_create(ray, &ActorOptions::new(), 100i64).expect("create the Counter actor");
 
@@ -231,8 +231,8 @@ async fn actor_with_ref(ray: &Ray, cluster: bool) {
         .expect("sync increment(&ref(5))")
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("read the sync increment result");
-    assert_eq!(value, 105, "increment_sync(&ref(5)) 返回了 {}", value);
-    println!("  increment_sync(&ref(5)) → {}", value);
+    assert_eq!(value, 105, "increment_sync(&ref(5)) returned {}", value);
+    println!("  increment_sync(&ref(5)) -> {}", value);
 
     let ten = ray.put(&10i64).expect("put(10)");
     let fut = counter_increment(ray, &handle, &ten);
@@ -243,22 +243,22 @@ async fn actor_with_ref(ray: &Ray, cluster: bool) {
         .expect("submit after dropping the caller's handle")
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("read the async increment result");
-    assert_eq!(value, 115, "increment(&ref(10)) 返回了 {}", value);
-    println!("  increment: future 先建、引用先 drop、再轮询 → {}", value);
+    assert_eq!(value, 115, "increment(&ref(10)) returned {}", value);
+    println!("  increment: future created, ref dropped, then polled -> {}", value);
 
     let value = counter_get_sync(ray, &handle)
         .expect("sync get()")
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("read the sync get result");
-    assert_eq!(value, 115, "get_sync() 返回了 {}", value);
-    println!("  get_sync() → {}", value);
+    assert_eq!(value, 115, "get_sync() returned {}", value);
+    println!("  get_sync() -> {}", value);
 
     if cluster {
         let _ = ray.kill_actor(&handle, true);
-        println!("  actor 已 kill");
+        println!("  actor killed");
     } else {
         println!(
-            "  本地模式不 kill actor（KillActor 要 core worker，本地模式没有），随进程退出消失"
+            "  local mode skips kill_actor (requires core worker); actor ends with process"
         );
     }
 }
@@ -271,12 +271,12 @@ async fn actor_with_ref(ray: &Ray, cluster: bool) {
 /// 在 `SerializationContext._deserialize_object`（`ray/_private/serialization.py:393-544`，
 /// `:537-538`）拒收有数据而无 metadata 的参数并报 `RayError::Task`。
 async fn python_with_ref(ray: &Ray) {
-    println!("\n--- 6. Python 任务与 Python actor 的引用参数 ---");
+    println!("\n--- 6. Python task and Python actor with ref arguments ---");
     let two = serialize(&2i32).expect("serialize(2)");
 
     // 6a. 驱动 put_xlang 写入的对象当引用参数：携带 XLANG metadata，Python 任务正常解码。
     let driver_put = ray.put_xlang(&40i32).expect("put_xlang(40)");
-    assert!(driver_put.is_xlang(), "put_xlang 应返回 is_xlang() == true");
+    assert!(driver_put.is_xlang(), "put_xlang should set is_xlang() == true");
     let sum_6a: i32 = ray
         .task_call_python(
             PYTHON_MODULE,
@@ -290,11 +290,11 @@ async fn python_with_ref(ray: &Ray) {
         .expect("read Python add(&put_xlang(40), 2)");
     assert_eq!(
         sum_6a, 42,
-        "Python add(&put_xlang(40), 2) 返回了 {}",
+        "Python add(&put_xlang(40), 2) returned {}",
         sum_6a
     );
     println!(
-        "  驱动 put_xlang 的对象当引用参数：add(&put_xlang(40), 2) → {}",
+        "  driver put_xlang object as ref arg: add(&put_xlang(40), 2) -> {}",
         sum_6a
     );
 
@@ -307,17 +307,17 @@ async fn python_with_ref(ray: &Ray) {
         .expect("read Python sum_list(&put_xlang([10, 20, 12]))");
     assert_eq!(
         list_sum, 42,
-        "Python sum_list(&put_xlang([10, 20, 12])) 返回了 {}",
+        "Python sum_list(&put_xlang([10, 20, 12])) returned {}",
         list_sum
     );
     println!(
-        "  驱动 put_xlang 的列表当引用参数：sum_list(&put_xlang([10, 20, 12])) → {}",
+        "  driver put_xlang list as ref arg: sum_list(&put_xlang([10, 20, 12])) -> {}",
         list_sum
     );
 
     // 6a'. API 区分对照：驱动 put（无 metadata）按引用传给 Python add，Python 侧拒收。
     let rust_only = ray.put(&40i32).expect("put(40)");
-    assert!(!rust_only.is_xlang(), "put 应返回 is_xlang() == false");
+    assert!(!rust_only.is_xlang(), "put should set is_xlang() == false");
     match ray.task_call_python(
         PYTHON_MODULE,
         "add",
@@ -327,17 +327,17 @@ async fn python_with_ref(ray: &Ray) {
         Ok(obj) => match obj.cast::<i32>().get_timeout(PROBE_TIMEOUT_MS) {
             Err(RayError::Task(msg)) => {
                 println!(
-                    "  驱动 put（无 metadata）当引用参数 → Python 任务失败 Task({})",
+                    "  driver put (no metadata) as ref arg -> Python task failed Task({})",
                     msg
                 )
             }
             Ok(value) => panic!(
-                "驱动 put（无 metadata）当引用参数，Python 任务却成功了：{}",
+                "driver put (no metadata) as ref arg unexpectedly succeeded: {}",
                 value
             ),
-            Err(other) => panic!("返回了别的错误变体: {}", other),
+            Err(other) => panic!("unexpected error variant: {}", other),
         },
-        Err(other) => panic!("Python 任务提交就失败了: {}", other),
+        Err(other) => panic!("Python task submission failed: {}", other),
     }
 
     // 6b. Python 任务产生的对象（带 PYTHON metadata）当引用参数：正常读到值。
@@ -353,8 +353,8 @@ async fn python_with_ref(ray: &Ray) {
         .cast::<i32>()
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("read the Python add result");
-    assert_eq!(sum, 42, "Python add(&ref(40), 2) 返回了 {}", sum);
-    println!("  Python 产生的对象当引用参数：add(&ref(40), 2) → {}", sum);
+    assert_eq!(sum, 42, "Python add(&ref(40), 2) returned {}", sum);
+    println!("  Python-produced object as ref arg: add(&ref(40), 2) -> {}", sum);
 
     let start = serialize(&0i64).expect("serialize(0)");
     let handle = ray
@@ -371,11 +371,11 @@ async fn python_with_ref(ray: &Ray) {
         .expect("read Python Counter.increment(&put_xlang(5))");
     assert_eq!(
         val_6c, 5,
-        "Python Counter.increment(&put_xlang(5)) 返回了 {}",
+        "Python Counter.increment(&put_xlang(5)) returned {}",
         val_6c
     );
     println!(
-        "  驱动 put_xlang 的对象当 actor 参数：Counter.increment(&put_xlang(5)) → {}",
+        "  driver put_xlang object as actor arg: Counter.increment(&put_xlang(5)) -> {}",
         val_6c
     );
 
@@ -384,16 +384,16 @@ async fn python_with_ref(ray: &Ray) {
     match ray.actor_call_python(handle.id(), "increment", &[rust_only_five.id()], &[true]) {
         Ok(obj) => match obj.cast::<i64>().get_timeout(PROBE_TIMEOUT_MS) {
             Err(RayError::Task(msg)) => println!(
-                "  驱动 put（无 metadata）当 actor 参数 → Python actor 失败 Task({})",
+                "  driver put (no metadata) as actor arg -> Python actor failed Task({})",
                 msg
             ),
             Ok(value) => panic!(
-                "驱动 put（无 metadata）当 actor 参数，Python actor 却成功了：{}",
+                "driver put (no metadata) as actor arg unexpectedly succeeded: {}",
                 value
             ),
-            Err(other) => panic!("返回了别的错误变体: {}", other),
+            Err(other) => panic!("unexpected error variant: {}", other),
         },
-        Err(other) => panic!("Python actor 调用提交就失败了: {}", other),
+        Err(other) => panic!("Python actor call submission failed: {}", other),
     }
 
     // 6d. actor 方法拿 Python 产生的引用：在 6c 的 5 基础上累加得到 10。
@@ -411,11 +411,11 @@ async fn python_with_ref(ray: &Ray) {
         .expect("read the Python actor result");
     assert_eq!(
         value, 10,
-        "Python Counter.increment(&ref(5)) 返回了 {}",
+        "Python Counter.increment(&ref(5)) returned {}",
         value
     );
     println!(
-        "  Python 产生的对象当 actor 参数：Counter.increment(&ref(5)) → {}",
+        "  Python-produced object as actor arg: Counter.increment(&ref(5)) -> {}",
         value
     );
 
@@ -431,36 +431,36 @@ async fn python_with_ref(ray: &Ray) {
     assert_eq!(
         restored.id(),
         handle.id(),
-        "复原的 Python actor id 与原 handle 不同"
+        "restored Python actor id differs from original handle"
     );
     let current: i64 = ray
         .actor_call_python(restored.id(), "get", &[], &[])
-        .expect("用复原的 Python handle 提交 get")
+        .expect("submit get on restored Python handle")
         .cast::<i64>()
         .get_timeout(PROBE_TIMEOUT_MS)
-        .expect("读复原 Python handle 的 get");
-    assert_eq!(current, value, "复原的 Python handle 读到的值不对");
+        .expect("read get on restored Python handle");
+    assert_eq!(current, value, "restored Python handle returned wrong value");
     println!(
-        "  Python handle 往返：serialize {} 字节 → from_serialized → get() → {}",
+        "  Python handle round-trip: serialize {} bytes -> from_serialized -> get() -> {}",
         serialized.len(),
         current
     );
 
     let _ = ray.kill_actor(&handle, true);
-    println!("  Python actor 已 kill");
+    println!("  Python actor killed");
 }
 
 /// 7. 提交之后立刻 drop 参数引用。
 async fn drop_after_submit(ray: &Ray) {
-    println!("\n--- 7. 提交之后立刻 drop 参数引用 ---");
+    println!("\n--- 7. Drop argument ref immediately after submit ---");
     let five = ray.put(&5i32).expect("put(5)");
     let out = add_remote(ray, &five, 34).expect("submit add(&ref(5), 34)");
     drop(five);
     let sum = out
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("read the result after dropping the argument ref");
-    assert_eq!(sum, 39, "drop 参数引用之后任务返回了 {}", sum);
-    println!("  参数引用已 drop，任务仍读到 {}", sum);
+    assert_eq!(sum, 39, "task after dropping arg ref returned {}", sum);
+    println!("  arg ref dropped; task still returned {}", sum);
 }
 
 /// 8. 任务返回的 id 不能当引用用。
@@ -471,7 +471,7 @@ async fn drop_after_submit(ray: &Ray) {
 /// 时才能取对象（`core_worker.cc` 的 `GetObjects` 先查 `HasOwner`），与对象是否
 /// 还活着无关。8b 里 actor 自己把那对象读回来，证明它活着。
 async fn returned_ref_is_unusable(ray: &Ray) {
-    println!("\n--- 8. 任务返回的 id 不可读 ---");
+    println!("\n--- 8. Returned id from task is unusable as ref ---");
 
     // 8a. 驱动自己 put、Rust 任务把 id 字节原样交回：读得到。
     let owner = ray.put(&5i32).expect("put(5)");
@@ -482,14 +482,14 @@ async fn returned_ref_is_unusable(ray: &Ray) {
         .cast::<Vec<u8>>()
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("read the id bytes the task returned");
-    assert_eq!(echoed, owner.id(), "任务交回的 id 与提交的 id 不同");
+    assert_eq!(echoed, owner.id(), "returned id differs from submitted id");
     let rebuilt: ObjectRef<i32> = ObjectRef::from(echoed);
     let value = rebuilt
         .get_timeout(PROBE_TIMEOUT_MS)
-        .expect("驱动自己持有引用时，回来的 id 应当能读");
-    assert_eq!(value, 5, "回来的 id 读到了 {}", value);
+        .expect("returned id should be readable while driver holds ref");
+    assert_eq!(value, 5, "returned id read back {}", value);
     println!(
-        "  control: 驱动自己持有引用时，任务交回的 id 读到 {}",
+        "  control: while driver holds ref, returned id reads {}",
         value
     );
     drop(owner);
@@ -508,7 +508,7 @@ async fn returned_ref_is_unusable(ray: &Ray) {
     assert_eq!(
         worker_id.len(),
         28,
-        "Keeper 交回的 id 是 {} 字节",
+        "Keeper returned {}-byte id",
         worker_id.len()
     );
     let alive: i32 = ray
@@ -517,9 +517,9 @@ async fn returned_ref_is_unusable(ray: &Ray) {
         .cast::<i32>()
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("read the kept value");
-    assert_eq!(alive, 5, "actor 保活的对象读回来是 {}", alive);
+    assert_eq!(alive, 5, "actor kept object returned {}", alive);
     println!(
-        "  actor 里保活的对象读到 {}（对象活着），id_hex={}",
+        "  actor kept object returned {} (alive), id_hex={}",
         alive,
         ObjectRef::<i32>::from(worker_id.clone()).id_hex()
     );
@@ -531,30 +531,30 @@ async fn returned_ref_is_unusable(ray: &Ray) {
             let elapsed = started.elapsed();
             assert!(
                 elapsed < Duration::from_secs(1),
-                "快速失败变成了等满期限: {:?}",
+                "expected fast failure, waited {:?}",
                 elapsed
             );
-            println!("  驱动按同一个 id 读 → Ffi after {:?}", elapsed);
+            println!("  driver get on same id -> Ffi after {:?}", elapsed);
             println!("  ({})", msg);
         }
-        Ok(value) => panic!("驱动读到了工人 put 的对象：{}", value),
-        Err(other) => panic!("驱动读这个 id 返回了别的错误变体: {}", other),
+        Ok(value) => panic!("driver unexpectedly read worker-put object: {}", value),
+        Err(other) => panic!("driver get returned unexpected error variant: {}", other),
     }
     let _ = ray.kill_actor(&keeper, true);
-    println!("  工人/别的进程 put 出来的 id 对驱动是来路不明的 id，对象活着也读不到");
+    println!("  worker-created id has no driver owner path even while alive");
 
     // 这样的 id 也不能当引用参数提交（否则 Ray 的 GetOwnerAddressOrDie 会终止进程）。
     let as_arg: ObjectRef<i32> = ObjectRef::from(worker_id);
     match add_remote(ray, &as_arg, 1) {
-        Err(RayError::Runtime(_)) => println!("  同一个 id 当引用参数 → Runtime（被守卫拦住）"),
-        Ok(_) => panic!("工人交回的 id 被当成引用参数提交了"),
-        Err(other) => panic!("工人交回的 id 当引用参数返回了别的错误变体: {}", other),
+        Err(RayError::Runtime(_)) => println!("  same id as ref arg -> Runtime (caught by guard)"),
+        Ok(_) => panic!("worker-returned id was unexpectedly submitted as ref arg"),
+        Err(other) => panic!("worker-returned id as ref arg returned unexpected error: {}", other),
     }
 }
 
 /// 9. 来路不明的 28 字节 id、27 字节 id 与跨语言 `ObjectRef`：都在 Rust 侧被拒，进程继续运行。
 async fn unknown_ids_are_rejected(ray: &Ray, cluster: bool) {
-    println!("\n--- 9. 来路不明的 id 当引用参数 ---");
+    println!("\n--- 9. Unowned ids as ref arguments ---");
 
     // 9a. `put` 之后保存 id 字节、drop 句柄、再按字节重建：本进程不再持有这个引用。
     let obj = ray.put(&5i32).expect("put(5)");
@@ -563,10 +563,10 @@ async fn unknown_ids_are_rejected(ray: &Ray, cluster: bool) {
     let rebuilt: ObjectRef<i32> = ObjectRef::from(saved);
     match add_remote(ray, &rebuilt, 1) {
         Err(RayError::Runtime(_)) => {
-            println!("  add(&ref(保存字节后重建的 id), 1) → Runtime")
+            println!("  add(&ref(rebuilt from saved bytes), 1) -> Runtime")
         }
-        Ok(_) => panic!("保存字节后重建的 id 被当成引用参数提交了"),
-        Err(other) => panic!("重建的 id 返回了别的错误变体: {}", other),
+        Ok(_) => panic!("rebuilt id from saved bytes was unexpectedly submitted as ref arg"),
+        Err(other) => panic!("rebuilt id returned unexpected error variant: {}", other),
     }
 
     // 9b. 自己拼的 28 字节 id。
@@ -577,35 +577,35 @@ async fn unknown_ids_are_rejected(ray: &Ray, cluster: bool) {
             let elapsed = started.elapsed();
             assert!(
                 elapsed < Duration::from_secs(1),
-                "拒绝变成了阻塞: {:?}",
+                "refusal unexpectedly blocked: {:?}",
                 elapsed
             );
             println!(
-                "  add(&ref(来路不明的 28 字节 id), 1) → Runtime after {:?}",
+                "  add(&ref(fabricated 28-byte id), 1) -> Runtime after {:?}",
                 elapsed
             );
             println!("  ({})", msg);
         }
-        Ok(_) => panic!("来路不明的 28 字节 id 被当成引用参数提交了"),
-        Err(other) => panic!("来路不明的 28 字节 id 返回了别的错误变体: {}", other),
+        Ok(_) => panic!("fabricated 28-byte id was unexpectedly submitted as ref arg"),
+        Err(other) => panic!("fabricated 28-byte id returned unexpected error: {}", other),
     }
 
     // 9c. 同一个自己拼的 id 按值传：按值的形状也过同一道守卫。
     let owned: ObjectRef<i32> = ObjectRef::from(vec![7u8; 28]);
     match add_remote(ray, owned, 1) {
         Err(RayError::Runtime(_)) => {
-            println!("  add(来路不明的 28 字节 id, 1)（按值）→ Runtime")
+            println!("  add(fabricated 28-byte id, 1) (by value) -> Runtime")
         }
-        Ok(_) => panic!("按值传的来路不明 id 被提交了"),
-        Err(other) => panic!("按值传的来路不明 id 返回了别的错误变体: {}", other),
+        Ok(_) => panic!("fabricated 28-byte id by value was unexpectedly submitted"),
+        Err(other) => panic!("fabricated id by value returned unexpected error: {}", other),
     }
 
     // 9d. 27 字节：长度不对，错误变体与消息与 C 侧一致。
     let short: ObjectRef<i32> = ObjectRef::from(vec![0u8; 27]);
     match add_remote(ray, &short, 1) {
-        Err(RayError::Ffi(msg)) => println!("  add(&27 字节 id, 1) → Ffi({})", msg),
-        Ok(_) => panic!("27 字节的 id 被当成引用参数提交了"),
-        Err(other) => panic!("27 字节的 id 返回了别的错误变体: {}", other),
+        Err(RayError::Ffi(msg)) => println!("  add(&27-byte id, 1) -> Ffi({})", msg),
+        Ok(_) => panic!("27-byte id was unexpectedly submitted as ref arg"),
+        Err(other) => panic!("27-byte id returned unexpected error variant: {}", other),
     }
 
     // 9e. 裸通道：`is_ref` 与参数个数对不上时拒绝，不进入 C 侧的越界读。
@@ -614,48 +614,48 @@ async fn unknown_ids_are_rejected(ray: &Ray, cluster: bool) {
     let args: [&[u8]; 2] = [&one, &two];
     match ray.task_call("add", &args, &[true], &TaskOptions::new()) {
         Err(RayError::Ffi(msg)) => {
-            println!("  task_call(2 个参数, 1 个 is_ref) → Ffi({})", msg)
+            println!("  task_call(2 args, 1 is_ref) -> Ffi({})", msg)
         }
-        Ok(_) => panic!("is_ref 长度对不上却提交了"),
-        Err(other) => panic!("is_ref 长度对不上返回了别的错误变体: {}", other),
+        Ok(_) => panic!("mismatched is_ref length was unexpectedly submitted"),
+        Err(other) => panic!("mismatched is_ref returned unexpected error variant: {}", other),
     }
     // 9f. 集群模式下 put_xlang 句柄交给 Rust 宏调用器：提交前立即返回 RayError::Serialization。
     if cluster {
         let driver_put = ray.put_xlang(&40i32).expect("put_xlang(40)");
         match add_remote(ray, &driver_put, 2) {
             Err(RayError::Serialization(msg)) => {
-                println!("  add(&put_xlang(40), 2) → Serialization({})", msg);
+                println!("  add(&put_xlang(40), 2) -> Serialization({})", msg);
             }
             Ok(obj) => panic!(
-                "put_xlang 句柄被当成 Rust 任务引用参数提交了: {:?}",
+                "put_xlang handle was unexpectedly submitted as Rust ref arg: {:?}",
                 obj.get_timeout(PROBE_TIMEOUT_MS)
             ),
-            Err(other) => panic!("put_xlang 借用句柄返回了别的错误变体: {}", other),
+            Err(other) => panic!("borrowed put_xlang handle returned unexpected error: {}", other),
         }
         match add_remote(ray, driver_put, 2) {
             Err(RayError::Serialization(_)) => {
-                println!("  add(put_xlang(40), 2)（按值）→ Serialization");
+                println!("  add(put_xlang(40), 2) (by value) -> Serialization");
             }
             Ok(obj) => panic!(
-                "按值传的 put_xlang 句柄被当成 Rust 任务引用参数提交了: {:?}",
+                "owned put_xlang handle was unexpectedly submitted as Rust ref arg: {:?}",
                 obj.get_timeout(PROBE_TIMEOUT_MS)
             ),
-            Err(other) => panic!("put_xlang 按值句柄返回了别的错误变体: {}", other),
+            Err(other) => panic!("owned put_xlang handle returned unexpected error: {}", other),
         }
     }
-    println!("  进程继续运行：没有 GetOwnerAddressOrDie 的终止，也没有本地模式的永久等待");
+    println!("  process continues: no GetOwnerAddressOrDie abort and no local-mode hang");
 }
 
 /// 10. 异步入口的错误路径：27 字节 id 的 future 返回错误，不会 panic。
 async fn async_error_path(ray: &Ray) {
-    println!("\n--- 10. 异步入口的错误路径 ---");
+    println!("\n--- 10. Async entry error path ---");
     let short: ObjectRef<i32> = ObjectRef::from(vec![0u8; 27]);
     match add_remote_async(ray, &short, 1).await {
         Err(RayError::Ffi(msg)) => {
-            println!("  add_remote_async(&27 字节 id, 1).await → Ffi({})", msg)
+            println!("  add_remote_async(&27-byte id, 1).await -> Ffi({})", msg)
         }
-        Ok(_) => panic!("27 字节 id 的异步调用成功了"),
-        Err(other) => panic!("异步入口返回了别的错误变体: {}", other),
+        Ok(_) => panic!("27-byte id async call unexpectedly succeeded"),
+        Err(other) => panic!("async entry returned unexpected error variant: {}", other),
     }
 }
 
@@ -667,7 +667,7 @@ async fn async_error_path(ray: &Ray) {
 /// 引用参数的 0 字节更糟：本地模式在 `build_task_args_cpp` 里用无期限的
 /// `runtime->Get(id)` 读值，永久等待。所以每条入口都在进 Ray 之前拒绝。
 async fn id_width_rejections(ray: &Ray, cluster: bool) {
-    println!("\n--- 11. id 宽度不对的 id 在进 Ray 之前被拒 ---");
+    println!("\n--- 11. Invalid id widths rejected before entering Ray ---");
 
     // 11a. 单个读取：3 字节与 0 字节都报出实际长度。
     let short: ObjectRef<i64> = ObjectRef::from(vec![1u8, 2, 3]);
@@ -675,36 +675,36 @@ async fn id_width_rejections(ray: &Ray, cluster: bool) {
         Err(RayError::Ffi(msg)) => {
             assert!(
                 msg.contains("28 bytes"),
-                "3 字节 id 的错误里没有长度要求: {}",
+                "3-byte id error missing expected length: {}",
                 msg
             );
             assert!(
                 msg.contains("3 bytes"),
-                "3 字节 id 的错误里没有实际长度: {}",
+                "3-byte id error missing actual length: {}",
                 msg
             );
-            println!("  get_timeout(3 字节 id) → Ffi({})", msg);
+            println!("  get_timeout(3-byte id) -> Ffi({})", msg);
         }
-        Err(other) => panic!("3 字节 id 返回了别的错误变体: {}", other),
-        Ok(value) => panic!("3 字节 id 读到了 {}", value),
+        Err(other) => panic!("3-byte id returned unexpected error variant: {}", other),
+        Ok(value) => panic!("3-byte id unexpectedly returned {}", value),
     }
     let empty: ObjectRef<i64> = ObjectRef::from(Vec::new());
     match empty.get_timeout(1000) {
         Err(RayError::Ffi(msg)) => {
             assert!(
                 msg.contains("28 bytes"),
-                "0 字节 id 的错误里没有长度要求: {}",
+                "0-byte id error missing expected length: {}",
                 msg
             );
             assert!(
                 msg.contains("0 bytes"),
-                "0 字节 id 的错误里没有实际长度: {}",
+                "0-byte id error missing actual length: {}",
                 msg
             );
-            println!("  get_timeout(0 字节 id) → Ffi({})", msg);
+            println!("  get_timeout(0-byte id) -> Ffi({})", msg);
         }
-        Err(other) => panic!("0 字节 id 返回了别的错误变体: {}", other),
-        Ok(value) => panic!("0 字节 id 读到了 {}", value),
+        Err(other) => panic!("0-byte id returned unexpected error variant: {}", other),
+        Ok(value) => panic!("0-byte id unexpectedly returned {}", value),
     }
 
     // 11b. 批量读取：正常 id 与 3 字节 id 混在一批。
@@ -712,19 +712,19 @@ async fn id_width_rejections(ray: &Ray, cluster: bool) {
     let short: ObjectRef<i64> = ObjectRef::from(vec![1u8, 2, 3]);
     match ray.get_many_timeout(&[good.clone(), short], 1000) {
         Err(RayError::Ffi(msg)) => {
-            println!("  get_many_timeout([好 id, 3 字节 id]) → Ffi({})", msg)
+            println!("  get_many_timeout([good id, 3-byte id]) -> Ffi({})", msg)
         }
-        Err(other) => panic!("批量读取返回了别的错误变体: {}", other),
-        Ok(values) => panic!("批量读取读到了 {:?}", values),
+        Err(other) => panic!("batch read returned unexpected error variant: {}", other),
+        Ok(values) => panic!("batch read unexpectedly returned {:?}", values),
     }
 
     // 11c. wait：3 字节 id。
     let short: ObjectRef<i64> = ObjectRef::from(vec![1u8, 2, 3]);
     match ray.wait(&[short], 1, 1000) {
-        Err(RayError::Ffi(msg)) => println!("  wait([3 字节 id], 1, 1000) → Ffi({})", msg),
-        Err(other) => panic!("wait 返回了别的错误变体: {}", other),
+        Err(RayError::Ffi(msg)) => println!("  wait([3-byte id], 1, 1000) -> Ffi({})", msg),
+        Err(other) => panic!("wait returned unexpected error variant: {}", other),
         Ok((ready, unready)) => panic!(
-            "wait 接受了 3 字节 id: ready={} unready={}",
+            "wait accepted 3-byte id: ready={} unready={}",
             ready.len(),
             unready.len()
         ),
@@ -737,18 +737,18 @@ async fn id_width_rejections(ray: &Ray, cluster: bool) {
         Err(RayError::Ffi(msg)) => {
             assert!(
                 msg.contains("argument 0"),
-                "引用参数的错误里没有参数下标: {}",
+                "ref arg error missing argument index: {}",
                 msg
             );
             assert!(
                 msg.contains("28 bytes"),
-                "引用参数的错误里没有长度要求: {}",
+                "ref arg error missing expected length: {}",
                 msg
             );
-            println!("  task_call(引用参数 3 字节) → Ffi({})", msg);
+            println!("  task_call(3-byte ref arg) -> Ffi({})", msg);
         }
-        Err(other) => panic!("3 字节引用参数返回了别的错误变体: {}", other),
-        Ok(_) => panic!("3 字节的引用参数被提交了"),
+        Err(other) => panic!("3-byte ref arg returned unexpected error variant: {}", other),
+        Ok(_) => panic!("3-byte ref arg was unexpectedly submitted"),
     }
     let empty: [u8; 0] = [];
     let args: [&[u8]; 1] = [&empty];
@@ -756,73 +756,79 @@ async fn id_width_rejections(ray: &Ray, cluster: bool) {
         Err(RayError::Ffi(msg)) => {
             assert!(
                 msg.contains("0 bytes"),
-                "0 字节引用参数的错误里没有实际长度: {}",
+                "0-byte ref arg error missing actual length: {}",
                 msg
             );
-            println!("  task_call(引用参数 0 字节) → Ffi({})", msg);
+            println!("  task_call(0-byte ref arg) -> Ffi({})", msg);
         }
-        Err(other) => panic!("0 字节引用参数返回了别的错误变体: {}", other),
-        Ok(_) => panic!("0 字节的引用参数被提交了（修复前这里在本地模式永久挂起）"),
+        Err(other) => panic!("0-byte ref arg returned unexpected error variant: {}", other),
+        Ok(_) => panic!("0-byte ref arg was unexpectedly submitted"),
     }
 
     // 11e. Python 任务的引用参数：同一个宽度检查。
     let three = [1u8, 2, 3];
     let args: [&[u8]; 1] = [&three];
     match ray.task_call_python(PYTHON_MODULE, "add", &args, &[true]) {
-        Err(RayError::Ffi(msg)) => println!("  task_call_python(引用参数 3 字节) → Ffi({})", msg),
-        Err(other) => panic!("Python 任务的 3 字节引用参数返回了别的错误变体: {}", other),
-        Ok(_) => panic!("Python 任务的 3 字节引用参数被提交了"),
+        Err(RayError::Ffi(msg)) => println!("  task_call_python(3-byte ref arg) -> Ffi({})", msg),
+        Err(other) => panic!(
+            "Python task 3-byte ref arg returned unexpected error variant: {}",
+            other
+        ),
+        Ok(_) => panic!("Python task 3-byte ref arg was unexpectedly submitted"),
     }
 
     // 11f. actor id 宽度：3 字节与 0 字节。
-    for (label, actor_id) in [("3 字节", vec![1u8, 2, 3]), ("0 字节", Vec::new())] {
+    for (label, actor_id) in [("3-byte", vec![1u8, 2, 3]), ("0-byte", Vec::new())] {
         match ray.actor_call(&actor_id, "Counter::increment", &[], &[]) {
             Err(RayError::Ffi(msg)) => {
                 assert!(
                     msg.contains("actor id must be 16 bytes"),
-                    "{} actor id 的错误里没有长度要求: {}",
+                    "{} actor id error missing length requirement: {}",
                     label,
                     msg
                 );
-                println!("  actor_call({} actor id) → Ffi({})", label, msg);
+                println!("  actor_call({} actor id) -> Ffi({})", label, msg);
             }
-            Err(other) => panic!("{} actor id 返回了别的错误变体: {}", label, other),
-            Ok(_) => panic!("{}的 actor id 被接受了", label),
+            Err(other) => panic!("{} actor id returned unexpected error variant: {}", label, other),
+            Ok(_) => panic!("{} actor id was unexpectedly accepted", label),
         }
     }
 
     // 11g. 本地模式：`actor_call_python` 的宽度检查排在本地模式拒绝之前，与
     // `ray_cancel` 的次序一致。集群模式没有这条本地模式分支，跳过。
     if cluster {
-        println!("  actor_call_python 的守卫次序在集群模式没有本地模式分支可区分：跳过");
+        println!("  actor_call_python guard order: skipped in cluster mode (no local mode branch)");
     } else {
         match ray.actor_call_python(&[1u8, 2, 3], "increment", &[], &[]) {
             Err(RayError::Ffi(msg)) => {
                 assert!(
                     msg.contains("actor id must be 16 bytes"),
-                    "本地模式 actor_call_python 的短 id 没有报宽度: {}",
+                    "local mode actor_call_python short id error missing width: {}",
                     msg
                 );
                 assert!(
                     !msg.contains("local mode"),
-                    "宽度检查排在了本地模式拒绝之后: {}",
+                    "width check ran after local mode refusal: {}",
                     msg
                 );
-                println!("  actor_call_python(3 字节 actor id) → Ffi({})", msg);
+                println!("  actor_call_python(3-byte actor id) -> Ffi({})", msg);
             }
-            Err(other) => panic!("本地模式 actor_call_python 返回了别的错误变体: {}", other),
-            Ok(_) => panic!("本地模式 actor_call_python 接受了 3 字节 actor id"),
+            Err(other) => panic!(
+                "local mode actor_call_python returned unexpected error variant: {}",
+                other
+            ),
+            Ok(_) => panic!("local mode actor_call_python accepted 3-byte actor id"),
         }
     }
 
     // 11h. 以上拒绝之后运行时状态没有被打坏。
     let value = ray
         .put(&42i64)
-        .expect("拒绝之后 put")
+        .expect("put after rejections")
         .get_timeout(PROBE_TIMEOUT_MS)
-        .expect("拒绝之后 get");
-    assert_eq!(value, 42, "拒绝之后 put + get 读到 {}", value);
-    println!("  以上全部被拒之后 put + get 照常读到 {}", value);
+        .expect("get after rejections");
+    assert_eq!(value, 42, "put + get after rejections returned {}", value);
+    println!("  after all rejections put + get returned {}", value);
 }
 
 #[tokio::main]
@@ -830,7 +836,7 @@ async fn main() {
     let mode = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "cluster".to_string());
-    println!("=== ObjectRef 作为任务/actor 方法参数 ({}) ===", mode);
+    println!("=== ObjectRef as task/actor arguments ({}) ===", mode);
     let config = match mode.as_str() {
         "local" => RayConfig::local(),
         "cluster" => cluster_config(),
@@ -848,8 +854,8 @@ async fn main() {
     if cluster {
         python_with_ref(&ray).await;
     } else {
-        println!("\n--- 6. Python 任务与 Python actor 的引用参数：跳过 ---");
-        println!("  本地模式没有 Python worker（ref_counting_test 记录过这条）");
+        println!("\n--- 6. Python task and Python actor ref args: skipped ---");
+        println!("  no Python worker in local mode");
     }
 
     drop_after_submit(&ray).await;
@@ -857,8 +863,8 @@ async fn main() {
     if cluster {
         returned_ref_is_unusable(&ray).await;
     } else {
-        println!("\n--- 8. 任务返回的 id 不可读：跳过 ---");
-        println!("  这一项要 worker .so 里的 return_id_bytes 与 Python actor，本地模式两样都没有");
+        println!("\n--- 8. Returned id from task is unusable: skipped ---");
+        println!("  requires worker .so return_id_bytes and Python actor");
     }
 
     unknown_ids_are_rejected(&ray, cluster).await;
@@ -867,13 +873,13 @@ async fn main() {
 
     if !cluster {
         println!(
-            "\n说明：第 1、2 项在本地模式下由 build_task_args_cpp 在提交前用 Runtime()->Get(id)"
+            "\nnote: steps 1 and 2 in local mode resolve refs via Runtime()->Get(id)"
         );
         println!(
-            "取成值（与 SDK 在 ray/api/arguments.h:43-52 的做法一致），集群模式下同一个引用以 id"
+            "in build_task_args_cpp before submission; cluster mode passes the object id"
         );
-        println!("交给 core worker，由它把对象的值投递给工人");
+        println!("to core worker to deliver the object value to the worker");
     }
 
-    println!("\n✓ 引用参数检查全部通过");
+    println!("\nPASS: all ref argument checks passed");
 }

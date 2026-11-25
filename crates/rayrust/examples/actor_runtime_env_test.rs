@@ -73,7 +73,7 @@ fn cluster_config() -> RayConfig {
     let address = std::env::var("RAY_ADDRESS").expect("RAY_ADDRESS");
     assert!(
         !address.is_empty() && address != "local",
-        "这个示例只在集群模式跑（RAY_ADDRESS={}）：本地模式不应用 actor 的 runtime env",
+        "this example only runs in cluster mode (RAY_ADDRESS={}): local mode does not apply actor runtime_env",
         address
     );
     let node_ip = std::env::var("RAY_NODE_IP").expect("RAY_NODE_IP");
@@ -89,15 +89,15 @@ fn expect_ffi_containing<T>(what: &str, result: Result<T, RayError>, needles: &[
         Err(RayError::Ffi(msg)) => {
             assert!(
                 needles.iter().any(|needle| msg.contains(needle)),
-                "{} 的错误文本里没有 {:?}: {}",
+                "{}: error message does not contain {:?}: {}",
                 what,
                 needles,
                 msg
             );
-            println!("  {} → Ffi({})", what, msg);
+            println!("  {} -> Ffi({})", what, msg);
         }
-        Err(other) => panic!("{} 返回了别的错误变体: {}", what, other),
-        Ok(_) => panic!("{} 返回了 Ok，本该被拒", what),
+        Err(other) => panic!("{}: returned unexpected error variant: {}", what, other),
+        Ok(_) => panic!("{}: returned Ok, expected refusal", what),
     }
 }
 
@@ -113,10 +113,13 @@ fn python_counter_get(ray: &Ray, opts: &ActorOptions) -> Result<i64, RayError> {
 fn expect_python_control(ray: &Ray, label: &str) {
     let value = match python_counter_get(ray, &ActorOptions::new()) {
         Ok(value) => value,
-        Err(error) => panic!("{} 的对照 actor 读值失败: {}", label, error),
+        Err(error) => panic!("{}: control actor read failed: {}", label, error),
     };
-    assert_eq!(value, 7, "{} 的对照 actor 读到 {}", label, value);
-    println!("  {}：不带 runtime env 的 Python actor → get() = {}", label, value);
+    assert_eq!(value, 7, "{}: control actor returned {}", label, value);
+    println!(
+        "  {}: Python actor without runtime_env -> get() = {}",
+        label, value
+    );
 }
 
 /// 建一个 Rust `EnvReader` 并读 `RAYRUST_ACTOR_ENV`。
@@ -128,53 +131,63 @@ fn rust_env_reader_read(ray: &Ray, opts: &ActorOptions) -> Result<Option<String>
 
 /// 1 到 4：Python actor 侧，文档被接受，坏文档在提交前被拒。
 fn python_actor_checks(ray: &Ray) {
-    println!("\n--- 1. 对照：Python actor 不带 runtime env ---");
-    expect_python_control(ray, "第 1 项");
+    println!("\n--- 1. Control: Python actor without runtime_env ---");
+    expect_python_control(ray, "case 1");
 
-    println!("\n--- 2. Python actor 带用户文档 ---");
+    println!("\n--- 2. Python actor with user runtime_env ---");
     let document = format!(r#"{{"env_vars":{{"{}":"1"}}}}"#, PY_ENV_VAR);
     let opts = ActorOptions::new().runtime_env(document.clone());
     match python_counter_get(ray, &opts) {
         Ok(value) => {
-            assert_eq!(value, 7, "带用户文档的 Python actor 读到 {}", value);
-            println!("  runtime_env = {} → 创建 Ok，get() = {}", document, value);
+            assert_eq!(
+                value, 7,
+                "Python actor with user runtime_env returned {}",
+                value
+            );
+            println!(
+                "  runtime_env = {} -> created Ok, get() = {}",
+                document, value
+            );
         }
-        Err(error) => panic!("runtime_env = {} 的 Python actor 创建失败: {}", document, error),
+        Err(error) => panic!(
+            "Python actor creation with runtime_env = {} failed: {}",
+            document, error
+        ),
     }
 
-    println!("\n--- 3. Python actor 带非法 JSON ---");
+    println!("\n--- 3. Python actor with invalid JSON ---");
     expect_ffi_containing(
         r#"runtime_env = "not valid""#,
         python_counter_get(ray, &ActorOptions::new().runtime_env("not valid")),
         &["parse error", "runtime_env must be"],
     );
-    expect_python_control(ray, "拒绝之后");
+    expect_python_control(ray, "after refusal");
 
-    println!("\n--- 4. Python actor 带 JSON 数组 ---");
+    println!("\n--- 4. Python actor with JSON array ---");
     expect_ffi_containing(
         r#"runtime_env = "[1,2]""#,
         python_counter_get(ray, &ActorOptions::new().runtime_env("[1,2]")),
         &["runtime_env must be a JSON object"],
     );
-    expect_python_control(ray, "拒绝之后");
+    expect_python_control(ray, "after refusal");
 }
 
 /// 5 到 7：Rust actor 侧，`env_vars` 真的到了工人进程。
 fn rust_actor_checks(ray: &Ray) {
-    println!("\n--- 5. 对照：Rust actor 不带 runtime env ---");
+    println!("\n--- 5. Control: Rust actor without runtime_env ---");
     match rust_env_reader_read(ray, &ActorOptions::new()) {
         Ok(value) => {
             assert_eq!(
                 value, None,
-                "不带 runtime env 的 EnvReader 读到 {:?}，这个变量在驱动进程里不该有",
+                "EnvReader without runtime_env returned {:?}, expected None in worker env",
                 value
             );
-            println!("  不带 runtime env → read({}) = None", RUST_ENV_VAR);
+            println!("  without runtime_env -> read({}) = None", RUST_ENV_VAR);
         }
-        Err(error) => panic!("对照 EnvReader 创建或调用失败: {}", error),
+        Err(error) => panic!("control EnvReader creation or call failed: {}", error),
     }
 
-    println!("\n--- 6. Rust actor 带用户文档 ---");
+    println!("\n--- 6. Rust actor with user runtime_env ---");
     let document = format!(r#"{{"env_vars":{{"{}":"rust"}}}}"#, RUST_ENV_VAR);
     let opts = ActorOptions::new().runtime_env(document.clone());
     match rust_env_reader_read(ray, &opts) {
@@ -182,19 +195,22 @@ fn rust_actor_checks(ray: &Ray) {
             assert_eq!(
                 value,
                 Some("rust".to_string()),
-                "带 runtime_env = {} 的 EnvReader 读到 {:?}",
+                "EnvReader with runtime_env = {} returned {:?}",
                 document,
                 value
             );
             println!(
-                "  runtime_env = {} → read({}) = {:?}（文档到了工人进程）",
+                "  runtime_env = {} -> read({}) = {:?} (applied in worker process)",
                 document, RUST_ENV_VAR, value
             );
         }
-        Err(error) => panic!("runtime_env = {} 的 EnvReader 失败: {}", document, error),
+        Err(error) => panic!(
+            "EnvReader with runtime_env = {} failed: {}",
+            document, error
+        ),
     }
 
-    println!("\n--- 7. Rust actor 带非法 JSON ---");
+    println!("\n--- 7. Rust actor with invalid JSON ---");
     expect_ffi_containing(
         r#"runtime_env = "{""#,
         rust_env_reader_read(ray, &ActorOptions::new().runtime_env("{")),
@@ -202,15 +218,22 @@ fn rust_actor_checks(ray: &Ray) {
     );
     match rust_env_reader_read(ray, &ActorOptions::new()) {
         Ok(value) => {
-            assert_eq!(value, None, "拒绝之后的对照 EnvReader 读到 {:?}", value);
-            println!("  拒绝之后：不带 runtime env 的 EnvReader 照常 → read({}) = None", RUST_ENV_VAR);
+            assert_eq!(
+                value, None,
+                "control EnvReader after refusal returned {:?}",
+                value
+            );
+            println!(
+                "  after refusal: EnvReader without runtime_env -> read({}) = None",
+                RUST_ENV_VAR
+            );
         }
-        Err(error) => panic!("拒绝之后的对照 EnvReader 失败: {}", error),
+        Err(error) => panic!("control EnvReader after refusal failed: {}", error),
     }
 }
 
 fn main() {
-    println!("=== ActorOptions::runtime_env（用户形态的 runtime env 文档）===");
+    println!("=== ActorOptions::runtime_env (user-shaped runtime_env document) ===");
     let ray = Ray::connect(&cluster_config()).expect("Ray::connect");
 
     python_actor_checks(&ray);
@@ -219,5 +242,5 @@ fn main() {
     // 让 FFI 调用有机会收尾，避免退出竞态。
     std::thread::sleep(std::time::Duration::from_millis(200));
 
-    println!("\n✓ ActorOptions::runtime_env 检查全部通过");
+    println!("\nPASS: all ActorOptions::runtime_env checks passed");
 }

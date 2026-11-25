@@ -94,21 +94,27 @@ struct NoClone(#[allow(dead_code)] i64);
 
 /// 编译期检查：`T` 不实现 `Clone` 时 `ObjectRef<T>` 仍然可以克隆。
 fn check_clone_without_t_clone() {
-    println!("\n--- 编译检查：ObjectRef<NoClone>::clone() 不要求 T: Clone ---");
+    println!("\n--- Compile check: ObjectRef<NoClone>::clone() does not require T: Clone ---");
     let id = vec![7u8; 28];
     let obj_ref: ObjectRef<NoClone> = ObjectRef::from(id.clone());
     let cloned = obj_ref.clone();
-    assert_eq!(cloned.id(), id.as_slice(), "clone 之后 id 变了");
-    println!("  ObjectRef<NoClone>::clone() → id {} 字节", cloned.id().len());
+    assert_eq!(cloned.id(), id.as_slice(), "id changed after clone");
+    println!(
+        "  ObjectRef<NoClone>::clone() -> {}-byte id",
+        cloned.id().len()
+    );
 }
 
 /// 一次批量取应当比 500 个并发单引用快出一倍。
 async fn check_batch_vs_single(ray: &Ray) {
-    println!("\n--- 1. 批量取 vs 逐个引用取（{} 个任务）---", BATCH_TASKS);
+    println!(
+        "\n--- 1. Batch get vs per-ref get ({} tasks) ---",
+        BATCH_TASKS
+    );
     let refs: Vec<ObjectRef<i64>> = (0..BATCH_TASKS)
         .map(|i| multiply_remote(ray, i as i64, 1).expect("submit multiply"))
         .collect();
-    println!("  已提交 {} 个 multiply(i, 1) 任务", refs.len());
+    println!("  submitted {} multiply(i, 1) tasks", refs.len());
 
     let start = Instant::now();
     let mut sequential = Vec::with_capacity(refs.len());
@@ -117,7 +123,7 @@ async fn check_batch_vs_single(ray: &Ray) {
             obj_ref
                 .get_timeout_async(BATCH_TIMEOUT)
                 .await
-                .expect("get_timeout_async 逐个取"),
+                .expect("sequential get_timeout_async"),
         );
     }
     let sequential_elapsed = start.elapsed();
@@ -126,7 +132,7 @@ async fn check_batch_vs_single(ray: &Ray) {
     let batch = ray
         .get_many_timeout_async(&refs, BATCH_TIMEOUT)
         .await
-        .expect("get_many_timeout_async 批量取");
+        .expect("get_many_timeout_async");
     let batch_elapsed = start.elapsed();
 
     let start = Instant::now();
@@ -136,57 +142,72 @@ async fn check_batch_vs_single(ray: &Ray) {
     }
     let mut concurrent = vec![None; refs.len()];
     while let Some(joined) = set.join_next().await {
-        let (i, value) = joined.expect("JoinSet 的任务失败");
-        concurrent[i] = Some(value.expect("并发 get_timeout_async"));
+        let (i, value) = joined.expect("JoinSet task failed");
+        concurrent[i] = Some(value.expect("concurrent get_timeout_async"));
     }
     let concurrent: Vec<i64> = concurrent
         .into_iter()
-        .map(|value| value.expect("并发档缺了某个引用"))
+        .map(|value| value.expect("missing concurrent result"))
         .collect();
     let concurrent_elapsed = start.elapsed();
 
     let rate = |elapsed: Duration| refs.len() as f64 / elapsed.as_secs_f64();
     println!(
-        "  顺序单引用（参考）：{} ms，{:.0} 个/秒",
+        "  sequential per-ref (baseline): {} ms, {:.0} items/s",
         sequential_elapsed.as_millis(),
         rate(sequential_elapsed)
     );
     println!(
-        "  批量一次：  {} ms，{:.0} 个/秒",
+        "  batch once:                    {} ms, {:.0} items/s",
         batch_elapsed.as_millis(),
         rate(batch_elapsed)
     );
     println!(
-        "  并发单引用：{} ms，{:.0} 个/秒",
+        "  concurrent per-ref:            {} ms, {:.0} items/s",
         concurrent_elapsed.as_millis(),
         rate(concurrent_elapsed)
     );
     println!(
-        "  顺序取是批量取的 {:.2} 倍",
+        "  sequential / batch speedup: {:.2}x",
         sequential_elapsed.as_secs_f64() / batch_elapsed.as_secs_f64()
     );
 
-    assert_eq!(batch.len(), refs.len(), "批量取返回 {} 个值", batch.len());
+    assert_eq!(
+        batch.len(),
+        refs.len(),
+        "batch returned {} values",
+        batch.len()
+    );
     for (i, value) in batch.iter().enumerate() {
         assert_eq!(
             *value, i as i64,
-            "批量取的第 {} 个值是 {}，应为 {}",
+            "batch[{}] was {}, expected {}",
             i, value, i
         );
     }
-    assert_eq!(sequential.len(), refs.len(), "顺序取返回 {} 个值", sequential.len());
+    assert_eq!(
+        sequential.len(),
+        refs.len(),
+        "sequential returned {} values",
+        sequential.len()
+    );
     for (i, value) in sequential.iter().enumerate() {
-        assert_eq!(*value, i as i64, "顺序取的第 {} 个值是 {}", i, value);
+        assert_eq!(*value, i as i64, "sequential[{}] was {}", i, value);
     }
-    assert_eq!(concurrent.len(), refs.len(), "并发取返回 {} 个值", concurrent.len());
+    assert_eq!(
+        concurrent.len(),
+        refs.len(),
+        "concurrent returned {} values",
+        concurrent.len()
+    );
     for (i, value) in concurrent.iter().enumerate() {
-        assert_eq!(*value, i as i64, "并发取的第 {} 个值是 {}", i, value);
+        assert_eq!(*value, i as i64, "concurrent[{}] was {}", i, value);
     }
     // 判据取并发档：500 个并发单引用正是批量实现退化成逐个取时的耗时上界；
     // 顺序档先把 500 个任务的执行时间付掉了，退化后的批量取仍旧远快于它。
     assert!(
         batch_elapsed * 2 < concurrent_elapsed,
-        "批量取用了 {} ms，并发单引用用了 {} ms，没有快出一倍",
+        "batch took {} ms vs concurrent per-ref {} ms, expected >2x faster",
         batch_elapsed.as_millis(),
         concurrent_elapsed.as_millis()
     );
@@ -194,81 +215,97 @@ async fn check_batch_vs_single(ray: &Ray) {
 
 /// 批量取的期限与单引用一样，由 Ray 在 `Get` 内部执行。
 async fn check_batch_timeout(ray: &Ray) {
-    println!("\n--- 2. 批量取的期限 ---");
+    println!("\n--- 2. Batch get timeout ---");
     let long_task = submit_long_task(ray);
-    println!("  提交 time.sleep({}) → {}", LONG_TASK_SLEEP_S, long_task.id_hex());
+    println!(
+        "  submitted time.sleep({}) -> {}",
+        LONG_TASK_SLEEP_S,
+        long_task.id_hex()
+    );
     let refs: Vec<ObjectRef<()>> = vec![long_task.clone()];
 
     let start = Instant::now();
     match ray.get_many_timeout_async(&refs, ASYNC_BATCH_TIMEOUT).await {
-        Ok(_) => panic!("睡眠任务在 {:?} 内交付了值", ASYNC_BATCH_TIMEOUT),
+        Ok(_) => panic!(
+            "sleeping task unexpectedly returned within {:?}",
+            ASYNC_BATCH_TIMEOUT
+        ),
         Err(RayError::Timeout(msg)) => {
             let elapsed = start.elapsed().as_millis();
             println!(
-                "  get_many_timeout_async({:?}) → RayError::Timeout，{} ms",
+                "  get_many_timeout_async({:?}) -> RayError::Timeout in {} ms",
                 ASYNC_BATCH_TIMEOUT, elapsed
             );
             println!("  message: {}", msg);
             assert!(
                 elapsed >= ASYNC_BATCH_TIMEOUT.as_millis(),
-                "批量取在 {} ms 就放弃，早于 {:?} 的期限",
+                "batch get returned at {} ms, before {:?} deadline",
                 elapsed,
                 ASYNC_BATCH_TIMEOUT
             );
             assert!(
                 elapsed < ASYNC_BATCH_TIMEOUT.as_millis() + TIMEOUT_SLACK_MS,
-                "批量取在期限之后 {} ms 才返回",
+                "batch get returned {} ms after deadline",
                 elapsed - ASYNC_BATCH_TIMEOUT.as_millis()
             );
         }
-        Err(other) => panic!("未就绪的批量取返回 {:?}，应为 RayError::Timeout", other),
+        Err(other) => panic!(
+            "pending batch get returned {:?}, expected RayError::Timeout",
+            other
+        ),
     }
 
     let start = Instant::now();
     match ray.get_many_timeout(&refs, SYNC_BATCH_TIMEOUT_MS) {
-        Ok(_) => panic!("睡眠任务在 {} ms 内交付了值", SYNC_BATCH_TIMEOUT_MS),
+        Ok(_) => panic!(
+            "sleeping task unexpectedly returned within {} ms",
+            SYNC_BATCH_TIMEOUT_MS
+        ),
         Err(RayError::Timeout(msg)) => {
             let elapsed = start.elapsed().as_millis();
             println!(
-                "  get_many_timeout({} ms) → RayError::Timeout，{} ms",
+                "  get_many_timeout({} ms) -> RayError::Timeout in {} ms",
                 SYNC_BATCH_TIMEOUT_MS, elapsed
             );
             println!("  message: {}", msg);
             assert!(
                 elapsed >= SYNC_BATCH_TIMEOUT_MS as u128,
-                "同步批量取在 {} ms 就放弃，早于 {} ms 的期限",
+                "sync batch get returned at {} ms, before {} ms deadline",
                 elapsed,
                 SYNC_BATCH_TIMEOUT_MS
             );
             assert!(
                 elapsed < SYNC_BATCH_TIMEOUT_MS as u128 + TIMEOUT_SLACK_MS,
-                "同步批量取在期限之后 {} ms 才返回",
+                "sync batch get returned {} ms after deadline",
                 elapsed - SYNC_BATCH_TIMEOUT_MS as u128
             );
         }
-        Err(other) => panic!("未就绪的同步批量取返回 {:?}，应为 RayError::Timeout", other),
+        Err(other) => panic!(
+            "pending sync batch get returned {:?}, expected RayError::Timeout",
+            other
+        ),
     }
 
     // 睡眠任务占着唯一的 CPU，必须取消掉下一个任务才能跑。
-    cancel_running(ray, &long_task, "睡眠任务");
+    cancel_running(ray, &long_task, "sleeping task");
 }
 
 /// `wait_async` 必须按引用本身区分就绪与未就绪，而不是按顺序。
 async fn check_wait_async(ray: &Ray) {
-    println!("\n--- 3. wait_async 处理混合批次 ---");
+    println!("\n--- 3. wait_async on mixed batch ---");
     let done = multiply_remote(ray, 6, 7).expect("submit multiply(6, 7)");
     let done_value: i64 = done
         .get_timeout_async(Duration::from_secs(30))
         .await
-        .expect("取已完成任务的值");
-    assert_eq!(done_value, 42, "multiply(6, 7) 返回了 {}", done_value);
+        .expect("get completed task result");
+    assert_eq!(done_value, 42, "multiply(6, 7) returned {}", done_value);
     let long_task = submit_long_task(ray);
 
     let done_ref: ObjectRef<i64> = done.clone();
     let sleep_ref: ObjectRef<i64> = long_task.clone().cast();
     let refs = vec![done_ref, sleep_ref];
-    println!("  已完成：{}", refs[0].id_hex());
-    println!("  睡眠：  {}", refs[1].id_hex());
+    println!("  completed: {}", refs[0].id_hex());
+    println!("  sleeping:  {}", refs[1].id_hex());
 
     let start = Instant::now();
     let (ready, unready) = ray
@@ -278,25 +315,25 @@ async fn check_wait_async(ray: &Ray) {
     let elapsed = start.elapsed();
 
     println!(
-        "  wait_async(2 个引用, num_objects=1, {} ms) → ready {} 个, unready {} 个, 用时 {} ms",
+        "  wait_async(2 refs, num_objects=1, {} ms) -> ready={}, unready={}, elapsed={} ms",
         WAIT_TIMEOUT.as_millis(),
         ready.len(),
         unready.len(),
         elapsed.as_millis()
     );
-    assert_eq!(ready.len(), 1, "ready 有 {} 个引用", ready.len());
-    assert_eq!(unready.len(), 1, "unready 有 {} 个引用", unready.len());
+    assert_eq!(ready.len(), 1, "ready had {} refs", ready.len());
+    assert_eq!(unready.len(), 1, "unready had {} refs", unready.len());
     assert_eq!(
         ready[0].id(),
         refs[0].id(),
-        "ready 里是 {}，应为已完成的 {}",
+        "ready[0] was {}, expected completed {}",
         ready[0].id_hex(),
         refs[0].id_hex()
     );
     assert_eq!(
         unready[0].id(),
         refs[1].id(),
-        "unready 里是 {}，应为睡眠中的 {}",
+        "unready[0] was {}, expected sleeping {}",
         unready[0].id_hex(),
         refs[1].id_hex()
     );
@@ -304,17 +341,17 @@ async fn check_wait_async(ray: &Ray) {
     let values = ray
         .get_many_timeout_async(&[done], Duration::from_secs(30))
         .await
-        .expect("取已完成的引用");
-    println!("  get_many_timeout_async([已完成]) → {:?}", values);
-    assert_eq!(values, vec![42], "已完成的任务返回了 {:?}", values);
+        .expect("get completed ref");
+    println!("  get_many_timeout_async([completed]) -> {:?}", values);
+    assert_eq!(values, vec![42], "completed task returned {:?}", values);
 
-    cancel_running(ray, &long_task, "睡眠任务");
+    cancel_running(ray, &long_task, "sleeping task");
 }
 
 /// 解码中途失败时，整组 buffer 与数组都必须释放。
 async fn check_leak(ray: &Ray) {
     println!(
-        "\n--- 4. {} 次解码失败的批量取（每批 {} 个引用）---",
+        "\n--- 4. {} rounds of failing batch get ({} refs per batch) ---",
         LEAK_ROUNDS, LEAK_BATCH
     );
     let good: ObjectRef<Vec<i64>> = ray.put(&vec![42i64]).expect("put the good element");
@@ -323,34 +360,41 @@ async fn check_leak(ray: &Ray) {
         .cast();
     let mut refs: Vec<ObjectRef<Vec<i64>>> = (0..LEAK_BATCH).map(|_| good.clone()).collect();
     refs[1] = bad;
-    println!("  第 1 个元素可解码，第 2 个元素是 i64 结果被 .cast() 成 Vec<i64>");
+    println!("  element 0 decodes as Vec<i64>; element 1 is i64 cast to Vec<i64>");
 
     let before = rss_bytes();
-    println!("  循环前常驻内存：{} 字节", before);
+    println!("  RSS before loop: {} bytes", before);
 
     let start = Instant::now();
     for round in 0..LEAK_ROUNDS {
         match ray.get_many(&refs) {
             Err(RayError::Serialization(_)) => {}
-            Err(other) => panic!("第 {} 轮返回 {:?}，应为 RayError::Serialization", round, other),
-            Ok(values) => panic!("第 {} 轮把 i64 载荷解码成了 {} 个 Vec<i64>", round, values.len()),
+            Err(other) => panic!(
+                "round {} returned {:?}, expected RayError::Serialization",
+                round, other
+            ),
+            Ok(values) => panic!(
+                "round {} unexpectedly decoded i64 payload into {} Vec<i64>s",
+                round,
+                values.len()
+            ),
         }
     }
     let elapsed = start.elapsed();
 
     let after = rss_bytes();
     let growth = after.saturating_sub(before);
-    println!("  循环后常驻内存：{} 字节", after);
-    println!("  增长：{} 字节", growth);
+    println!("  RSS after loop:  {} bytes", after);
+    println!("  RSS growth:      {} bytes", growth);
     println!(
-        "  {} 轮共 {} ms（每轮 {} µs）",
+        "  {} rounds took {} ms ({} us/round)",
         LEAK_ROUNDS,
         elapsed.as_millis(),
         elapsed.as_micros() / LEAK_ROUNDS as u128
     );
     assert!(
         growth < LEAK_MAX_GROWTH_BYTES,
-        "常驻内存增长了 {} 字节，超过 {} 字节的上限",
+        "RSS grew by {} bytes, exceeding {} byte limit",
         growth,
         LEAK_MAX_GROWTH_BYTES
     );
@@ -358,36 +402,40 @@ async fn check_leak(ray: &Ray) {
 
 /// 空批次直接返回空结果。
 async fn check_empty_batch(ray: &Ray) {
-    println!("\n--- 5. 空批次 ---");
+    println!("\n--- 5. Empty batch ---");
     let values = ray
         .get_many_async::<i64>(&[])
         .await
-        .expect("空批次的 get_many_async");
-    println!("  get_many_async::<i64>(&[]) → {} 个值", values.len());
-    assert!(values.is_empty(), "空批次返回了 {} 个值", values.len());
+        .expect("get_many_async on empty batch");
+    println!("  get_many_async::<i64>(&[]) -> {} values", values.len());
+    assert!(
+        values.is_empty(),
+        "empty batch returned {} values",
+        values.len()
+    );
 }
 
 /// 打印各入口对非法期限的返回值，并断言它被拒绝成 `RayError::Ffi`。
 fn expect_rejected<T>(label: &str, timeout_ms: i32, result: Result<T, RayError>) {
     match result {
-        Ok(_) => panic!("{} 接受了小于 -1 的期限", label),
+        Ok(_) => panic!("{} unexpectedly accepted timeout < -1", label),
         Err(RayError::Ffi(msg)) => {
             assert!(
                 msg.contains(&format!("got {}", timeout_ms)),
-                "{} 的消息没有带上入参 {}：{}",
+                "{} error message missing input {}: {}",
                 label,
                 timeout_ms,
                 msg
             );
-            println!("  {} → RayError::Ffi: {}", label, msg);
+            println!("  {} -> RayError::Ffi: {}", label, msg);
         }
-        Err(other) => panic!("{} 返回 {:?}，应为 RayError::Ffi", label, other),
+        Err(other) => panic!("{} returned {:?}, expected RayError::Ffi", label, other),
     }
 }
 
 /// 小于 -1 的期限会让 Ray 内部的 `RAY_CHECK` 终止整个进程，三个入口都必须先拒绝。
 fn check_negative_timeout(ray: &Ray) {
-    println!("\n--- 6. 小于 -1 的期限被拒绝 ---");
+    println!("\n--- 6. Timeouts < -1 are rejected ---");
     // 被测对象未就绪：没有校验时 Ray 的 RAY_CHECK 会在“有缺失元素”这条
     // 路上终止整个进程，这项检查因此同时覆盖“被拒绝”与“进程还活着”。
     let pending = submit_long_task(ray);
@@ -412,11 +460,15 @@ fn check_negative_timeout(ray: &Ray) {
 
     let recovered: i64 = value
         .get_timeout(30_000)
-        .expect("被拒绝之后的正常取");
-    assert_eq!(recovered, 5, "被拒绝之后的正常取返回了 {}", recovered);
-    println!("  被拒绝之后 value.get_timeout(30000) → {}", recovered);
+        .expect("normal get after rejection");
+    assert_eq!(
+        recovered, 5,
+        "normal get after rejection returned {}",
+        recovered
+    );
+    println!("  value.get_timeout(30000) after rejection -> {}", recovered);
 
-    cancel_running(ray, &pending, "睡眠任务");
+    cancel_running(ray, &pending, "sleeping task");
 }
 
 #[tokio::main]

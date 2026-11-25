@@ -31,7 +31,7 @@ fn main() {
     let ray = Ray::connect(&config).expect("Ray::connect");
 
     // 前置对照：驱动自身的 put/get
-    println!("\n--- 0. 驱动侧前置 put/get ---");
+    println!("\n--- 0. Driver baseline put/get ---");
     let driver_obj = ray.put(&42i64).expect("driver put(42)");
     let driver_val = driver_obj.get_timeout(TIMEOUT_MS).expect("driver get(42)");
     println!("  driver put/get -> {}", driver_val);
@@ -165,7 +165,7 @@ fn main() {
     assert_eq!(actor_val, 15, "call_actor_in_worker value mismatch");
 
     // 驱动侧核对 Counter 状态已变为 15，并校验驱动自身的 put/get 仍正常
-    println!("\n--- 5. 驱动侧后置核对 ---");
+    println!("\n--- 5. Driver post-check ---");
     let final_count: i64 = ray
         .actor_call(counter.id(), COUNTER_GET, &[], &[])
         .expect("submit final Counter::get")

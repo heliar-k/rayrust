@@ -70,14 +70,18 @@ fn expect_refused(label: &str, result: Result<ActorHandle, RayError>) {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains("the function name is empty"),
-                "{}: 错误文本不是空函数名那一句: {}",
+                "{}: error message does not mention empty function name: {}",
                 label,
                 message
             );
-            println!("  {} → Ffi({})", label, message);
+            println!("  {} -> Ffi({})", label, message);
         }
-        Err(other) => panic!("{}: 返回了别的错误变体: {}", label, other),
-        Ok(handle) => panic!("{}: 被接受了，交回 {} 字节的 id", label, handle.id().len()),
+        Err(other) => panic!("{}: returned unexpected error variant: {}", label, other),
+        Ok(handle) => panic!(
+            "{}: unexpectedly succeeded with {}-byte id",
+            label,
+            handle.id().len()
+        ),
     }
 }
 
@@ -85,86 +89,86 @@ fn expect_refused(label: &str, result: Result<ActorHandle, RayError>) {
 fn expect_created_then_call_fails(ray: &Ray, label: &str, func_name: &str, method: &str) {
     let handle = match ray.actor_create(func_name, &[], &ActorOptions::new()) {
         Ok(handle) => {
-            println!("  {} 创建 → Ok({} 字节 id)", label, handle.id().len());
+            println!("  {} created -> Ok({}-byte id)", label, handle.id().len());
             handle
         }
-        Err(error) => panic!("{}: 创建没有返回 Ok: {:?}", label, error),
+        Err(error) => panic!("{}: creation did not return Ok: {:?}", label, error),
     };
     match call_and_read(ray, handle.id(), method) {
         Ok(value) => panic!(
-            "{}: 调用读到了值 {}，这个 actor 里没有那个函数",
+            "{}: call unexpectedly returned {} for missing function",
             label, value
         ),
-        Err(error) => println!("  {} 调用 → Err({:?})", label, error),
+        Err(error) => println!("  {} call -> Err({:?})", label, error),
     }
 }
 
 fn main() {
-    println!("=== actor_create 的函数名检查 (local) ===");
+    println!("=== actor_create function name check (local) ===");
     let ray = Ray::connect(&RayConfig::local()).expect("Ray::connect");
-    assert!(ray.is_local_mode(), "这个例子只跑本地模式");
+    assert!(ray.is_local_mode(), "this example only runs in local mode");
 
-    println!("\n--- 1. 空函数名 ---");
+    println!("\n--- 1. Empty function name ---");
     expect_refused(
         "actor_create(\"\")",
         ray.actor_create("", &[], &ActorOptions::new()),
     );
     let value = ray
         .put(&42i32)
-        .expect("拒绝之后 put")
+        .expect("put after refusal")
         .get()
-        .expect("拒绝之后 get");
-    assert_eq!(value, 42, "拒绝之后 put + get 读到 {}", value);
-    println!("  进程存活，put + get 照常读到 {}", value);
+        .expect("get after refusal");
+    assert_eq!(value, 42, "put + get after refusal returned {}", value);
+    println!("  process alive, put + get returned {}", value);
 
-    println!("\n--- 2. 空函数名 + name(\"{}\") ---", REFUSED_NAME);
+    println!("\n--- 2. Empty function name + name(\"{}\") ---", REFUSED_NAME);
     expect_refused(
         "actor_create(\"\", name)",
         ray.actor_create("", &[], &ActorOptions::new().name(REFUSED_NAME)),
     );
     match ray.get_actor(REFUSED_NAME, "") {
-        Ok(None) => println!("  get_actor(\"{}\") → Ok(None)", REFUSED_NAME),
+        Ok(None) => println!("  get_actor(\"{}\") -> Ok(None)", REFUSED_NAME),
         Ok(Some(handle)) => panic!(
-            "被拒的创建登记了名字，查回来 {} 字节的 id",
+            "refused creation registered the name and returned {}-byte id",
             handle.id().len()
         ),
-        Err(error) => panic!("get_actor(\"{}\") 返回了错误: {:?}", REFUSED_NAME, error),
+        Err(error) => panic!("get_actor(\"{}\") returned error: {:?}", REFUSED_NAME, error),
     }
 
-    println!("\n--- 3. 只有空白字符的名字 ---");
+    println!("\n--- 3. Whitespace-only function name ---");
     expect_created_then_call_fails(&ray, "actor_create(\" \")", " ", COUNTER_GET);
-    println!("  进程存活");
+    println!("  process alive");
 
-    println!("\n--- 4. 非空但没人注册的名字 ---");
+    println!("\n--- 4. Non-empty unregistered function name ---");
     expect_created_then_call_fails(
         &ray,
         "actor_create(\"no_such_function\")",
         "no_such_function",
         "no_such_function::get",
     );
-    println!("  进程存活");
+    println!("  process alive");
 
-    println!("\n--- 5. 对照：真实 actor ---");
+    println!("\n--- 5. Control: real actor ---");
     let start = serialize(&7i64).expect("serialize");
     let counter = match ray.actor_create(COUNTER_FACTORY, &[&start[..]], &ActorOptions::new()) {
         Ok(handle) => {
             println!(
-                "  {} 创建 → Ok({} 字节 id)",
+                "  {} created -> Ok({}-byte id)",
                 COUNTER_FACTORY,
                 handle.id().len()
             );
             handle
         }
-        Err(error) => panic!("对照的创建失败了: {:?}", error),
+        Err(error) => panic!("control creation failed: {:?}", error),
     };
     match call_and_read(&ray, counter.id(), COUNTER_GET) {
         Ok(value) => {
-            assert_eq!(value, 7, "{} 读到 {}", COUNTER_GET, value);
-            println!("  {} → Ok({})", COUNTER_GET, value);
+            assert_eq!(value, 7, "{} returned {}", COUNTER_GET, value);
+            println!("  {} -> Ok({})", COUNTER_GET, value);
         }
-        Err(error) => panic!("对照的调用失败了: {:?}", error),
+        Err(error) => panic!("control call failed: {:?}", error),
     }
 
     drop(ray);
-    println!("\n✓ 函数名检查在 5 项上成立");
+    println!("\nPASS: function name checks passed on all 5 cases");
 }

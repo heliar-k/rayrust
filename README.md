@@ -10,7 +10,7 @@ rayrust wraps the Ray C++ SDK (`libray_api.so`) via a C ABI layer, providing idi
 
 | Feature | Local Mode | Cluster Mode |
 |---|:---:|:---:|
-| `Ray::connect` / `drop` (RAII lifecycle) | ✅ | ✅ |
+| `Ray::connect` / `Ray::local` / `drop` (RAII lifecycle; `Ray::local()` is the local-mode shorthand) | ✅ | ✅ |
 | `put` / `get` / `wait` | ✅ | ✅ |
 | `get_many` / `get_many_timeout` (batch get, optional deadline; one `Wait` + per-element `Get`, see #41) | ✅ | ✅ |
 | `get_many_async` / `get_many_timeout_async` / `wait_async` (batch get and `Wait` on the tokio blocking pool) | ✅ | ✅ |
@@ -32,6 +32,9 @@ rayrust wraps the Ray C++ SDK (`libray_api.so`) via a C ABI layer, providing idi
 | XLANG header auto-detection (Ray 2.56.1+ compatible) | ✅ | ✅ |
 | `rmpv::Value` dynamic deserialization | ✅ | ✅ |
 | `put_xlang` (writes the 9-byte XLANG header and `XLANG` metadata via `CoreWorker::Put` in cluster mode; local mode has no `CoreWorker` or Python executor and returns an error, see #21) | ❌ | ✅ |
+| `ActorHandle::serialize()` / `ActorHandle::from_serialized()` (actor handle handoff across processes; local mode has no `CoreWorker` and returns `RayError::Ffi`) | ❌ | ✅ |
+| `exit_actor()` / `Ray::was_current_actor_restarted()` (actor lifecycle helpers inside actor methods; local mode treats `exit_actor()` as a no-op and `was_current_actor_restarted()` always returns `false`) | ✅ | ✅ |
+| Metrics (`Gauge`, `Counter`, `Histogram`, `Sum` via `libray_api.so`; local mode is a no-op; upstream `metrics_agent_port = -1` skips agent export) | ✅ | ✅ |
 | `ray_last_error_bytes()` (thread-local error bytes + length; Rust extracts formatted exception text with UTF-8 lossy fallback) | ✅ | ✅ |
 
 ## Quick Start
@@ -257,6 +260,32 @@ and Ray worker processes do not take part in reference counting, so dropping a
 reference there frees nothing. A reference rebuilt from id bytes
 (`ObjectRef::from(id_bytes)`) holds no reference at all: whether the object is
 still alive is up to whoever else holds it, so read it with `get_timeout`.
+
+### Metrics
+
+```rust
+use rayrust::prelude::*;
+
+let gauge = Gauge::new("queue_depth", "Pending items", "items", &["worker"])?;
+gauge.set(4.0, &[("worker", "w1")])?;
+
+let counter = Counter::new("requests_total", "Processed requests", "count", &["status"])?;
+counter.inc(1.0, &[("status", "ok")])?;
+
+let hist = Histogram::new(
+    "request_latency_ms",
+    "Request latency",
+    "ms",
+    &[1.0, 5.0, 10.0, 50.0],
+    &["route"],
+)?;
+hist.observe(3.5, &[("route", "/predict")])?;
+
+let sum = Sum::new("bytes_transferred", "Net payload delta", "bytes", &[])?;
+sum.record(256.0, &[])?;
+```
+
+Metric handles can be constructed before `Ray::connect` or inside tasks and actors, and reused across runtime shutdown and re-initialization cycles. Recording calls validate arguments first and are protected by the shutdown gate on an active runtime: local mode starts no `CoreWorker` and returns `Ok(())` as a no-op, while cluster mode registers and aggregates views in-process because upstream `ProcessHelper::RayStart` fixes `CoreWorkerOptions::metrics_agent_port` to `-1`.
 
 ## Architecture
 

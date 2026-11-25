@@ -56,27 +56,27 @@ fn expect_refused<T>(label: &str, result: Result<T, RayError>, needle: &str) {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains(needle),
-                "{}: 错误文本里没有 {:?}: {}",
+                "{}: error message does not contain {:?}: {}",
                 label,
                 needle,
                 message
             );
-            println!("  {} → Ffi({})", label, message);
+            println!("  {} -> Ffi({})", label, message);
         }
-        Err(other) => panic!("{}: 返回了别的错误变体: {}", label, other),
-        Ok(_) => panic!("{}: 被接受了", label),
+        Err(other) => panic!("{}: returned unexpected error variant: {}", label, other),
+        Ok(_) => panic!("{}: unexpectedly succeeded", label),
     }
 }
 
 fn main() {
-    println!("=== actor_create_python 的空名字检查 (cluster) ===");
+    println!("=== actor_create_python empty name check (cluster) ===");
     let ray = Ray::connect(&cluster_config()).expect("Ray::connect");
     assert!(
         !ray.is_local_mode(),
-        "这个例子只跑集群模式：本地模式整体拒绝 actor_create_python"
+        "this example only runs in cluster mode: local mode rejects actor_create_python"
     );
 
-    println!("\n--- 1. 空 module 名与空 class 名 ---");
+    println!("\n--- 1. Empty module and class names ---");
     expect_refused(
         "actor_create_python(\"\", \"\")",
         ray.actor_create_python("", "", &[], &ActorOptions::new()),
@@ -84,42 +84,42 @@ fn main() {
     );
     let value = ray
         .put(&42i32)
-        .expect("拒绝之后 put")
+        .expect("put after refusal")
         .get()
-        .expect("拒绝之后 get");
-    assert_eq!(value, 42, "拒绝之后 put + get 读到 {}", value);
-    println!("  进程存活，put + get 照常读到 {}", value);
+        .expect("get after refusal");
+    assert_eq!(value, 42, "put + get after refusal returned {}", value);
+    println!("  process alive, put + get returned {}", value);
 
-    println!("\n--- 2. 空 class 名 ---");
+    println!("\n--- 2. Empty class name ---");
     expect_refused(
         "actor_create_python(\"rayrust_test\", \"\")",
         ray.actor_create_python("rayrust_test", "", &[], &ActorOptions::new()),
         "the class name is empty",
     );
 
-    println!("\n--- 3. 空 module 名 ---");
+    println!("\n--- 3. Empty module name ---");
     expect_refused(
         "actor_create_python(\"\", \"Counter\")",
         ray.actor_create_python("", "Counter", &[], &ActorOptions::new()),
         "the module name is empty",
     );
 
-    println!("\n--- 4. 空名字 + name(\"{}\") ---", REFUSED_NAME);
+    println!("\n--- 4. Empty name + name(\"{}\") ---", REFUSED_NAME);
     expect_refused(
         "actor_create_python(\"\", \"\", name)",
         ray.actor_create_python("", "", &[], &ActorOptions::new().name(REFUSED_NAME)),
         "the module name is empty",
     );
     match ray.get_actor(REFUSED_NAME, "") {
-        Ok(None) => println!("  get_actor(\"{}\") → Ok(None)", REFUSED_NAME),
+        Ok(None) => println!("  get_actor(\"{}\") -> Ok(None)", REFUSED_NAME),
         Ok(Some(handle)) => panic!(
-            "被拒的创建登记了名字，查回来 {} 字节的 id",
+            "refused creation registered the name and returned {}-byte id",
             handle.id().len()
         ),
-        Err(error) => panic!("get_actor(\"{}\") 返回了错误: {:?}", REFUSED_NAME, error),
+        Err(error) => panic!("get_actor(\"{}\") returned error: {:?}", REFUSED_NAME, error),
     }
 
-    println!("\n--- 5. 对照：真实 Python actor ---");
+    println!("\n--- 5. Control: real Python actor ---");
     let start = serialize(&7i64).expect("serialize the constructor argument");
     let counter = match ray.actor_create_python(
         "rayrust_test",
@@ -128,18 +128,18 @@ fn main() {
         &ActorOptions::new(),
     ) {
         Ok(handle) => {
-            println!("  actor_create_python → Ok({} 字节 id)", handle.id().len());
+            println!("  actor_create_python -> Ok({}-byte id)", handle.id().len());
             handle
         }
-        Err(error) => panic!("对照的创建失败了: {:?}", error),
+        Err(error) => panic!("control creation failed: {:?}", error),
     };
     let call = ray
         .actor_call_python(counter.id(), "get", &[], &[])
         .expect("submit get");
     let value: i64 = call.cast().get_timeout(READ_TIMEOUT_MS).expect("read get");
-    assert_eq!(value, 7, "Python Counter 的 get() 读到 {}", value);
-    println!("  actor_call_python(id, \"get\") → Ok({})", value);
+    assert_eq!(value, 7, "Python Counter get() returned {}", value);
+    println!("  actor_call_python(id, \"get\") -> Ok({})", value);
 
     drop(ray);
-    println!("\n✓ 空名字检查在 5 项上成立");
+    println!("\nPASS: empty name checks passed on all 5 cases");
 }

@@ -47,24 +47,24 @@ fn actor_call_rejects_an_unregistered_actor_id() {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains("is not registered in this process"),
-                "未登记的 id 没有报未登记: {}",
+                "unregistered id error missing expected message: {}",
                 message
             );
             assert!(
                 message.contains(&hex_of(&unknown)),
-                "错误文本里没有 id 的 hex: {}",
+                "error message missing id hex: {}",
                 message
             );
         }
-        Err(other) => panic!("未登记的 id 返回了别的错误变体: {}", other),
-        Ok(_) => panic!("未登记的 id 被提交了"),
+        Err(other) => panic!("unregistered id returned unexpected error variant: {}", other),
+        Ok(_) => panic!("unregistered id was unexpectedly accepted"),
     }
     // 拒绝之后进程与运行时都还能用。
     let value = ray.put(&7i32).expect("put after the rejection");
     assert_eq!(
         value.get_timeout(5000).expect("get after the rejection"),
         7,
-        "拒绝之后 put/get 读回的值不对"
+        "unexpected put/get value after rejection"
     );
 }
 
@@ -72,30 +72,30 @@ fn actor_call_rejects_an_unregistered_actor_id() {
 fn actor_call_reports_a_short_actor_id_before_the_registry() {
     let _lock = lock_ray();
     let ray = local_ray();
-    for (label, actor_id) in [("3 字节", vec![1u8, 2, 3]), ("0 字节", Vec::new())] {
+    for (label, actor_id) in [("3-byte", vec![1u8, 2, 3]), ("0-byte", Vec::new())] {
         match ray.actor_call(&actor_id, "counter::increment", &[], &[]) {
             Err(RayError::Ffi(message)) => {
                 assert!(
                     message.contains("actor id must be 16 bytes"),
-                    "{} actor id 没有报宽度: {}",
+                    "{} actor id error missing width check: {}",
                     label,
                     message
                 );
                 assert!(
                     message.contains(&format!("got {} bytes", actor_id.len())),
-                    "{} actor id 的错误里没有实际长度: {}",
+                    "{} actor id error missing actual length: {}",
                     label,
                     message
                 );
                 assert!(
                     !message.contains("is not registered in this process"),
-                    "{} actor id 先命中了登记表: {}",
+                    "{} actor id hit registry before width check: {}",
                     label,
                     message
                 );
             }
-            Err(other) => panic!("{} actor id 返回了别的错误变体: {}", label, other),
-            Ok(_) => panic!("{}的 actor id 被接受了", label),
+            Err(other) => panic!("{} actor id returned unexpected error variant: {}", label, other),
+            Ok(_) => panic!("{} actor id was unexpectedly accepted", label),
         }
     }
 }
@@ -109,7 +109,7 @@ fn the_registry_forgets_the_handles_of_a_dropped_runtime() {
     let handle = ray
         .actor_create("__rayrust_no_such_actor_factory", &[], &ActorOptions::new())
         .expect("actor_create in local mode");
-    assert_eq!(handle.id().len(), 16, "actor id 的长度不是 16");
+    assert_eq!(handle.id().len(), 16, "actor id length is not 16");
     // 同一个运行时里，调用要么被本地模式自己拒掉，要么提交；不能是「未登记」。
     match ray.actor_call(
         handle.id(),
@@ -119,10 +119,10 @@ fn the_registry_forgets_the_handles_of_a_dropped_runtime() {
     ) {
         Err(RayError::Ffi(message)) => assert!(
             !message.contains("is not registered in this process"),
-            "同一个运行时里的 handle 被登记表拒了: {}",
+            "handle from current runtime was rejected as unregistered: {}",
             message
         ),
-        Err(other) => panic!("调用本地 actor 返回了别的错误变体: {}", other),
+        Err(other) => panic!("calling local actor returned unexpected error variant: {}", other),
         Ok(_) => {}
     }
     let stale = handle.id().to_vec();
@@ -131,11 +131,11 @@ fn the_registry_forgets_the_handles_of_a_dropped_runtime() {
     match ray.actor_call(&stale, "__rayrust_no_such_actor_factory::get", &[], &[]) {
         Err(RayError::Ffi(message)) => assert!(
             message.contains("is not registered in this process"),
-            "重连之后的陈旧 handle 没有报未登记: {}",
+            "stale handle after reconnect was not reported as unregistered: {}",
             message
         ),
-        Err(other) => panic!("陈旧 handle 返回了别的错误变体: {}", other),
-        Ok(_) => panic!("重连之后的陈旧 handle 被提交了"),
+        Err(other) => panic!("stale handle returned unexpected error variant: {}", other),
+        Ok(_) => panic!("stale handle after reconnect was unexpectedly accepted"),
     }
 }
 
@@ -154,22 +154,22 @@ fn serialize_reports_a_handle_from_a_dropped_runtime_as_unregistered() {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains("is not registered in this process"),
-                "陈旧 handle 的 serialize 没有报未登记: {}",
+                "serialize on stale handle was not reported as unregistered: {}",
                 message
             );
             assert!(
                 !message.contains("local mode"),
-                "本地模式拒绝排在了登记表之前: {}",
+                "local mode refusal ran before registry check: {}",
                 message
             );
             assert!(
                 message.contains(&hex_of(&stale_id)),
-                "错误文本里没有 id 的 hex: {}",
+                "error message missing id hex: {}",
                 message
             );
         }
-        Err(other) => panic!("陈旧 handle 返回了别的错误变体: {}", other),
-        Ok(_) => panic!("陈旧 handle 被序列化了"),
+        Err(other) => panic!("stale handle returned unexpected error variant: {}", other),
+        Ok(_) => panic!("stale handle was unexpectedly serialized"),
     }
 }
 
@@ -191,17 +191,17 @@ fn task_call_python_rejects_a_name_registered_as_a_rust_function() {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains("would run instead of the Python function"),
-                "错误文本没有说明撞名: {}",
+                "error message missing name collision explanation: {}",
                 message
             );
             assert!(
                 message.contains(&format!("some_module.{}", registered)),
-                "错误文本里没有模块与函数名: {}",
+                "error message missing module and function name: {}",
                 message
             );
         }
-        Err(other) => panic!("撞名的 task_call_python 返回了别的错误变体: {}", other),
-        Ok(_) => panic!("撞名的 Python 任务被提交了"),
+        Err(other) => panic!("colliding task_call_python returned unexpected error variant: {}", other),
+        Ok(_) => panic!("colliding Python task was unexpectedly submitted"),
     }
 }
 
@@ -215,7 +215,7 @@ fn c_namespace() -> Option<String> {
     let text = unsafe {
         let slice = std::slice::from_raw_parts(bytes.data as *const u8, bytes.len);
         std::str::from_utf8(slice)
-            .expect("C 入口交回的 namespace 不是合法 UTF-8")
+            .expect("namespace from C entry must be valid UTF-8")
             .to_string()
     };
     unsafe { rayrust::sys::ray_free_bytes(&mut bytes) };
@@ -240,9 +240,13 @@ fn connect_succeeds_and_keeps_clean_namespace_after_rejected_runtime_env() {
     // 1. 进程里还没有运行时。
     assert!(
         !unsafe { rayrust::sys::ray_is_initialized() },
-        "这个测试要求进程里没有 Ray runtime"
+        "this test requires no active Ray runtime at start"
     );
-    assert_eq!(c_namespace(), None, "没有运行时时 C 入口交回了 namespace");
+    assert_eq!(
+        c_namespace(),
+        None,
+        "C entry returned a namespace when no runtime exists"
+    );
 
     // 2. 四种畸形输入都被拒：集群与本地模式各两种。
     for config in [
@@ -260,33 +264,37 @@ fn connect_succeeds_and_keeps_clean_namespace_after_rejected_runtime_env() {
         match Ray::connect(&config) {
             Err(RayError::Ffi(message)) => assert!(
                 message.starts_with("ray_init: runtime_env JSON is invalid: "),
-                "被拒绝的 runtime_env 消息前缀不符: {}",
+                "rejected runtime_env message prefix mismatch: {}",
                 message
             ),
-            Err(other) => panic!("被拒绝的 runtime_env 返回了其他错误变体: {}", other),
-            Ok(_) => panic!("非法的 runtime_env 被接受了"),
+            Err(other) => panic!("rejected runtime_env returned unexpected error variant: {}", other),
+            Ok(_) => panic!("invalid runtime_env was unexpectedly accepted"),
         }
     }
 
     // 3. 被拒的调用没有留下 namespace，也没有建出运行时。
-    assert_eq!(c_namespace(), None, "被拒绝的 init 留下了可读的 namespace");
+    assert_eq!(
+        c_namespace(),
+        None,
+        "rejected init left a readable namespace"
+    );
     assert!(
         !unsafe { rayrust::sys::ray_is_initialized() },
-        "被拒绝的 init 建出了运行时"
+        "rejected init created a runtime"
     );
 
     // 4. 正常 init 写入传入的 namespace。
     let ray = Ray::connect(&RayConfig::local().namespace("initial_ns"))
-        .expect("拒绝之后使用正常配置初始化本地运行时");
+        .expect("initialize local runtime with valid config after rejection");
     assert_eq!(
-        ray.namespace().expect("读取本地模式 namespace"),
+        ray.namespace().expect("read local mode namespace"),
         "initial_ns",
-        "成功 init 之后 Rust 层读到的 namespace 不对"
+        "Rust layer namespace mismatch after init"
     );
     assert_eq!(
         c_namespace().as_deref(),
         Some("initial_ns"),
-        "成功 init 之后 C 入口读到的 namespace 不对"
+        "C entry namespace mismatch after init"
     );
 
     // 5. 已初始化时直接进 C 入口：`ray::Init` 是空操作，namespace 不该跟着换。
@@ -316,12 +324,12 @@ fn connect_succeeds_and_keeps_clean_namespace_after_rejected_runtime_env() {
     assert_eq!(
         direct_init("overwritten_ns", ""),
         0,
-        "已初始化时的 ray_init 返回了非零"
+        "ray_init while initialized returned non-zero"
     );
     assert_eq!(
         c_namespace().as_deref(),
         Some("initial_ns"),
-        "已初始化时的 ray_init 改写了 namespace"
+        "ray_init while initialized overwrote namespace"
     );
 
     // 6. 同一条路径带畸形 runtime_env：被拒，namespace 同样不变。
@@ -329,18 +337,18 @@ fn connect_succeeds_and_keeps_clean_namespace_after_rejected_runtime_env() {
     assert_eq!(
         direct_init("rejected_again", "{"),
         -1,
-        "直接调 C 入口的畸形 runtime_env 没有被拒"
+        "direct C ray_init with malformed runtime_env was not refused"
     );
-    let message = rayrust::sys::last_error().expect("C 入口没有记录错误");
+    let message = rayrust::sys::last_error().expect("C entry recorded no error");
     assert!(
         message.starts_with("runtime_env JSON is invalid: "),
-        "直接调 C 入口的错误消息前缀不符: {}",
+        "direct C ray_init error prefix mismatch: {}",
         message
     );
     assert_eq!(
         c_namespace().as_deref(),
         Some("initial_ns"),
-        "带畸形 runtime_env 的直接调用改写了 namespace"
+        "direct C ray_init with malformed runtime_env overwrote namespace"
     );
 
     // 7. 运行时仍然可用：put/get 与正常关闭。
@@ -350,7 +358,8 @@ fn connect_succeeds_and_keeps_clean_namespace_after_rejected_runtime_env() {
 
     let with_valid_env =
         RayConfig::local().runtime_env(r#"{"env_vars":{"RAYRUST_T41_LOCAL":"ok"}}"#);
-    let ray = Ray::connect(&with_valid_env).expect("携带合法对象 runtime_env 初始化本地运行时");
+    let ray = Ray::connect(&with_valid_env)
+        .expect("initialize local runtime with valid runtime_env object");
     let obj = ray.put(&99i32).expect("put 99");
     assert_eq!(obj.get_timeout(5000).expect("get 99"), 99);
     drop(ray);

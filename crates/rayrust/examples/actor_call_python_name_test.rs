@@ -82,37 +82,37 @@ fn expect_refused<T>(label: &str, result: Result<T, RayError>, needles: &[&str])
             for needle in needles {
                 assert!(
                     message.contains(needle),
-                    "{}: 错误文本里没有 {:?}: {}",
+                    "{}: error message does not contain {:?}: {}",
                     label,
                     needle,
                     message
                 );
             }
-            println!("  {} → Ffi({})", label, message);
+            println!("  {} -> Ffi({})", label, message);
         }
-        Err(other) => panic!("{}: 返回了别的错误变体: {}", label, other),
-        Ok(_) => panic!("{}: 被接受了", label),
+        Err(other) => panic!("{}: returned unexpected error variant: {}", label, other),
+        Ok(_) => panic!("{}: unexpectedly succeeded", label),
     }
 }
 
 /// 读一次方法调用的值，期限同上。
 fn read_i64(ray: &Ray, actor_id: &[u8], method: &str) -> i64 {
     ray.actor_call_python(actor_id, method, &[], &[])
-        .unwrap_or_else(|error| panic!("{}: 提交失败了: {:?}", method, error))
+        .unwrap_or_else(|error| panic!("{}: submit failed: {:?}", method, error))
         .cast::<i64>()
         .get_timeout(READ_TIMEOUT_MS)
-        .unwrap_or_else(|error| panic!("{}: 读值失败了: {:?}", method, error))
+        .unwrap_or_else(|error| panic!("{}: get failed: {:?}", method, error))
 }
 
 fn main() {
-    println!("=== actor_call_python 的空方法名检查 (cluster) ===");
+    println!("=== actor_call_python empty method name check (cluster) ===");
     let ray = Ray::connect(&cluster_config()).expect("Ray::connect");
     assert!(
         !ray.is_local_mode(),
-        "这个例子只跑集群模式：本地模式整体拒绝 actor_call_python"
+        "this example only runs in cluster mode: local mode rejects actor_call_python"
     );
 
-    println!("\n--- 1. 对照：真实 Python actor ---");
+    println!("\n--- 1. Control: real Python actor ---");
     let start = serialize(&7i64).expect("serialize the constructor argument");
     let counter = match ray.actor_create_python(
         "rayrust_test",
@@ -121,10 +121,10 @@ fn main() {
         &ActorOptions::new(),
     ) {
         Ok(handle) => {
-            println!("  actor_create_python → Ok({} 字节 id)", handle.id().len());
+            println!("  actor_create_python -> Ok({}-byte id)", handle.id().len());
             handle
         }
-        Err(error) => panic!("对照的创建失败了: {:?}", error),
+        Err(error) => panic!("control creation failed: {:?}", error),
     };
     let step = serialize(&1i64).expect("serialize the increment argument");
     let value: i64 = ray
@@ -133,45 +133,45 @@ fn main() {
         .cast()
         .get_timeout(READ_TIMEOUT_MS)
         .expect("read increment");
-    assert_eq!(value, 8, "Python Counter 的 increment(1) 读到 {}", value);
+    assert_eq!(value, 8, "Python Counter increment(1) returned {}", value);
     println!(
-        "  actor_call_python(id, \"increment\", [1]) → Ok({})",
+        "  actor_call_python(id, \"increment\", [1]) -> Ok({})",
         value
     );
 
-    println!("\n--- 2. 空方法名 ---");
+    println!("\n--- 2. Empty method name ---");
     expect_refused(
         "actor_call_python(id, \"\")",
         ray.actor_call_python(counter.id(), "", &[], &[]),
         &["the method name is empty"],
     );
     let value = read_i64(&ray, counter.id(), "get");
-    assert_eq!(value, 8, "空方法名之后 get 读到 {}", value);
-    println!("  同一个 actor 的 get 仍读到 {}", value);
+    assert_eq!(value, 8, "get after empty method name returned {}", value);
+    println!("  get on the same actor still returned {}", value);
 
-    println!("\n--- 3. 带内部 NUL 的方法名 ---");
+    println!("\n--- 3. Method name with interior NUL ---");
     expect_refused(
         "actor_call_python(id, \"in\\0crement\")",
         ray.actor_call_python(counter.id(), "in\0crement", &[], &[]),
         &["method_name", "interior NUL"],
     );
     let value = read_i64(&ray, counter.id(), "get");
-    assert_eq!(value, 8, "内部 NUL 之后 get 读到 {}", value);
-    println!("  同一个 actor 的 get 仍读到 {}", value);
+    assert_eq!(value, 8, "get after interior NUL returned {}", value);
+    println!("  get on the same actor still returned {}", value);
 
-    println!("\n--- 4. 对照：C++ actor 的空方法名 ---");
+    println!("\n--- 4. Control: C++ actor empty method name ---");
     let start_cpp = serialize(&41i64).expect("serialize the C++ constructor argument");
     let cpp_counter =
         match ray.actor_create(COUNTER_FACTORY, &[&start_cpp[..]], &ActorOptions::new()) {
             Ok(handle) => {
                 println!(
-                    "  {} 创建 → Ok({} 字节 id)",
+                    "  {} created -> Ok({}-byte id)",
                     COUNTER_FACTORY,
                     handle.id().len()
                 );
                 handle
             }
-            Err(error) => panic!("对照的创建失败了: {:?}", error),
+            Err(error) => panic!("control creation failed: {:?}", error),
         };
     expect_refused(
         "actor_call(cpp_id, \"\")",
@@ -180,13 +180,13 @@ fn main() {
     );
     let value: i64 = ray
         .actor_call(cpp_counter.id(), COUNTER_GET, &[], &[])
-        .unwrap_or_else(|error| panic!("{}: 提交失败了: {:?}", COUNTER_GET, error))
+        .unwrap_or_else(|error| panic!("{}: submit failed: {:?}", COUNTER_GET, error))
         .cast()
         .get_timeout(READ_TIMEOUT_MS)
-        .unwrap_or_else(|error| panic!("{}: 读值失败了: {:?}", COUNTER_GET, error));
-    assert_eq!(value, 41, "C++ Counter 的 get 读到 {}", value);
-    println!("  {} → Ok({})", COUNTER_GET, value);
+        .unwrap_or_else(|error| panic!("{}: get failed: {:?}", COUNTER_GET, error));
+    assert_eq!(value, 41, "C++ Counter get returned {}", value);
+    println!("  {} -> Ok({})", COUNTER_GET, value);
 
     drop(ray);
-    println!("\n✓ 空方法名检查在 4 项上成立");
+    println!("\nPASS: empty method name checks passed on all 4 cases");
 }

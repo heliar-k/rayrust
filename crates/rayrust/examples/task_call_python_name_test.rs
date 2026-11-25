@@ -65,16 +65,16 @@ fn expect_refused<T>(label: &str, result: Result<T, RayError>, needles: &[&str])
             for needle in needles {
                 assert!(
                     message.contains(needle),
-                    "{}: 错误文本里没有 {:?}: {}",
+                    "{}: error message does not contain {:?}: {}",
                     label,
                     needle,
                     message
                 );
             }
-            println!("  {} → Ffi({})", label, message);
+            println!("  {} -> Ffi({})", label, message);
         }
-        Err(other) => panic!("{}: 返回了别的错误变体: {}", label, other),
-        Ok(_) => panic!("{}: 被接受了", label),
+        Err(other) => panic!("{}: returned unexpected error variant: {}", label, other),
+        Ok(_) => panic!("{}: unexpectedly succeeded", label),
     }
 }
 
@@ -84,29 +84,29 @@ fn check_control(ray: &Ray, label: &str) {
     let b = serialize(&1i32).expect("serialize the second argument");
     let value: i32 = ray
         .task_call_python(PYTHON_MODULE, "add", &[&a[..], &b[..]], &[])
-        .unwrap_or_else(|error| panic!("{}: 提交失败了: {:?}", label, error))
+        .unwrap_or_else(|error| panic!("{}: submit failed: {:?}", label, error))
         .cast()
         .get_timeout(READ_TIMEOUT_MS)
-        .unwrap_or_else(|error| panic!("{}: 读值失败了: {:?}", label, error));
-    assert_eq!(value, 3, "{} 读到 {}", label, value);
+        .unwrap_or_else(|error| panic!("{}: get failed: {:?}", label, error));
+    assert_eq!(value, 3, "{} returned {}", label, value);
     println!(
-        "  task_call_python(\"{}\", \"add\", [2, 1]) → Ok({})",
+        "  task_call_python(\"{}\", \"add\", [2, 1]) -> Ok({})",
         PYTHON_MODULE, value
     );
 }
 
 fn main() {
-    println!("=== task_call_python 的空名字检查 (cluster) ===");
+    println!("=== task_call_python empty name check (cluster) ===");
     let ray = Ray::connect(&cluster_config()).expect("Ray::connect");
     assert!(
         !ray.is_local_mode(),
-        "这个例子只跑集群模式：本地模式没有 Python 执行器"
+        "this example only runs in cluster mode: local mode has no Python executor"
     );
 
-    println!("\n--- 1. 对照：真实 Python 任务 ---");
-    check_control(&ray, "对照");
+    println!("\n--- 1. Control: real Python task ---");
+    check_control(&ray, "control");
 
-    println!("\n--- 2. 空 module 名 ---");
+    println!("\n--- 2. Empty module name ---");
     let a = serialize(&2i32).expect("serialize the first argument");
     let b = serialize(&1i32).expect("serialize the second argument");
     expect_refused(
@@ -114,41 +114,47 @@ fn main() {
         ray.task_call_python("", "add", &[&a[..], &b[..]], &[]),
         &["the module name is empty"],
     );
-    check_control(&ray, "空 module 名之后的对照");
+    check_control(&ray, "control after empty module name");
 
-    println!("\n--- 3. 空 function 名（提交成功，读值失败） ---");
+    println!("\n--- 3. Empty function name (submit succeeds, get fails) ---");
     match ray.task_call_python(PYTHON_MODULE, "", &[&a[..], &b[..]], &[]) {
         Ok(reference) => {
             println!(
-                "  task_call_python(\"{}\", \"\", [2, 1]) → Ok(提交成功)",
+                "  task_call_python(\"{}\", \"\", [2, 1]) -> Ok(submitted)",
                 PYTHON_MODULE
             );
             match reference.cast::<i64>().get_timeout(READ_TIMEOUT_MS) {
-                Ok(value) => panic!("空 function 名读到了值: {}", value),
-                Err(error @ RayError::Task(_)) => println!("  读值 → {:?}", error),
-                Err(other) => panic!("空 function 名读值返回了别的错误变体: {:?}", other),
+                Ok(value) => panic!("empty function name unexpectedly returned {}", value),
+                Err(error @ RayError::Task(_)) => println!("  get -> {:?}", error),
+                Err(other) => panic!(
+                    "empty function name get returned unexpected error variant: {:?}",
+                    other
+                ),
             }
         }
-        Err(error) => panic!("空 function 名被拒了，但它是能跑通的输入: {:?}", error),
+        Err(error) => panic!(
+            "empty function name was unexpectedly refused: {:?}",
+            error
+        ),
     }
-    check_control(&ray, "空 function 名之后的对照");
+    check_control(&ray, "control after empty function name");
 
-    println!("\n--- 4. 带内部 NUL 的 module 名 ---");
+    println!("\n--- 4. Module name with interior NUL ---");
     expect_refused(
         "task_call_python(\"rayrust\\0test\", \"add\", [2, 1])",
         ray.task_call_python("rayrust\0test", "add", &[&a[..], &b[..]], &[]),
         &["module", "interior NUL"],
     );
-    check_control(&ray, "带内部 NUL 的 module 名之后的对照");
+    check_control(&ray, "control after interior NUL module name");
 
-    println!("\n--- 5. 带内部 NUL 的 function 名 ---");
+    println!("\n--- 5. Function name with interior NUL ---");
     expect_refused(
         "task_call_python(\"rayrust_test\", \"ad\\0d\", [2, 1])",
         ray.task_call_python(PYTHON_MODULE, "ad\0d", &[&a[..], &b[..]], &[]),
         &["function", "interior NUL"],
     );
-    check_control(&ray, "带内部 NUL 的 function 名之后的对照");
+    check_control(&ray, "control after interior NUL function name");
 
     drop(ray);
-    println!("\n✓ 空 module 名检查、内部 NUL 拦截与空 function 名的异步语义在 5 项上成立");
+    println!("\nPASS: empty module name check, interior NUL check, and empty function name semantics passed on all 5 cases");
 }

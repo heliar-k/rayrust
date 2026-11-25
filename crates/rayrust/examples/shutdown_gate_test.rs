@@ -76,7 +76,7 @@ fn check_gate_rejection(name: &str, returned_empty: bool, failures: &mut Vec<Str
 
     if !returned_empty {
         let detail = format!(
-            "{}: 返回了非空结果 (raw_kind={}, msg={:?})",
+            "{}: returned non-empty result (raw_kind={}, msg={:?})",
             name, raw_kind, msg
         );
         println!("  FAIL {}", detail);
@@ -85,7 +85,7 @@ fn check_gate_rejection(name: &str, returned_empty: bool, failures: &mut Vec<Str
     }
     if raw_kind != RAY_ERROR_KIND_RUNTIME_RAW || kind != ErrorKind::Runtime {
         let detail = format!(
-            "{}: 错误类别不符, 预期 raw={} ({:?}), 实际 raw={} ({:?}), msg={:?}",
+            "{}: error kind mismatch, expected raw={} ({:?}), got raw={} ({:?}), msg={:?}",
             name,
             RAY_ERROR_KIND_RUNTIME_RAW,
             ErrorKind::Runtime,
@@ -99,11 +99,11 @@ fn check_gate_rejection(name: &str, returned_empty: bool, failures: &mut Vec<Str
     }
     match msg {
         Some(ref text) if text.contains(EXPECTED_CLOSING_MESSAGE) => {
-            println!("  {} → refused (Runtime: {})", name, text);
+            println!("  {} -> refused (Runtime: {})", name, text);
         }
         other => {
             let detail = format!(
-                "{}: 错误消息不符, 预期包含 {:?}, 实际 {:?}",
+                "{}: error message mismatch, expected {:?}, got {:?}",
                 name, EXPECTED_CLOSING_MESSAGE, other
             );
             println!("  FAIL {}", detail);
@@ -485,7 +485,7 @@ fn check_29_entries() {
         )
     };
     if gauge_h.is_null() || counter_h.is_null() || hist_h.is_null() || sum_h.is_null() {
-        fail("构造关闭闸门测试用指标句柄失败".to_string());
+        fail("failed to construct metric handles for shutdown gate test".to_string());
     }
 
     // 26. ray_gauge_set
@@ -517,12 +517,12 @@ fn check_29_entries() {
 
     if !failures.is_empty() {
         fail(format!(
-            "29 个入口中有 {} 个未按预期拒绝: {}",
+            "{} of 29 entries were not refused as expected: {}",
             failures.len(),
             failures.join("; ")
         ));
     }
-    println!("  29 个入口全部以 RAY_ERROR_KIND_RUNTIME 拒绝");
+    println!("  all 29 entries refused with RAY_ERROR_KIND_RUNTIME");
 }
 
 fn main() {
@@ -539,39 +539,39 @@ fn main() {
     println!("=== shutdown_gate_test ({}) ===", mode);
 
     // 1. 前置对照
-    println!("\n--- 1. 前置对照：建立运行时并 put/get ---");
+    println!("\n--- 1. Baseline: initialize runtime and put/get ---");
     let config = if is_local {
         RayConfig::local()
     } else {
         cluster_config()
     };
-    let ray = Ray::connect(&config).unwrap_or_else(|e| fail(format!("首次连接失败: {}", e)));
+    let ray = Ray::connect(&config).unwrap_or_else(|e| fail(format!("initial connect failed: {}", e)));
     let obj = ray
         .put(&12345i64)
-        .unwrap_or_else(|e| fail(format!("首次 put 失败: {}", e)));
+        .unwrap_or_else(|e| fail(format!("initial put failed: {}", e)));
     let val = obj
         .get()
-        .unwrap_or_else(|e| fail(format!("首次 get 失败: {}", e)));
+        .unwrap_or_else(|e| fail(format!("initial get failed: {}", e)));
     if val != 12345 {
-        fail(format!("首次 get 预期 12345, 实际 {}", val));
+        fail(format!("initial get expected 12345, got {}", val));
     }
     println!("  put(12345) -> get() = {}", val);
 
     // 2. 丢掉句柄，检查 ray_is_initialized()
-    println!("\n--- 2. 释放句柄后 ray_is_initialized() 为 false ---");
+    println!("\n--- 2. After handle drop, ray_is_initialized() is false ---");
     drop(ray);
     let initialized = unsafe { sys::ray_is_initialized() };
     println!("  ray_is_initialized() = {}", initialized);
     if initialized {
-        fail("释放句柄后 ray_is_initialized() 仍为 true".to_string());
+        fail("ray_is_initialized() remained true after handle drop".to_string());
     }
 
     // 3. 29 个入口逐个调用
-    println!("\n--- 3. 关闭后 29 个入口逐个调用 ---");
+    println!("\n--- 3. Call all 29 entries after shutdown ---");
     check_29_entries();
 
     // 4. 引用计数两个入口不被拒
-    println!("\n--- 4. 引用计数两个入口返回 0 且无错误 ---");
+    println!("\n--- 4. Both ref-counting entries return 0 with no error ---");
     let ref_id = [0x01u8; 28];
     sys::clear_error();
     let rc_add =
@@ -587,7 +587,7 @@ fn main() {
     );
     if rc_add != 0 || !err_add.is_null() || err_add_len != 0 {
         fail(format!(
-            "ray_add_local_reference 预期 rc=0 且无错误, 实际 rc={}, len={}, err={:?}",
+            "ray_add_local_reference expected rc=0 and no error, got rc={}, len={}, err={:?}",
             rc_add,
             err_add_len,
             sys::last_error()
@@ -608,7 +608,7 @@ fn main() {
     );
     if rc_rem != 0 || !err_rem.is_null() || err_rem_len != 0 {
         fail(format!(
-            "ray_remove_local_reference 预期 rc=0 且无错误, 实际 rc={}, len={}, err={:?}",
+            "ray_remove_local_reference expected rc=0 and no error, got rc={}, len={}, err={:?}",
             rc_rem,
             err_rem_len,
             sys::last_error()
@@ -616,7 +616,7 @@ fn main() {
     }
 
     // 5. ray_is_local_mode() 仍然答得出
-    println!("\n--- 5. ray_is_local_mode() 保持可读且不报错 ---");
+    println!("\n--- 5. ray_is_local_mode() stays readable without error ---");
     sys::clear_error();
     let reported_local = unsafe { sys::ray_is_local_mode() };
     let mut err_mode: *const c_char = std::ptr::null();
@@ -630,7 +630,7 @@ fn main() {
     );
     if reported_local != is_local || !err_mode.is_null() || err_mode_len != 0 {
         fail(format!(
-            "ray_is_local_mode 预期 {} 且无错误, 实际 {}, len={}, err={:?}",
+            "ray_is_local_mode expected {} with no error, got {}, len={}, err={:?}",
             is_local,
             reported_local,
             err_mode_len,
@@ -654,7 +654,7 @@ fn main() {
     unsafe { sys::ray_last_error_bytes(&mut err_create, &mut err_create_len) };
     if post_gauge.is_null() || !err_create.is_null() || err_create_len != 0 {
         fail(format!(
-            "关闭后 ray_gauge_create 失败或留下错误: ptr_is_null={}, len={}, err={:?}",
+            "post-close ray_gauge_create failed or left error: ptr_is_null={}, len={}, err={:?}",
             post_gauge.is_null(),
             err_create_len,
             sys::last_error()
@@ -667,10 +667,10 @@ fn main() {
     let mut err_name_len: usize = 0;
     unsafe { sys::ray_last_error_bytes(&mut err_name, &mut err_name_len) };
     let name_guard = sys::CBytesGuard::from(raw_name)
-        .unwrap_or_else(|| fail("关闭后 ray_metric_get_name 返回空指针".to_string()));
+        .unwrap_or_else(|| fail("post-close ray_metric_get_name returned null".to_string()));
     if name_guard.as_slice() != b"post_close_gauge" || !err_name.is_null() || err_name_len != 0 {
         fail(format!(
-            "关闭后 ray_metric_get_name 结果或错误异常: got={:?}, len={}, err={:?}",
+            "post-close ray_metric_get_name unexpected result or error: got={:?}, len={}, err={:?}",
             std::str::from_utf8(name_guard.as_slice()),
             err_name_len,
             sys::last_error()
@@ -685,25 +685,25 @@ fn main() {
     unsafe { sys::ray_last_error_bytes(&mut err_destroy, &mut err_destroy_len) };
     if !err_destroy.is_null() || err_destroy_len != 0 {
         fail(format!(
-            "关闭后 ray_metric_destroy 留下错误: len={}, err={:?}",
+            "post-close ray_metric_destroy left error: len={}, err={:?}",
             err_destroy_len,
             sys::last_error()
         ));
     }
     println!(
-        "  ray_gauge_create / ray_metric_get_name / ray_metric_destroy 在关闭后正常完成且无错误"
+        "  ray_gauge_create / ray_metric_get_name / ray_metric_destroy succeeded after shutdown with no error"
     );
 
     // 检查三个 ABI/版本诊断入口在关闭后不受关闭闸门拒绝且不留错误
     sys::clear_error();
     let raw_build_ver = unsafe { sys::ray_build_sdk_version() };
     let build_ver_guard = sys::CBytesGuard::from(raw_build_ver)
-        .unwrap_or_else(|| fail("关闭后 ray_build_sdk_version 返回空指针".to_string()));
+        .unwrap_or_else(|| fail("post-close ray_build_sdk_version returned null".to_string()));
     if build_ver_guard.as_slice() != sys::BUILD_RAY_VERSION.as_bytes()
         || sys::last_error().is_some()
     {
         fail(format!(
-            "关闭后 ray_build_sdk_version 异常: err={:?}",
+            "post-close ray_build_sdk_version failed: err={:?}",
             sys::last_error()
         ));
     }
@@ -712,12 +712,12 @@ fn main() {
     sys::clear_error();
     let raw_loaded_ver = unsafe { sys::ray_loaded_sdk_version() };
     let loaded_ver_guard = sys::CBytesGuard::from(raw_loaded_ver)
-        .unwrap_or_else(|| fail("关闭后 ray_loaded_sdk_version 返回空指针".to_string()));
+        .unwrap_or_else(|| fail("post-close ray_loaded_sdk_version returned null".to_string()));
     if loaded_ver_guard.as_slice() != sys::BUILD_RAY_VERSION.as_bytes()
         || sys::last_error().is_some()
     {
         fail(format!(
-            "关闭后 ray_loaded_sdk_version 异常: err={:?}",
+            "post-close ray_loaded_sdk_version failed: err={:?}",
             sys::last_error()
         ));
     }
@@ -728,17 +728,17 @@ fn main() {
     let sym_rc = unsafe { sys::ray_check_private_symbol(sym_fm.as_ptr()) };
     if sym_rc != 0 || sys::last_error().is_some() {
         fail(format!(
-            "关闭后 ray_check_private_symbol 失败: rc={}, err={:?}",
+            "post-close ray_check_private_symbol failed: rc={}, err={:?}",
             sym_rc,
             sys::last_error()
         ));
     }
     println!(
-        "  ray_build_sdk_version / ray_loaded_sdk_version / ray_check_private_symbol 在关闭后正常完成且无错误"
+        "  ray_build_sdk_version / ray_loaded_sdk_version / ray_check_private_symbol succeeded after shutdown with no error"
     );
 
     // 6. 关闭进行中的拒绝（仅在 local 模式跑）
-    println!("\n--- 6. 关闭排空进行中的拒绝 ---");
+    println!("\n--- 6. Refusal during shutdown drain ---");
     if is_local {
         let drain_gauge = unsafe {
             sys::ray_gauge_create(
@@ -750,12 +750,12 @@ fn main() {
             )
         };
         if drain_gauge.is_null() {
-            fail("构造第 6 项 drain_gate_gauge 失败".to_string());
+            fail("failed to construct case 6 drain_gate_gauge".to_string());
         }
         let ray_drain =
-            Ray::local().unwrap_or_else(|e| fail(format!("第 6 项 Ray::local 失败: {}", e)));
+            Ray::local().unwrap_or_else(|e| fail(format!("case 6 Ray::local failed: {}", e)));
         let _pending = sleep_for_remote(&ray_drain, 1.5)
-            .unwrap_or_else(|e| fail(format!("提交 sleep_for(1.5) 失败: {}", e)));
+            .unwrap_or_else(|e| fail(format!("submit sleep_for(1.5) failed: {}", e)));
         let drop_thread = std::thread::spawn(move || {
             let t0 = Instant::now();
             drop(ray_drain);
@@ -803,86 +803,86 @@ fn main() {
 
         if drop_ms < 1000.0 {
             fail(format!(
-                "排空耗时过短 ({:.2} ms < 1000 ms), 无法证明调用发生在排空期间",
+                "drain elapsed ({:.2} ms < 1000 ms), cannot confirm calls ran during drain",
                 drop_ms
             ));
         }
         if !mid_empty {
-            fail("排空进行中的 ray_put 未被拒绝（返回了非空 id）".to_string());
+            fail("in-flight ray_put during drain was not refused (returned non-empty id)".to_string());
         }
         if mid_raw_kind != RAY_ERROR_KIND_RUNTIME_RAW || mid_kind != ErrorKind::Runtime {
             fail(format!(
-                "排空进行中的 ray_put 错误类别不符: raw={} ({:?}), msg={:?}",
+                "in-flight ray_put error kind mismatch: raw={} ({:?}), msg={:?}",
                 mid_raw_kind, mid_kind, mid_msg
             ));
         }
         match mid_msg {
             Some(ref text) if text.contains(EXPECTED_CLOSING_MESSAGE) => {
-                println!("  排空期间 ray_put 被拒绝: Runtime({})", text);
+                println!("  ray_put during drain refused: Runtime({})", text);
             }
-            other => fail(format!("排空进行中的 ray_put 错误消息不符: {:?}", other)),
+            other => fail(format!("in-flight ray_put error message mismatch: {:?}", other)),
         }
 
         if !mid_xlang_empty {
-            fail("排空进行中的 ray_put_xlang 未被拒绝（返回了非空 id）".to_string());
+            fail("in-flight ray_put_xlang during drain was not refused (returned non-empty id)".to_string());
         }
         if mid_xlang_raw_kind != RAY_ERROR_KIND_RUNTIME_RAW || mid_xlang_kind != ErrorKind::Runtime
         {
             fail(format!(
-                "排空进行中的 ray_put_xlang 错误类别不符: raw={} ({:?}), msg={:?}",
+                "in-flight ray_put_xlang error kind mismatch: raw={} ({:?}), msg={:?}",
                 mid_xlang_raw_kind, mid_xlang_kind, mid_xlang_msg
             ));
         }
         match mid_xlang_msg {
             Some(ref text) if text.contains(EXPECTED_CLOSING_MESSAGE) => {
-                println!("  排空期间 ray_put_xlang 被拒绝: Runtime({})", text);
+                println!("  ray_put_xlang during drain refused: Runtime({})", text);
             }
             other => fail(format!(
-                "排空进行中的 ray_put_xlang 错误消息不符: {:?}",
+                "in-flight ray_put_xlang error message mismatch: {:?}",
                 other
             )),
         }
 
         if mid_gauge_rc != -1 {
             fail(format!(
-                "排空进行中的 ray_gauge_set 未被拒绝（rc={}）",
+                "in-flight ray_gauge_set during drain was not refused (rc={})",
                 mid_gauge_rc
             ));
         }
         if mid_gauge_raw_kind != RAY_ERROR_KIND_RUNTIME_RAW || mid_gauge_kind != ErrorKind::Runtime
         {
             fail(format!(
-                "排空进行中的 ray_gauge_set 错误类别不符: raw={} ({:?}), msg={:?}",
+                "in-flight ray_gauge_set error kind mismatch: raw={} ({:?}), msg={:?}",
                 mid_gauge_raw_kind, mid_gauge_kind, mid_gauge_msg
             ));
         }
         match mid_gauge_msg {
             Some(ref text) if text.contains(EXPECTED_CLOSING_MESSAGE) => {
-                println!("  排空期间 ray_gauge_set 被拒绝: Runtime({})", text);
+                println!("  ray_gauge_set during drain refused: Runtime({})", text);
             }
             other => fail(format!(
-                "排空进行中的 ray_gauge_set 错误消息不符: {:?}",
+                "in-flight ray_gauge_set error message mismatch: {:?}",
                 other
             )),
         }
     } else {
-        println!("  cluster 模式关闭不等待在途任务，第 6 项仅在 local 模式运行");
+        println!("  cluster mode shutdown does not wait for in-flight tasks; case 6 only runs in local mode");
     }
 
     // 7. 复位：再次建立运行时并 put/get
-    println!("\n--- 7. 重新初始化复位关闭标志并 put/get ---");
-    let ray2 = Ray::connect(&config).unwrap_or_else(|e| fail(format!("重新连接失败: {}", e)));
+    println!("\n--- 7. Re-initialize to reset shutdown flag and put/get ---");
+    let ray2 = Ray::connect(&config).unwrap_or_else(|e| fail(format!("reconnect failed: {}", e)));
     let obj2 = ray2
         .put(&67890i64)
-        .unwrap_or_else(|e| fail(format!("复位后 put 失败: {}", e)));
+        .unwrap_or_else(|e| fail(format!("put after reset failed: {}", e)));
     let val2 = obj2
         .get()
-        .unwrap_or_else(|e| fail(format!("复位后 get 失败: {}", e)));
+        .unwrap_or_else(|e| fail(format!("get after reset failed: {}", e)));
     if val2 != 67890 {
-        fail(format!("复位后 get 预期 67890, 实际 {}", val2));
+        fail(format!("get after reset expected 67890, got {}", val2));
     }
-    println!("  重新连接成功: put(67890) -> get() = {}", val2);
+    println!("  reconnect succeeded: put(67890) -> get() = {}", val2);
     drop(ray2);
 
-    println!("\nPASS: shutdown_gate_test ({}) 全部通过", mode);
+    println!("\nPASS: shutdown_gate_test ({}) all checks passed", mode);
 }
