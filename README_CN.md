@@ -340,16 +340,52 @@ let futs = (0..10).map(|i| add_remote_async(&ray, i, 1));
 
 `put`、`kill_actor`、`get_actor` 与全部宏生成的调用器都返回 `Result`：参数序列化错误与任务、actor 提交错误都回到调用方，不变成 panic。`Ray::connect` 在进入 SDK 之前校验 `RayConfig::address` 与 `RayConfig::runtime_env`，畸形 `runtime_env` JSON（或非对象的合法 JSON 值）返回 `Err`，不会终止进程。C ABI 的线程局部 `last_error()` 在 FFI 调用后检查，调用前 `clear_error()` 防止残留错误。失败的任务与 actor 从错误载荷中提取格式化异常文本（如 Python traceback），无法提取时按 UTF-8 lossy 呈现原始字节。C++ SDK 未翻译的错误类型以 `RayError::Unclassified` 返回：不带错误文本的对象（如已取消的任务）由消息说明该情况并点名 `TASK_CANCELLED`；携带错误帧的对象（如 `runtime_env` 安装失败）在解码之前就被识别，因此 `get`、`get_value`、`Vec<u8>` 以及批量与异步入口都返回 Ray 记录的错误文本，不把帧字节当成值解出来。判定要求载荷严格满足帧规则（总长为 `9 + N`、正文是 msgpack `bin`、protobuf 顶层字段号与 wire type 都在允许集合内、文本非空且是合法 UTF-8），正常值不会被改判；恰好满足这些规则的载荷会以 `RayError::Unclassified` 返回，该载荷因此不再参与解码。`#[remote]` 与 `#[actor]` 生成的工人回调将参数解码错误与函数体 `panic!` 捕获并通过回调错误通道回传为任务错误，不会跨 `extern "C"` 终止工人进程。
 
-Rust vs Python 在 Ray 集群上（500 个任务）：
+## 性能基准
 
 ![Benchmark](docs/benchmark.svg)
 
-| 指标 | Rust | Python | 加速比 |
+### 测试环境与统计口径
+
+- **主机配置**：`2 × AMD EPYC 7542 32-Core Processor`（64 物理核心 / 128 线程），377 GiB 内存，Linux 5.10 `x86_64`
+- **集群形态**：单节点 Ray 2.56.1 集群（`--num-cpus=16`，`127.0.0.1` 本地回环）
+- **构建与运行时**：`rustc 1.100.0`（`--release`）、`rayrust 0.2.1`、`Python 3.12.3`、`ray[cpp]==2.56.1`
+- **统计口径**：预热全部 16 个 C++ worker 与 16 个 Python worker 后连续独立运行 5 轮；单元格展示 **5 轮中位数（`最小值–最大值`）**
+
+### 1. SDK 调度与对象存储开销（微型任务与并发等待）
+
+微型任务（`add(a, b)`）耗时主要由跨进程 RPC、raylet 调度与对象存储往返决定，`rayrust`（经 `libray_api.so`）与 `Ray Python` 处于同一数量级。并发等待批量任务时，使用 `Ray::get_many_async` 执行一次批量 `Wait` 的吞吐约为逐引用 `ObjectRef::get_async` 的 2.0 倍（`7,092` 对比 `3,554 tasks/s`）。
+
+| 指标 | Rust（`rayrust`） | Python（`ray`） | 中位数比值 |
 |---|---|---|---|
-| 异步吞吐 | 4744 tasks/sec | 1918 tasks/sec | **2.5x** |
-| 延迟（中位数） | 617µs | 950µs | **1.5x** |
-| 计算（sum 0..1M） | 2.8ms | 652ms | **234x** |
-| 异步 runtime（100×50ms） | 521ms（9.6x 并行） | — | — |
+| 并发吞吐，批量获取（`N=500`，`add_remote_async` + `get_many_async` 对比 `ray.get(refs)`） | 7,092 tasks/s（6,724–7,493）<br>70.50 ms（66.73–74.36） | 6,274 tasks/s（4,897–7,297）<br>79.69 ms（68.52–102.09） | **1.13x** |
+| 并发吞吐，逐引用获取（`N=500`，`JoinSet` + `ObjectRef::get_async`） | 3,554 tasks/s（3,475–3,798）<br>140.69 ms（131.66–143.87） | — | — |
+| 跨语言并发吞吐，批量获取（`N=500`，Rust → Python `rayrust_test.add` + `get_many_async`） | 5,971 tasks/s（5,615–6,664）<br>83.73 ms（75.02–89.05） | 6,274 tasks/s（4,897–7,297） | **0.95x** |
+| 顺序同步吞吐（`N=500`，`add_remote` + `get` 对比 `ray.get(add.remote)`） | 813 tasks/s（741–992）<br>614.66 ms（504.11–674.44） | 626 tasks/s（556–673）<br>798.09 ms（743.23–899.90） | **1.30x** |
+| 单任务往返延迟，同步（`N=100`，`add(1, 2)`） | 中位数 1.28 ms（1.15–1.32）<br>p99 1.94 ms（1.55–2.17） | 中位数 1.50 ms（1.38–1.67）<br>p99 2.09 ms（1.72–7.94） | **1.17x**（中位数） |
+| 单任务往返延迟，异步（`N=100`，`add_remote_async` + `get_async`） | 中位数 1.36 ms（1.24–1.40）<br>p99 1.95 ms（1.73–2.63） | — | **1.10x**（对比 Python 同步） |
+| 跨语言单任务往返延迟（`N=100`，Rust → Python `rayrust_test.add`） | 中位数 1.40 ms（1.34–1.62）<br>p99 2.59 ms（2.06–3.86） | 中位数 1.50 ms（1.38–1.67） | **1.07x**（中位数） |
+| 异步 worker 并发休眠（16 CPU 上 `100 × 50 ms` tokio 休眠，7 批理论下限 `350 ms`） | 371.17 ms（370.87–373.45） | — | **13.47x**（13.39–13.48x，对比串行 `5,000 ms`） |
+| 复杂载荷往返（`100 × 100` 嵌套整数列表，`N=50` 顺序 `echo_list`） | 3.43 ms/iter（3.18–5.70）<br>纯 msgpack 128.35 µs · `put` 561.69 µs | 4.03 ms/iter（2.75–4.53） | **1.17x** |
+
+### 2. 任务函数体执行速度对比（编译型 Rust 与解释型 CPython 语言对比）
+
+下表对比任务函数体内纯循环计算（`sum(0..1_000_000)`）在编译型 Rust（`--release`）与解释型 CPython 3.12 下的执行速度；计时范围为 10 个并发任务从提交、worker 执行到批量取回（`get_many_async` / `ray.get(refs)`）的端到端总耗时：
+
+| 负载 | 编译型 Rust（`compute`） | 解释型 CPython（Python 驱动 `pybench.py`） | 解释型 CPython（Rust 跨语言调用 `rayrust_test.compute`） | 语言计算加速比 |
+|---|---|---|---|---|
+| `sum(0..1_000_000) × 10` 并发任务（端到端批量总耗时） | 3.72 ms（3.29–4.13 ms） | 37.52 ms（31.18–47.71 ms） | 34.61 ms（20.78–63.15 ms） | **10.1x**（Python 驱动中位数比值）<br>**9.89x**（跨语言同轮配对中位数，范围 6.04–16.98x） |
+
+### 复现命令
+
+```bash
+cargo build --release --all-targets
+ray start --head --port=6379 --num-cpus=16 --include-dashboard=false
+
+RAY_ADDRESS=127.0.0.1:6379 RAY_NODE_IP=127.0.0.1 cargo run --release --example raybench
+RAY_ADDRESS=127.0.0.1:6379 RAY_NODE_IP=127.0.0.1 python3 tests/python/pybench.py
+
+ray stop --force
+```
 
 ## 集群配置
 
@@ -443,7 +479,7 @@ fn main() {
 | `async_demo` | tokio 并发异步任务 |
 | `xlang_complex` | 跨语言复杂类型（11 项测试） |
 | `actor_e2e` | Rust actor 端到端测试（`#[actor]` 宏） |
-| `raybench` | 性能基准（Rust vs Python） |
+| `raybench` | SDK 调度开销与任务函数体基准测试（配对 `tests/python/pybench.py`） |
 
 ## 持续集成
 
