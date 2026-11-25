@@ -363,9 +363,10 @@ impl Drop for CBytesGuard {
     }
 }
 
-/// Helper to convert a Rust string to CString, handling null.
-pub fn to_cstring(s: &str) -> CString {
-    CString::new(s).unwrap_or_else(|_| CString::new("").unwrap())
+/// Convert a Rust string slice into a `CString`, returning `Err(NulError)`
+/// if `s` contains an interior NUL byte.
+pub fn to_cstring(s: &str) -> Result<CString, std::ffi::NulError> {
+    CString::new(s)
 }
 
 /// 读取当前线程在 C 包装层记录的最后一条错误消息。
@@ -402,4 +403,26 @@ pub fn build_args_array(args: &[&[u8]]) -> Vec<RayBytes> {
             len: b.len(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_cstring;
+
+    #[test]
+    fn to_cstring_accepts_empty_and_plain_strings() {
+        for input in ["", "127.0.0.1:6379", "rayrust_test", " "] {
+            let cstr = to_cstring(input).expect("valid string without interior NUL");
+            assert_eq!(cstr.as_bytes(), input.as_bytes());
+        }
+    }
+
+    #[test]
+    fn to_cstring_rejects_interior_nul_with_exact_byte_position() {
+        let cases: &[(&str, usize)] = &[("\0", 0), ("\0abc", 0), ("a\0b", 1), ("abc\0", 3)];
+        for &(input, expected_pos) in cases {
+            let err = to_cstring(input).expect_err("string with NUL must return Err");
+            assert_eq!(err.nul_position(), expected_pos);
+        }
+    }
 }

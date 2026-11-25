@@ -95,7 +95,8 @@ pub fn handle_handoff(serialized: Vec<u8>, raw_id: Vec<u8>) -> (Vec<u8>, Vec<u8>
 /// 用裸 actor id 提交一次方法调用：走 `Ray::actor_call` 用的同一个 C 入口。工人进程
 /// 里没有 `Ray` 句柄可用，所以这里直接调 FFI。
 fn call_actor_by_raw_id(actor_id: &[u8]) -> String {
-    let method = rayrust::sys::to_cstring("__rayrust_actor_factory_counter::get");
+    let method = rayrust::sys::to_cstring("__rayrust_actor_factory_counter::get")
+        .expect("static method name");
     let mut out = unsafe {
         rayrust::sys::ray_actor_call(
             actor_id.as_ptr() as *const std::os::raw::c_char,
@@ -182,7 +183,7 @@ pub fn submit_nested(value: i64) -> Result<(Vec<u8>, i64), String> {
     let arg_a = rayrust::serialize(&value).map_err(|e| format!("{:?}", e))?;
     let arg_b = rayrust::serialize(&7i64).map_err(|e| format!("{:?}", e))?;
     let args = rayrust::sys::build_args_array(&[&arg_a, &arg_b]);
-    let func_c = rayrust::sys::to_cstring("multiply");
+    let func_c = rayrust::sys::to_cstring("multiply").expect("static function name");
     rayrust::sys::clear_error();
     let raw = unsafe {
         rayrust::sys::ray_task_call_with_options(
@@ -213,7 +214,8 @@ pub fn call_actor_in_worker(serialized_handle: Vec<u8>, n: i64) -> Result<(Vec<u
         .map_err(|e| format!("{:?}", e))?;
     let arg_n = rayrust::serialize(&n).map_err(|e| format!("{:?}", e))?;
     let args = rayrust::sys::build_args_array(&[&arg_n]);
-    let method = rayrust::sys::to_cstring("__rayrust_actor_factory_counter::increment");
+    let method = rayrust::sys::to_cstring("__rayrust_actor_factory_counter::increment")
+        .expect("static method name");
     rayrust::sys::clear_error();
     let raw = unsafe {
         rayrust::sys::ray_actor_call(

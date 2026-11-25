@@ -17,9 +17,8 @@
 //! （`types.ModuleType` 子类带 `__call__`，或者往 `sys.modules` 放可调用对象），那时
 //! 任务真的执行（实测返回 3）。第 3 项断言的就是这条异步语义。
 //!
-//! 带内部 NUL 的 module 名经 `to_cstring`（crates/rayrust-sys/src/lib.rs:253-255，
-//! #27）变成空串，同样被空 module 名那条检查拦住；带内部 NUL 的 function 名就是一个
-//! 空 function 名，照原样提交。
+//! 带内部 NUL 的 module 名与 function 名在进入 C 之前由 Rust FFI 边界拒绝，返回点名
+//! `module` 或 `function` 且含 `interior NUL` 的 `RayError::Ffi`，任务不会提交。
 //!
 //! 只跑集群模式：本地模式对 Python 任务没有 Python 执行器。
 //! ```text
@@ -36,8 +35,10 @@
 //!    `the module name is empty`；随后对照仍读到 3
 //! 3. `task_call_python("rayrust_test", "", ...)`：提交成功，读值失败（普通任务失败，
 //!    空 function 名没有被拒），随后对照仍读到 3
-//! 4. `task_call_python("rayrust\0test", "add", ...)`：被拒成 `RayError::Ffi`，消息
-//!    含 `the module name is empty`；随后对照仍读到 3
+//! 4. `task_call_python("rayrust\0test", "add", ...)`：在 Rust FFI 边界被拒成
+//!    `RayError::Ffi`，消息含 `module` 与 `interior NUL`；随后对照仍读到 3
+//! 5. `task_call_python("rayrust_test", "ad\0d", ...)`：在 Rust FFI 边界被拒成
+//!    `RayError::Ffi`，消息含 `function` 与 `interior NUL`；随后对照仍读到 3
 //!
 //! 非空但没人注册的名字同样保留 Ray 的异步语义：驱动没有函数表，无从判断，实测读值
 //! 会一直等到超时；这个入口不拒这类名字，示例里不做断言。
@@ -57,17 +58,19 @@ fn cluster_config() -> RayConfig {
     RayConfig::new(&address).node_ip(&node_ip)
 }
 
-/// 一次应当被拒绝的调用：必须是 `RayError::Ffi`，消息里含 `needle`。
-fn expect_refused<T>(label: &str, result: Result<T, RayError>, needle: &str) {
+/// 一次应当被拒绝的调用：必须是 `RayError::Ffi`，消息里含全部 `needles`。
+fn expect_refused<T>(label: &str, result: Result<T, RayError>, needles: &[&str]) {
     match result {
         Err(RayError::Ffi(message)) => {
-            assert!(
-                message.contains(needle),
-                "{}: 错误文本里没有 {:?}: {}",
-                label,
-                needle,
-                message
-            );
+            for needle in needles {
+                assert!(
+                    message.contains(needle),
+                    "{}: 错误文本里没有 {:?}: {}",
+                    label,
+                    needle,
+                    message
+                );
+            }
             println!("  {} → Ffi({})", label, message);
         }
         Err(other) => panic!("{}: 返回了别的错误变体: {}", label, other),
@@ -109,7 +112,7 @@ fn main() {
     expect_refused(
         "task_call_python(\"\", \"add\", [2, 1])",
         ray.task_call_python("", "add", &[&a[..], &b[..]], &[]),
-        "the module name is empty",
+        &["the module name is empty"],
     );
     check_control(&ray, "空 module 名之后的对照");
 
@@ -134,10 +137,18 @@ fn main() {
     expect_refused(
         "task_call_python(\"rayrust\\0test\", \"add\", [2, 1])",
         ray.task_call_python("rayrust\0test", "add", &[&a[..], &b[..]], &[]),
-        "the module name is empty",
+        &["module", "interior NUL"],
     );
-    check_control(&ray, "内部 NUL 之后的对照");
+    check_control(&ray, "带内部 NUL 的 module 名之后的对照");
+
+    println!("\n--- 5. 带内部 NUL 的 function 名 ---");
+    expect_refused(
+        "task_call_python(\"rayrust_test\", \"ad\\0d\", [2, 1])",
+        ray.task_call_python(PYTHON_MODULE, "ad\0d", &[&a[..], &b[..]], &[]),
+        &["function", "interior NUL"],
+    );
+    check_control(&ray, "带内部 NUL 的 function 名之后的对照");
 
     drop(ray);
-    println!("\n✓ 空 module 名检查与空 function 名的异步语义在 4 项上成立");
+    println!("\n✓ 空 module 名检查、内部 NUL 拦截与空 function 名的异步语义在 5 项上成立");
 }

@@ -184,7 +184,7 @@ fn task_call_python_rejects_a_name_registered_as_a_rust_function() {
         panic!("the registered function must not run")
     }
     let registered = "__rayrust_registered_rust_function";
-    let name_c = rayrust::sys::to_cstring(registered);
+    let name_c = rayrust::sys::to_cstring(registered).expect("static function name");
     unsafe { rayrust::sys::ray_register_function(name_c.as_ptr(), never_called) };
     let ray = local_ray();
     match ray.task_call_python("some_module", registered, &[], &[]) {
@@ -291,8 +291,8 @@ fn connect_succeeds_and_keeps_clean_namespace_after_rejected_runtime_env() {
 
     // 5. 已初始化时直接进 C 入口：`ray::Init` 是空操作，namespace 不该跟着换。
     fn direct_init(namespace: &str, runtime_env: &str) -> i32 {
-        let ns_c = rayrust::sys::to_cstring(namespace);
-        let env_c = rayrust::sys::to_cstring(runtime_env);
+        let ns_c = rayrust::sys::to_cstring(namespace).expect("static namespace");
+        let env_c = rayrust::sys::to_cstring(runtime_env).expect("static runtime_env");
         let env_ptr = if runtime_env.is_empty() {
             std::ptr::null()
         } else {

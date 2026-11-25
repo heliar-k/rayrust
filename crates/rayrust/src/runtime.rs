@@ -50,6 +50,21 @@ fn ffi_error_detail(context: &str, detail: impl std::fmt::Display) -> RayError {
     )
 }
 
+fn check_no_nul(context: &str, field: &str, value: &str) -> Result<(), RayError> {
+    cstring_field(context, field, value).map(|_| ())
+}
+
+fn cstring_field(context: &str, field: &str, value: &str) -> Result<std::ffi::CString, RayError> {
+    to_cstring(value).map_err(|err| {
+        RayError::Ffi(format!(
+            "{}: {} contains an interior NUL byte at byte {} and cannot cross the C string FFI boundary",
+            context,
+            field,
+            err.nul_position()
+        ))
+    })
+}
+
 /// 载荷是 C++ SDK 未翻译的错误对象的帧（`9 + N` 的 protobuf）时，构造带 Ray 记录
 /// 文本的 `RayError::Unclassified`；不是帧时返回 `None`。
 ///
@@ -79,6 +94,12 @@ pub enum ActorLifetime {
 }
 
 /// Configuration for connecting to a Ray cluster.
+///
+/// Every string field (`address`, `node_ip`, each entry of `code_search_path`,
+/// `runtime_env`, `log_dir`, and `namespace`) is validated at the FFI boundary
+/// in both cluster and local modes: an interior NUL byte makes [`Ray::connect`]
+/// return [`RayError::Ffi`] naming the field and the first NUL byte index before
+/// entering the C++ SDK.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RayConfig {
     /// Address of the head node, e.g. "192.168.42.141:6379".
@@ -86,10 +107,11 @@ pub struct RayConfig {
     /// The run mode comes from [`RayConfig::local_mode`] alone; an empty address
     /// does not select local mode.
     ///
-    /// Local mode ignores this field: nothing of it reaches the SDK and nothing of
-    /// it is validated. It still takes part in the config comparison of
-    /// [`Ray::connect`], so two local-mode configs whose addresses differ are
-    /// reported as different configs even though neither address was used.
+    /// Local mode skips the `host:port` format check on this field and does not
+    /// pass the address to the C++ SDK, while still rejecting an interior NUL
+    /// byte at the FFI boundary and comparing the field in [`Ray::connect`], so
+    /// two local-mode configs whose addresses differ are reported as different
+    /// configs even though neither address was used.
     ///
     /// Cluster mode with a non-empty address requires `host:port`: a bracketed
     /// IPv6 host, a non-empty host, and a port of decimal digits in
@@ -348,6 +370,16 @@ impl Ray {
     /// listing the fields that differ. While the last handle is being dropped,
     /// every call returns [`RayError::Runtime`] without waiting for the shutdown
     /// to finish, including a call made from inside a local-mode task.
+    ///
+    /// # Interior NUL validation
+    ///
+    /// Every string field on [`RayConfig`] (`address`, `node_ip`, each entry of
+    /// `code_search_path`, `runtime_env`, `log_dir`, and `namespace`) is checked
+    /// for interior NUL bytes in both cluster and local modes before calling
+    /// into the C++ SDK. Any interior NUL returns [`RayError::Ffi`] naming the
+    /// field (such as `code_search_path[1]`) and the byte index, leaving the
+    /// runtime uninitialized, `LIVE` unchanged, and the local-mode namespace
+    /// untouched. Local mode only skips the `host:port` format check below.
     ///
     /// # Address validation
     ///
@@ -688,7 +720,9 @@ impl Ray {
     /// [`TaskOptions`] carries the task name, resource requirements, placement
     /// group binding and runtime env. No options means one CPU, Ray's default
     /// for a task, so in cluster mode `--num-cpus` limits how many tasks run at
-    /// once (local mode drops resource requirements).
+    /// once (local mode drops resource requirements). An interior NUL byte in
+    /// `func_name` or in any [`TaskOptions`] string field returns
+    /// [`RayError::Ffi`] naming the field before submission.
     pub fn task_call(
         &self,
         func_name: &str,
@@ -750,11 +784,13 @@ impl Ray {
     /// [`Ray::task_call_python_with_options`] for any of those; this entry keeps the
     /// default one-CPU requirement. Local mode drops the requirement.
     ///
-    /// `module` must be non-empty. An empty one — and a name with an interior NUL
-    /// byte, which reaches the C entry as an empty C string — returns
-    /// [`RayError::Ffi`] before any task is submitted. That check comes before the
-    /// runtime lookup and before the local mode refusal below, so an empty module
-    /// name reports the name error in both modes and without a runtime.
+    /// `module` must be non-empty, and both `module` and `function` must be free of
+    /// interior NUL bytes. An interior NUL byte in either parameter returns
+    /// [`RayError::Ffi`] at the Rust FFI boundary naming `"module"` or `"function"`
+    /// before entering C. An empty `module` returns [`RayError::Ffi`] before any
+    /// task is submitted. Both checks come before the runtime lookup and before the
+    /// local mode refusal below, so an invalid or empty module name reports the name
+    /// error in both modes and without a runtime.
     /// An empty module name can never run. The worker imports the module by name
     /// (`python/ray/_private/function_manager.py:138`, `importlib.import_module`)
     /// and importlib raises `ValueError: Empty module name` for an empty string —
@@ -763,20 +799,20 @@ impl Ray {
     /// The first read returns [`RayError::Worker`] carrying the worker error
     /// message extracted from the payload (or the raw payload lossily decoded as
     /// UTF-8 if extraction fails), and the worker pool starts a replacement worker.
-    /// `function` is not checked. The loader splits it on dots and throws the empty
-    /// pieces away (`function_manager.py:139`), so an empty name resolves to the
-    /// module object itself, which the loader registers as the task's function
-    /// (`:391-395`). An ordinary module is not callable, so the task then fails
-    /// with `TypeError: 'module' object is not callable`: an ordinary task failure,
-    /// where the worker stays alive and the first read returns [`RayError::Task`]
-    /// carrying the formatted Python traceback extracted from the payload (or the
-    /// raw payload lossily decoded as UTF-8 if extraction fails). A module object can be callable, though — a `types.ModuleType`
-    /// subclass with `__call__` assigned to the module's `__class__`, or any
-    /// callable placed in `sys.modules` under that name — and then the task runs
-    /// and returns that object's result (measured on 2.51.1: such a module
-    /// returned 3 for a call with an empty function name). Refusing the name would
-    /// reject that call, so the entry submits it. An interior NUL byte makes it an
-    /// empty function name as well, and the submission goes through the same way.
+    /// An empty `function` (`""`) is accepted. The loader splits it on dots and
+    /// throws the empty pieces away (`function_manager.py:139`), so an empty name
+    /// resolves to the module object itself, which the loader registers as the
+    /// task's function (`:391-395`). An ordinary module is not callable, so the task
+    /// then fails with `TypeError: 'module' object is not callable`: an ordinary
+    /// task failure, where the worker stays alive and the first read returns
+    /// [`RayError::Task`] carrying the formatted Python traceback extracted from the
+    /// payload (or the raw payload lossily decoded as UTF-8 if extraction fails). A
+    /// module object can be callable, though — a `types.ModuleType` subclass with
+    /// `__call__` assigned to the module's `__class__`, or any callable placed in
+    /// `sys.modules` under that name — and then the task runs and returns that
+    /// object's result (measured on 2.51.1: such a module returned 3 for a call with
+    /// an empty function name). Refusing the empty name would reject that call, so
+    /// the entry submits it.
     /// A non-empty name nobody registered keeps Ray's asynchronous semantics: the
     /// driver holds no function table, so the submission returns an `ObjectRef` and
     /// the first read waits until it times out. A whitespace-only name such as
@@ -841,8 +877,10 @@ impl Ray {
     ///
     /// The name checks, the reference-argument requirements and the local mode
     /// refusal are the ones [`Ray::task_call_python`] documents: `module` must be
-    /// non-empty, `function` is not checked, and in local mode a name that a
-    /// `#[rayrust::remote]` function registered returns [`RayError::Ffi`] instead of
+    /// non-empty, an empty `function` is submitted, an interior NUL byte in
+    /// `module`, `function` or any [`TaskOptions`] string field returns
+    /// [`RayError::Ffi`] naming the field, and in local mode a name that a
+    /// `#[rayrust::remote]` function registered returns [`RayError::Ffi`] without
     /// running that Rust function in place of the Python one.
     pub fn task_call_python_with_options(
         &self,
@@ -883,9 +921,9 @@ impl Ray {
     /// `src/ray/core_worker/core_worker_shutdown_executor.cc:40` and the driver's
     /// first read returns [`RayError::Actor`] carrying the actor error message
     /// extracted from the payload (or the raw payload lossily decoded as UTF-8 if
-    /// extraction fails). A name with an interior NUL byte
-    /// reaches the C entry as an empty C string, the same as in [`Ray::get_actor`],
-    /// and is refused with it.
+    /// extraction fails). An interior NUL byte in `func_name` or in any
+    /// [`ActorOptions`] string field returns [`RayError::Ffi`] at the Rust FFI
+    /// boundary naming the field before entering C.
     ///
     /// A non-empty name that nobody registered keeps Ray's asynchronous semantics:
     /// the driver has no way to learn which names are registered, so the creation
@@ -919,9 +957,9 @@ impl Ray {
     /// `TypeError: module.__new__(X): X is not a type object (module)` before
     /// `load_actor_class` is reached (the measured traceback holds only
     /// `_raylet.pyx:2432` and `:2253`). In both cases the worker exits with
-    /// `SYSTEM_ERROR`. A name with an interior NUL byte reaches the C entry as an
-    /// empty C string, the same as in [`Ray::get_actor`], and is refused with it
-    /// (#27).
+    /// `SYSTEM_ERROR`. An interior NUL byte in `module`, `class`, or any
+    /// [`ActorOptions`] string field returns [`RayError::Ffi`] at the Rust FFI
+    /// boundary naming the field before entering C.
     ///
     /// The two name checks run before the local mode refusal below, so an empty
     /// name reports the name error in local mode too.
@@ -1011,7 +1049,8 @@ impl Ray {
     /// `is_ref[i] = true` means `args[i]` is a binary ObjectRef ID
     /// (pass by reference); such an id must be exactly 28 bytes, and it must be a
     /// reference this process holds and whose owner Ray knows; see
-    /// [`Ray::task_call`].
+    /// [`Ray::task_call`]. An interior NUL byte in `func_name` returns
+    /// [`RayError::Ffi`] naming `"func_name"` before entering C.
     pub fn actor_call(
         &self,
         actor_id: &[u8],
@@ -1121,9 +1160,9 @@ impl Ray {
     /// read returns [`RayError::Actor`] carrying the actor error message extracted
     /// from the payload (or the raw payload lossily decoded as UTF-8 if extraction
     /// fails) and that actor cannot be called again. The empty name is refused in both cases, including the one where
-    /// the method exists. A method name with an interior NUL byte is refused by the
-    /// same check, because `to_cstring` (`crates/rayrust-sys/src/lib.rs:253-255`,
-    /// #27) turns it into an empty C string.
+    /// the method exists. A `method_name` containing an interior NUL byte returns
+    /// [`RayError::Ffi`] at the Rust FFI boundary naming `"method_name"` before
+    /// entering C, leaving the actor running.
     ///
     /// A non-empty method name the actor does not have cannot be told apart from a
     /// valid one here: this process holds no method table for the actor. Measured on
@@ -1199,6 +1238,8 @@ impl Ray {
     /// Create a placement group.
     /// `bundles_json` is a JSON array like `[{"CPU":1},{"CPU":1}]`.
     /// `strategy` is 0=PACK, 1=SPREAD, 2=STRICT_PACK, 3=STRICT_SPREAD.
+    /// An interior NUL byte in `name` or `bundles_json` returns [`RayError::Ffi`]
+    /// naming the field before entering C.
     pub fn placement_group_create(
         &self,
         name: &str,
@@ -1301,7 +1342,8 @@ impl Ray {
     ///
     /// 移除一个组时名字映射立刻被删（`gcs_placement_group_manager.cc:414-427`），所以
     /// 移除之后本方法马上报 [`RayError::Ffi`]，比按 id 的查询早（后者仍然成功、
-    /// `state` 是 `REMOVED`）。查不到时消息里带查询用的名字。本地模式同
+    /// `state` 是 `REMOVED`）。查不到时消息里带查询用的名字。`name` 含内部 NUL 字节时
+    /// 在 Rust FFI 边界返回点名 `"name"` 的 [`RayError::Ffi`]。本地模式同
     /// [`Ray::placement_groups`]。
     pub fn placement_group_by_name(&self, name: &str) -> Result<PlacementGroupInfo, RayError> {
         placement_group_by_name_inner(name)
@@ -1337,8 +1379,9 @@ impl Ray {
     /// touching Ray, because the core worker's
     /// `CoreWorker::GetNamedActorHandle` starts with `RAY_CHECK(!name.empty())`
     /// (`src/ray/core_worker/core_worker.cc:2594`) and RAY_CHECK terminates the
-    /// process. A name containing an interior NUL byte is rejected the same way:
-    /// it reaches the C side as an empty C string (#27). A name of only
+    /// process. An interior NUL byte in `name` or `namespace` returns
+    /// [`RayError::Ffi`] at the Rust FFI boundary naming `"name"` or `"namespace"`
+    /// before entering C. A name of only
     /// whitespace characters is legal and is not trimmed, so it is looked up as
     /// it is. `namespace` may be empty: the C++ submitter falls back to the job
     /// config's namespace for an empty one
@@ -1458,14 +1501,21 @@ fn config_mismatch_message(live: &RayConfig, requested: &RayConfig) -> String {
 ///
 /// 成功之后发布新的运行时代次：此前创建的 `ObjectRef` 全部属于已经关闭的运行时。
 pub(crate) fn init_with_config(config: &RayConfig) -> Result<(), RayError> {
-    let address_c = to_cstring(&config.address);
+    let address_c = cstring_field("ray_init", "address", &config.address)?;
     let local_mode = if config.local_mode { 1 } else { 0 };
-    let node_ip_c = to_cstring(&config.node_ip);
-    let code_search_path_c = to_cstring(&config.code_search_path.join(":"));
-    let runtime_env_c = to_cstring(&config.runtime_env);
-    let log_dir_c = to_cstring(&config.log_dir);
+    let node_ip_c = cstring_field("ray_init", "node_ip", &config.node_ip)?;
+    for (idx, entry) in config.code_search_path.iter().enumerate() {
+        check_no_nul("ray_init", &format!("code_search_path[{}]", idx), entry)?;
+    }
+    let code_search_path_c = cstring_field(
+        "ray_init",
+        "code_search_path",
+        &config.code_search_path.join(":"),
+    )?;
+    let runtime_env_c = cstring_field("ray_init", "runtime_env", &config.runtime_env)?;
+    let log_dir_c = cstring_field("ray_init", "log_dir", &config.log_dir)?;
 
-    let namespace_c = to_cstring(&config.namespace);
+    let namespace_c = cstring_field("ray_init", "namespace", &config.namespace)?;
 
     let ret = unsafe {
         rayrust_sys::ray_init(
@@ -1788,14 +1838,14 @@ pub(crate) fn task_call_json_inner(
     options_json: &str,
 ) -> Result<ObjectRef<()>, RayError> {
     check_is_ref_len(args.len(), is_ref)?;
-    let func_c = to_cstring(func_name);
+    let func_c = cstring_field("ray_task_call_with_options", "func_name", func_name)?;
+    let options_json_c = cstring_field("ray_task_call_with_options", "options_json", options_json)?;
     let args_arr = build_args_array(args);
     let (is_ref_ptr, is_ref_count) = if is_ref.is_empty() {
         (std::ptr::null(), 0)
     } else {
         (is_ref.as_ptr(), is_ref.len())
     };
-    let options_json_c = to_cstring(options_json);
 
     let bytes = unsafe {
         rayrust_sys::ray_task_call_with_options(
@@ -1852,10 +1902,10 @@ pub(crate) fn task_call_python_json_inner(
     options_json: &str,
 ) -> Result<Vec<u8>, RayError> {
     check_is_ref_len(args.len(), is_ref)?;
-    let module_c = to_cstring(module);
-    let func_c = to_cstring(function);
+    let module_c = cstring_field("ray_task_call_python", "module", module)?;
+    let func_c = cstring_field("ray_task_call_python", "function", function)?;
+    let options_c = cstring_field("ray_task_call_python", "options_json", options_json)?;
     let args_arr = build_args_array(args);
-    let options_c = to_cstring(options_json);
     let (is_ref_ptr, is_ref_count) = if is_ref.is_empty() {
         (std::ptr::null(), 0)
     } else {
@@ -2247,6 +2297,11 @@ fn check_task_options(opts: &TaskOptions) -> Result<(), RayError> {
             opts.bundle_index
         )));
     }
+    check_no_nul("TaskOptions", "name", &opts.name)?;
+    for (idx, (res_name, _)) in opts.resources.iter().enumerate() {
+        check_no_nul("TaskOptions", &format!("resources[{}].0", idx), res_name)?;
+    }
+    check_no_nul("TaskOptions", "runtime_env", &opts.runtime_env)?;
     Ok(())
 }
 
@@ -2508,6 +2563,12 @@ fn check_actor_options(opts: &ActorOptions) -> Result<(), RayError> {
             opts.bundle_index
         )));
     }
+    check_no_nul("ActorOptions", "name", &opts.name)?;
+    check_no_nul("ActorOptions", "ray_namespace", &opts.ray_namespace)?;
+    for (idx, (res_name, _)) in opts.resources.iter().enumerate() {
+        check_no_nul("ActorOptions", &format!("resources[{}].0", idx), res_name)?;
+    }
+    check_no_nul("ActorOptions", "runtime_env", &opts.runtime_env)?;
     Ok(())
 }
 
@@ -2517,11 +2578,15 @@ pub(crate) fn actor_create_with_options_inner(
     args: &[&[u8]],
     options: &ActorOptions,
 ) -> Result<ActorHandle, RayError> {
-    // 先校验再进 FFI：字段组合不合法时连 options JSON 都不生成。
+    // 先校验再进 FFI：名字或字段组合不合法时连 options JSON 都不生成。
+    let func_c = cstring_field("ray_actor_create_with_options", "func_name", func_name)?;
     check_actor_options(options)?;
-    let func_c = to_cstring(func_name);
     let args_arr = build_args_array(args);
-    let options_json = to_cstring(&options.to_json());
+    let options_json = cstring_field(
+        "ray_actor_create_with_options",
+        "options_json",
+        &options.to_json(),
+    )?;
 
     let bytes = unsafe {
         rayrust_sys::ray_actor_create_with_options(
@@ -2556,12 +2621,16 @@ pub(crate) fn actor_create_python_with_options_inner(
     args: &[&[u8]],
     options: &ActorOptions,
 ) -> Result<ActorHandle, RayError> {
-    // 先校验再进 FFI：字段组合不合法时连 options JSON 都不生成。
+    // 先校验再进 FFI：名字或字段组合不合法时连 options JSON 都不生成。
+    let module_c = cstring_field("ray_actor_create_python_with_options", "module", module)?;
+    let class_c = cstring_field("ray_actor_create_python_with_options", "class", class)?;
     check_actor_options(options)?;
-    let module_c = to_cstring(module);
-    let class_c = to_cstring(class);
     let args_arr = build_args_array(args);
-    let options_json = to_cstring(&options.to_json());
+    let options_json = cstring_field(
+        "ray_actor_create_python_with_options",
+        "options_json",
+        &options.to_json(),
+    )?;
 
     let bytes = unsafe {
         rayrust_sys::ray_actor_create_python_with_options(
@@ -2734,7 +2803,7 @@ pub(crate) fn actor_call_inner(
         check_cpp_actor_language("ray_actor_call", actor_id, registration)?;
     }
     check_is_ref_len(args.len(), is_ref)?;
-    let func_c = to_cstring(func_name);
+    let func_c = cstring_field("ray_actor_call", "func_name", func_name)?;
     let args_arr = build_args_array(args);
     let (is_ref_ptr, is_ref_count) = if is_ref.is_empty() {
         (std::ptr::null(), 0)
@@ -2814,7 +2883,7 @@ pub(crate) fn actor_call_python_inner(
         check_python_actor_language("ray_actor_call_python", actor_id, registration)?;
     }
     check_is_ref_len(args.len(), is_ref)?;
-    let method_c = to_cstring(method_name);
+    let method_c = cstring_field("ray_actor_call_python", "method_name", method_name)?;
     let args_arr = build_args_array(args);
     let (is_ref_ptr, is_ref_count) = if is_ref.is_empty() {
         (std::ptr::null(), 0)
@@ -3012,8 +3081,8 @@ pub(crate) fn placement_group_create_inner(
     bundles_json: &str,
     strategy: i32,
 ) -> Result<Vec<u8>, RayError> {
-    let name_c = to_cstring(name);
-    let json_c = to_cstring(bundles_json);
+    let name_c = cstring_field("ray_placement_group_create", "name", name)?;
+    let json_c = cstring_field("ray_placement_group_create", "bundles_json", bundles_json)?;
     let bytes = unsafe {
         rayrust_sys::ray_placement_group_create(name_c.as_ptr(), json_c.as_ptr(), strategy)
     };
@@ -3087,7 +3156,7 @@ pub(crate) fn placement_group_by_id_inner(group_id: &[u8]) -> Result<PlacementGr
 
 /// 按名字查一个 placement group。
 pub(crate) fn placement_group_by_name_inner(name: &str) -> Result<PlacementGroupInfo, RayError> {
-    let name_c = to_cstring(name);
+    let name_c = cstring_field("ray_placement_group_get_by_name", "name", name)?;
     let bytes = unsafe { rayrust_sys::ray_placement_group_get_by_name(name_c.as_ptr()) };
     let guard = CBytesGuard::from(bytes)
         .ok_or_else(|| ffi_error_detail("ray_placement_group_get_by_name", name))?;
@@ -3139,8 +3208,8 @@ pub(crate) fn get_namespace() -> Result<String, RayError> {
 /// `namespace` can be empty string for current namespace.
 /// Returns Ok(Some(handle)) if found, Ok(None) if not found.
 pub(crate) fn get_actor(name: &str, namespace: &str) -> Result<Option<ActorHandle>, RayError> {
-    let name_c = to_cstring(name);
-    let ns_c = to_cstring(namespace);
+    let name_c = cstring_field("ray_get_actor", "name", name)?;
+    let ns_c = cstring_field("ray_get_actor", "namespace", namespace)?;
     rayrust_sys::clear_error();
     let mut meta = rayrust_sys::RayActorHandleMeta {
         language: 0,
@@ -4182,7 +4251,8 @@ mod tests {
     /// 直调 C 入口提交一个地址，其余字段全不传。被拒的调用在进 SDK 之前就返回，
     /// 进程里不会建出运行时。
     fn ray_init_with_address(address: &str, local_mode: bool) -> i32 {
-        let address_c = to_cstring(address);
+        let address_c =
+            std::ffi::CString::new(address).expect("test address contains no interior NUL");
         rayrust_sys::clear_error();
         unsafe {
             rayrust_sys::ray_init(
@@ -4294,49 +4364,60 @@ mod tests {
         );
     }
 
-    /// 空函数名在 C 入口被拒，进程里没有运行时也能测：参数检查排在取运行时之前。
-    /// `to_cstring` 把带内部 NUL 的名字（`"a\0b"`）折成空串（#27），所以两条用例
-    /// 拿到的 C 串都是空的。
+    /// 空函数名在裸 C 入口被拒绝，进程里没有运行时也能验证：参数检查排在取运行时之前；
+    /// 含内部 NUL 的函数名在 Rust FFI 边界被拒绝并点名 `func_name` 与字节下标。
     #[test]
     fn actor_create_rejects_an_empty_function_name() {
         assert!(
             !unsafe { rayrust_sys::ray_is_initialized() },
             "这个测试要求进程里没有 Ray runtime"
         );
-        for (raw, label) in [("", "空串"), ("a\0b", "带内部 NUL 的 \"a\\0b\"")] {
-            let name = to_cstring(raw);
-            assert!(
-                name.as_bytes().is_empty(),
-                "{} 经过 to_cstring 不是空串：这一条被拒的理由是它到 C 侧成了空串",
-                label
-            );
-            let bytes = unsafe {
-                rayrust_sys::ray_actor_create_with_options(
-                    name.as_ptr(),
-                    std::ptr::null(),
-                    0,
-                    std::ptr::null(),
-                )
-            };
-            assert!(
-                bytes.data.is_null(),
-                "{} 的函数名被接受了（返回 {:#p}）",
-                label,
-                bytes.data
-            );
-            let message = rayrust_sys::last_error().expect("C 入口没有记录错误");
-            assert!(
-                message.contains("the function name is empty"),
-                "{} 的错误消息不是空函数名那一句: {}",
-                label,
-                message
-            );
-            assert!(
-                !unsafe { rayrust_sys::ray_is_initialized() },
-                "{} 被拒之后建出了运行时",
-                label
-            );
+        let empty = std::ffi::CString::new("").unwrap();
+        let bytes = unsafe {
+            rayrust_sys::ray_actor_create_with_options(
+                empty.as_ptr(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert!(
+            bytes.data.is_null(),
+            "空函数名被接受了（返回 {:#p}）",
+            bytes.data
+        );
+        let message = rayrust_sys::last_error().expect("C 入口没有记录错误");
+        assert!(
+            message.contains("the function name is empty"),
+            "空串的错误消息里没有空函数名说明: {}",
+            message
+        );
+
+        match actor_create_with_options_inner("", &[], &ActorOptions::new()) {
+            Err(RayError::Ffi(msg)) => assert!(
+                msg.contains("the function name is empty"),
+                "Rust 入口空函数名错误消息不符: {}",
+                msg
+            ),
+            other => panic!("Rust 入口空函数名返回了 {:?}", other),
         }
+
+        match actor_create_with_options_inner("a\0b", &[], &ActorOptions::new()) {
+            Err(RayError::Ffi(msg)) => {
+                assert!(
+                    msg.contains("ray_actor_create_with_options: func_name")
+                        && msg.contains("interior NUL byte at byte 1"),
+                    "含内部 NUL 的 func_name 错误消息不符: {}",
+                    msg
+                );
+            }
+            other => panic!("含内部 NUL 的 func_name 返回了 {:?}", other),
+        }
+
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "被拒绝之后创建了运行时"
+        );
     }
 
     /// 非空函数名不被这条检查拦住：守卫排在运行时检查之前，所以这里停在「运行时没有
@@ -4347,7 +4428,7 @@ mod tests {
             !unsafe { rayrust_sys::ray_is_initialized() },
             "这个测试要求进程里没有 Ray runtime"
         );
-        let name = to_cstring("no_such_function");
+        let name = std::ffi::CString::new("no_such_function").unwrap();
         let bytes = unsafe {
             rayrust_sys::ray_actor_create_with_options(
                 name.as_ptr(),
@@ -4365,16 +4446,15 @@ mod tests {
         );
     }
 
-    /// 空 module 名与空 class 名在 C 入口被拒，进程里没有运行时也能测：两条名字检查
-    /// 都排在取运行时之前。`to_cstring` 把带内部 NUL 的名字（`"a\0b"`）折成空串
-    /// （#27），所以那两条用例拿到的 C 串都是空的。
+    /// 空 module 名与空 class 名在裸 C 入口被拒绝，两条名字检查都排在取运行时之前；
+    /// 含内部 NUL 的 module 名与 class 名在 Rust FFI 边界被拒绝并分别点名 `module` 与 `class`。
     #[test]
     fn actor_create_python_rejects_an_empty_module_or_class_name() {
         assert!(
             !unsafe { rayrust_sys::ray_is_initialized() },
             "这个测试要求进程里没有 Ray runtime"
         );
-        let cases: [(&str, &str, &str, &str); 5] = [
+        let c_cases: [(&str, &str, &str, &str); 3] = [
             ("", "Counter", "the module name is empty", "空 module 名"),
             (
                 "",
@@ -4382,37 +4462,11 @@ mod tests {
                 "the module name is empty",
                 "两个都空（module 先报）",
             ),
-            (
-                "a\0b",
-                "Counter",
-                "the module name is empty",
-                "带内部 NUL 的 module 名 \"a\\0b\"",
-            ),
             ("rayrust_test", "", "the class name is empty", "空 class 名"),
-            (
-                "rayrust_test",
-                "a\0b",
-                "the class name is empty",
-                "带内部 NUL 的 class 名 \"a\\0b\"",
-            ),
         ];
-        for (module, class, needle, label) in cases {
-            let module_c = to_cstring(module);
-            let class_c = to_cstring(class);
-            if module.contains('\0') {
-                assert!(
-                    module_c.as_bytes().is_empty(),
-                    "{} 经过 to_cstring 不是空串",
-                    label
-                );
-            }
-            if class.contains('\0') {
-                assert!(
-                    class_c.as_bytes().is_empty(),
-                    "{} 经过 to_cstring 不是空串",
-                    label
-                );
-            }
+        for (module, class, needle, label) in c_cases {
+            let module_c = std::ffi::CString::new(module).unwrap();
+            let class_c = std::ffi::CString::new(class).unwrap();
             let bytes = unsafe {
                 rayrust_sys::ray_actor_create_python_with_options(
                     module_c.as_ptr(),
@@ -4431,17 +4485,50 @@ mod tests {
             let message = rayrust_sys::last_error().expect("C 入口没有记录错误");
             assert!(
                 message.contains(needle),
-                "{} 的错误消息不是 {:?}: {}",
+                "{} 的错误消息未包含 {:?}: {}",
                 label,
                 needle,
                 message
             );
-            assert!(
-                !unsafe { rayrust_sys::ray_is_initialized() },
-                "{} 被拒之后建出了运行时",
-                label
-            );
         }
+
+        let nul_cases: [(&str, &str, &str, &str); 3] = [
+            (
+                "a\0b",
+                "Counter",
+                "ray_actor_create_python_with_options: module contains an interior NUL byte at byte 1",
+                "含内部 NUL 的 module 名",
+            ),
+            (
+                "rayrust_test",
+                "a\0b",
+                "ray_actor_create_python_with_options: class contains an interior NUL byte at byte 1",
+                "含内部 NUL 的 class 名",
+            ),
+            (
+                "a\0b",
+                "c\0d",
+                "ray_actor_create_python_with_options: module contains an interior NUL byte at byte 1",
+                "module 与 class 均含内部 NUL（module 先报）",
+            ),
+        ];
+        for (module, class, needle, label) in nul_cases {
+            match actor_create_python_with_options_inner(module, class, &[], &ActorOptions::new()) {
+                Err(RayError::Ffi(msg)) => assert!(
+                    msg.contains(needle),
+                    "{} 错误消息未包含 {:?}: {}",
+                    label,
+                    needle,
+                    msg
+                ),
+                other => panic!("{} 返回了 {:?}", label, other),
+            }
+        }
+
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "被拒绝之后创建了运行时"
+        );
     }
 
     /// 合法名字不被这两条检查拦住：守卫排在运行时检查之前，所以这里停在「运行时没有
@@ -4452,8 +4539,8 @@ mod tests {
             !unsafe { rayrust_sys::ray_is_initialized() },
             "这个测试要求进程里没有 Ray runtime"
         );
-        let module = to_cstring("rayrust_test");
-        let class = to_cstring("Counter");
+        let module = std::ffi::CString::new("rayrust_test").unwrap();
+        let class = std::ffi::CString::new("Counter").unwrap();
         let bytes = unsafe {
             rayrust_sys::ray_actor_create_python_with_options(
                 module.as_ptr(),
@@ -4472,26 +4559,18 @@ mod tests {
         );
     }
 
-    /// 空方法名在 C 入口被拒，进程里没有运行时也能测：两条方法名检查都排在取运行时
-    /// 之前。`to_cstring` 把带内部 NUL 的方法名（`"in\0crement"`）折成空串（#27），
-    /// 所以那条用例拿到的 C 串也是空的。id 宽度检查排在方法名前面，15 字节 id + 空
-    /// 方法名报的是宽度错误。
+    /// 空方法名在裸 C 入口被拒绝，id 宽度检查排在方法名前面；含内部 NUL 的方法名在
+    /// Rust FFI 边界被拒绝并点名 `method_name` 与字节下标。
     #[test]
     fn actor_call_python_rejects_an_empty_method_name() {
         assert!(
             !unsafe { rayrust_sys::ray_is_initialized() },
             "这个测试要求进程里没有 Ray runtime"
         );
-        let full_id = [0u8; 16];
+        let full_id = [0x28u8; 16];
         let short_id = [0u8; 15];
-        let cases: [(&[u8], &str, &str, &str); 3] = [
+        let cases: [(&[u8], &str, &str, &str); 2] = [
             (&full_id, "", "the method name is empty", "空方法名"),
-            (
-                &full_id,
-                "in\0crement",
-                "the method name is empty",
-                "带内部 NUL 的方法名 \"in\\0crement\"",
-            ),
             (
                 &short_id,
                 "",
@@ -4500,14 +4579,7 @@ mod tests {
             ),
         ];
         for (id, method_name, needle, label) in cases {
-            let method_c = to_cstring(method_name);
-            if method_name.contains('\0') {
-                assert!(
-                    method_c.as_bytes().is_empty(),
-                    "{} 经过 to_cstring 不是空串",
-                    label
-                );
-            }
+            let method_c = std::ffi::CString::new(method_name).unwrap();
             let bytes = unsafe {
                 rayrust_sys::ray_actor_call_python(
                     id.as_ptr() as *const std::os::raw::c_char,
@@ -4528,17 +4600,32 @@ mod tests {
             let message = rayrust_sys::last_error().expect("C 入口没有记录错误");
             assert!(
                 message.contains(needle),
-                "{} 的错误消息不是 {:?}: {}",
+                "{} 的错误消息未包含 {:?}: {}",
                 label,
                 needle,
                 message
             );
-            assert!(
-                !unsafe { rayrust_sys::ray_is_initialized() },
-                "{} 被拒之后建出了运行时",
-                label
-            );
         }
+
+        actor_registry::record(
+            &full_id,
+            ActorLanguage::Python,
+            actor_registry::CREATION_DESCRIPTOR_PYTHON,
+        );
+        match actor_call_python_inner(&full_id, "in\0crement", &[], &[]) {
+            Err(RayError::Ffi(msg)) => assert!(
+                msg.contains("ray_actor_call_python: method_name")
+                    && msg.contains("interior NUL byte at byte 2"),
+                "含内部 NUL 的 method_name 错误消息不符: {}",
+                msg
+            ),
+            other => panic!("含内部 NUL 的 method_name 返回了 {:?}", other),
+        }
+
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "被拒绝之后创建了运行时"
+        );
     }
 
     /// 非空方法名不被这两条检查拦住：守卫排在取运行时之前，所以这里停在「运行时没有
@@ -4550,7 +4637,7 @@ mod tests {
             "这个测试要求进程里没有 Ray runtime"
         );
         let id = [0u8; 16];
-        let method_c = to_cstring("get");
+        let method_c = std::ffi::CString::new("get").unwrap();
         let bytes = unsafe {
             rayrust_sys::ray_actor_call_python(
                 id.as_ptr() as *const std::os::raw::c_char,
@@ -4571,45 +4658,36 @@ mod tests {
         );
     }
 
-    /// 空 module 名在 C 入口被拒，进程里没有运行时也能测：这条检查排在取运行时之前。
-    /// `to_cstring` 把带内部 NUL 的 module 名（`"a\0b"`）折成空串（#27），所以那条
-    /// 用例拿到的 C 串也是空的。
+    /// 空 module 名在 C 入口被拒绝；含内部 NUL 的 module 名在 Rust FFI 边界被拒绝并点名
+    /// `module` 与字节下标。
     #[test]
     fn task_call_python_rejects_an_empty_module_name() {
         assert!(
             !unsafe { rayrust_sys::ray_is_initialized() },
             "这个测试要求进程里没有 Ray runtime"
         );
-        let cases: [(&str, &str, &str); 2] = [
-            ("", "add", "空 module 名"),
-            ("a\0b", "add", "带内部 NUL 的 module 名 \"a\\0b\""),
-        ];
-        for (module, function, label) in cases {
-            if module.contains('\0') {
-                assert!(
-                    to_cstring(module).as_bytes().is_empty(),
-                    "{} 经过 to_cstring 不是空串",
-                    label
-                );
-            }
-            match task_call_python_json_inner(module, function, &[], &[], "") {
-                Err(RayError::Ffi(message)) => assert!(
-                    message.contains("the module name is empty"),
-                    "{} 的错误消息里没有 module 名那条: {}",
-                    label,
-                    message
-                ),
-                Err(other) => panic!("{} 返回了别的错误变体: {}", label, other),
-                Ok(_) => panic!("{} 被接受了", label),
-            }
-            assert!(
-                !unsafe { rayrust_sys::ray_is_initialized() },
-                "{} 被拒之后建出了运行时",
-                label
-            );
+        match task_call_python_json_inner("", "add", &[], &[], "") {
+            Err(RayError::Ffi(message)) => assert!(
+                message.contains("the module name is empty"),
+                "空 module 名的错误消息里没有 module 名说明: {}",
+                message
+            ),
+            Err(other) => panic!("空 module 名返回了别的错误变体: {}", other),
+            Ok(_) => panic!("空 module 名被接受了"),
         }
 
-        // 两个名字都空时报的是 module 那条：function 名根本不检查。
+        match task_call_python_json_inner("a\0b", "add", &[], &[], "") {
+            Err(RayError::Ffi(message)) => assert!(
+                message.contains("ray_task_call_python: module")
+                    && message.contains("interior NUL byte at byte 1"),
+                "含内部 NUL 的 module 名错误消息不符: {}",
+                message
+            ),
+            Err(other) => panic!("含内部 NUL 的 module 名返回了别的错误变体: {}", other),
+            Ok(_) => panic!("含内部 NUL 的 module 名被接受了"),
+        }
+
+        // 两个名字都空时报的是 module 那条：function 空串合法。
         match task_call_python_json_inner("", "", &[], &[], "") {
             Err(RayError::Ffi(message)) => assert!(
                 message.contains("the module name is empty"),
@@ -4619,40 +4697,41 @@ mod tests {
             Err(other) => panic!("两个名字都空时返回了别的错误变体: {}", other),
             Ok(_) => panic!("两个名字都空时被接受了"),
         }
+
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "被拒绝之后创建了运行时"
+        );
     }
 
-    /// 空 function 名不被拒绝，与空 module 名不同：加载器把它解析成 module 对象
-    /// 本身（`function_manager.py:139`），而 module 对象可以可调用，所以这个输入能
-    /// 跑通（`ray_c.h` 里有实测）。`to_cstring` 把带内部 NUL 的 function 名（`"a\0b"`）
-    /// 折成空串（#27），两条用例都走到运行时检查。
+    /// 空 function 名允许穿过名字检查走到运行时判空（加载器将其解析为 module 对象本身，
+    /// `function_manager.py:139`）；含内部 NUL 的 function 名在 Rust FFI 边界被拒绝并
+    /// 点名 `function` 与字节下标。
     #[test]
     fn task_call_python_lets_an_empty_function_name_through_to_the_runtime_check() {
         assert!(
             !unsafe { rayrust_sys::ray_is_initialized() },
             "这个测试要求进程里没有 Ray runtime"
         );
-        let cases: [(&str, &str); 2] = [
-            ("", "空 function 名"),
-            ("a\0b", "带内部 NUL 的 function 名 \"a\\0b\""),
-        ];
-        for (function, label) in cases {
-            if function.contains('\0') {
-                assert!(
-                    to_cstring(function).as_bytes().is_empty(),
-                    "{} 经过 to_cstring 不是空串",
-                    label
-                );
-            }
-            match task_call_python_json_inner("rayrust_test", function, &[], &[], "") {
-                Err(RayError::Ffi(message)) => assert!(
-                    message.contains("Ray runtime is not initialized"),
-                    "{} 没有走到运行时检查: {}",
-                    label,
-                    message
-                ),
-                Err(other) => panic!("{} 返回了别的错误变体: {}", label, other),
-                Ok(_) => panic!("{} 在没有运行时的进程里被提交了", label),
-            }
+        match task_call_python_json_inner("rayrust_test", "", &[], &[], "") {
+            Err(RayError::Ffi(message)) => assert!(
+                message.contains("Ray runtime is not initialized"),
+                "空 function 名没有走到运行时检查: {}",
+                message
+            ),
+            Err(other) => panic!("空 function 名返回了别的错误变体: {}", other),
+            Ok(_) => panic!("空 function 名在没有运行时的进程里被提交了"),
+        }
+
+        match task_call_python_json_inner("rayrust_test", "a\0b", &[], &[], "") {
+            Err(RayError::Ffi(message)) => assert!(
+                message.contains("ray_task_call_python: function")
+                    && message.contains("interior NUL byte at byte 1"),
+                "含内部 NUL 的 function 名没有点名字段: {}",
+                message
+            ),
+            Err(other) => panic!("含内部 NUL 的 function 名返回了别的错误变体: {}", other),
+            Ok(_) => panic!("含内部 NUL 的 function 名被提交了"),
         }
     }
 
@@ -5186,5 +5265,364 @@ mod tests {
             ),
             other => panic!("无运行时下合法载荷返回了 {:?}", other),
         }
+    }
+
+    fn assert_nul_rejected<T>(
+        label: &str,
+        result: Result<T, RayError>,
+        expected_context: &str,
+        expected_field: &str,
+        expected_pos: usize,
+    ) {
+        match result {
+            Err(RayError::Ffi(msg)) => {
+                let expected_prefix = format!(
+                    "{}: {} contains an interior NUL byte at byte {}",
+                    expected_context, expected_field, expected_pos
+                );
+                assert!(
+                    msg.starts_with(&expected_prefix),
+                    "{}: 错误消息 {:?} 未以 {:?} 开头",
+                    label,
+                    msg,
+                    expected_prefix
+                );
+                assert!(
+                    msg.contains("cannot cross the C string FFI boundary"),
+                    "{}: 错误消息缺少 FFI 边界说明: {:?}",
+                    label,
+                    msg
+                );
+            }
+            Err(other) => panic!("{}: 预期 Err(RayError::Ffi), 得到 {:?}", label, other),
+            Ok(_) => panic!("{}: 含内部 NUL 的输入返回了 Ok", label),
+        }
+    }
+
+    /// `RayConfig` 全部 6 个字符串字段在集群与本地配置下含内部 NUL 字节时，均在进入
+    /// C++ SDK 前返回点名字段与字节下标的 `RayError::Ffi`，保持进程无运行时且不写入 `LIVE`。
+    #[test]
+    fn connect_rejects_interior_nul_in_every_ray_config_field() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let cases: Vec<(&str, RayConfig, &str, usize)> = vec![
+            (
+                "cluster address",
+                RayConfig::new("127.0.0.1:6379\0tail"),
+                "address",
+                14,
+            ),
+            (
+                "local address",
+                RayConfig {
+                    address: "bad\0addr".to_string(),
+                    local_mode: true,
+                    ..Default::default()
+                },
+                "address",
+                3,
+            ),
+            (
+                "cluster node_ip",
+                RayConfig::new("127.0.0.1:6379").node_ip("10.0.\0.1"),
+                "node_ip",
+                5,
+            ),
+            (
+                "local node_ip",
+                RayConfig::local().node_ip("\0127.0.0.1"),
+                "node_ip",
+                0,
+            ),
+            (
+                "cluster code_search_path[1]",
+                RayConfig::new("127.0.0.1:6379")
+                    .code_search_path(vec!["/ok/a.so".to_string(), "/bad\0/b.so".to_string()]),
+                "code_search_path[1]",
+                4,
+            ),
+            (
+                "local code_search_path[1]",
+                RayConfig::local()
+                    .code_search_path(vec!["/ok/a.so".to_string(), "lib\0worker.so".to_string()]),
+                "code_search_path[1]",
+                3,
+            ),
+            (
+                "cluster runtime_env",
+                RayConfig::new("127.0.0.1:6379").runtime_env("{\"env_vars\":{}}\0"),
+                "runtime_env",
+                15,
+            ),
+            (
+                "local runtime_env",
+                RayConfig::local().runtime_env("{\"a\":\"\0\"}"),
+                "runtime_env",
+                6,
+            ),
+            (
+                "cluster log_dir",
+                RayConfig::new("127.0.0.1:6379").log_dir("/var/log\0/ray"),
+                "log_dir",
+                8,
+            ),
+            (
+                "local log_dir",
+                RayConfig::local().log_dir("logs\0dir"),
+                "log_dir",
+                4,
+            ),
+            (
+                "cluster namespace",
+                RayConfig::new("127.0.0.1:6379").namespace("ns\0cluster"),
+                "namespace",
+                2,
+            ),
+            (
+                "local namespace",
+                RayConfig::local().namespace("ns\0local"),
+                "namespace",
+                2,
+            ),
+        ];
+
+        for (label, cfg, field, pos) in cases {
+            assert_nul_rejected(label, Ray::connect(&cfg), "ray_init", field, pos);
+            assert!(!shutting_down(), "{} 被拒绝后遗留了关闭标志", label);
+            assert!(
+                LIVE.lock()
+                    .expect("live runtime registry poisoned")
+                    .is_none(),
+                "{} 被拒绝后写入了 LIVE 登记表",
+                label
+            );
+            assert!(
+                !unsafe { rayrust_sys::ray_is_initialized() },
+                "{} 被拒绝后激活了 C++ 运行时",
+                label
+            );
+        }
+    }
+
+    /// `TaskOptions` 与 `ActorOptions` 字符串字段含内部 NUL 字节时，同步与异步入口均在
+    /// 提交前拒绝并点名字段与字节下标。
+    #[test]
+    fn task_options_and_actor_options_reject_interior_nul_sync_and_async() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        let task_cases: Vec<(&str, TaskOptions, &str, usize)> = vec![
+            (
+                "TaskOptions::name",
+                TaskOptions::new().name("job\0name"),
+                "name",
+                3,
+            ),
+            (
+                "TaskOptions::resources[0].0",
+                TaskOptions::new().resource("GP\0U", 1.0),
+                "resources[0].0",
+                2,
+            ),
+            (
+                "TaskOptions::resources[1].0",
+                TaskOptions::new()
+                    .resource("CPU", 1.0)
+                    .resource("custom\0res", 2.0),
+                "resources[1].0",
+                6,
+            ),
+            (
+                "TaskOptions::runtime_env",
+                TaskOptions::new().runtime_env("{\"env_vars\":{\"K\":\"\0\"}}"),
+                "runtime_env",
+                18,
+            ),
+        ];
+
+        for (label, opts, field, pos) in &task_cases {
+            assert_nul_rejected(label, check_task_options(opts), "TaskOptions", field, *pos);
+            assert_nul_rejected(
+                &format!("{} sync task_call_inner", label),
+                task_call_inner("add", &[], &[], opts),
+                "TaskOptions",
+                field,
+                *pos,
+            );
+            let fut = submit_task_async("add", TaskArgs::new(), opts);
+            assert_nul_rejected(
+                &format!("{} async submit_task_async", label),
+                crate::async_runtime::block_on_async(fut),
+                "TaskOptions",
+                field,
+                *pos,
+            );
+        }
+
+        let actor_cases: Vec<(&str, ActorOptions, &str, usize)> = vec![
+            (
+                "ActorOptions::name",
+                ActorOptions::new().name("act\0name"),
+                "name",
+                3,
+            ),
+            (
+                "ActorOptions::ray_namespace",
+                ActorOptions::new().ray_namespace("ns\0actor"),
+                "ray_namespace",
+                2,
+            ),
+            (
+                "ActorOptions::resources[0].0",
+                ActorOptions::new().resource("TP\0U", 1.0),
+                "resources[0].0",
+                2,
+            ),
+            (
+                "ActorOptions::runtime_env",
+                ActorOptions::new().runtime_env("{\"pip\":[]}\0"),
+                "runtime_env",
+                10,
+            ),
+        ];
+
+        for (label, opts, field, pos) in &actor_cases {
+            assert_nul_rejected(
+                label,
+                check_actor_options(opts),
+                "ActorOptions",
+                field,
+                *pos,
+            );
+            assert_nul_rejected(
+                &format!("{} actor_create_with_options_inner", label),
+                actor_create_with_options_inner("factory", &[], opts),
+                "ActorOptions",
+                field,
+                *pos,
+            );
+            assert_nul_rejected(
+                &format!("{} actor_create_python_with_options_inner", label),
+                actor_create_python_with_options_inner("mod", "Cls", &[], opts),
+                "ActorOptions",
+                field,
+                *pos,
+            );
+        }
+
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "校验测试激活了 C++ 运行时"
+        );
+    }
+
+    /// 各任务、Actor、Placement Group 与查询入口的字符串参数含内部 NUL 字节时，均在
+    /// Rust FFI 边界拒绝并点名字段与字节下标。
+    #[test]
+    fn entry_points_reject_interior_nul_parameters_with_field_names() {
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "这个测试要求进程里没有 Ray runtime"
+        );
+        assert_nul_rejected(
+            "task_call_inner func_name",
+            task_call_inner("ad\0d", &[], &[], &TaskOptions::new()),
+            "ray_task_call_with_options",
+            "func_name",
+            2,
+        );
+        assert_nul_rejected(
+            "task_call_json_inner options_json",
+            task_call_json_inner("add", &[], &[], "{\"name\":\"x\0\"}"),
+            "ray_task_call_with_options",
+            "options_json",
+            10,
+        );
+        assert_nul_rejected(
+            "task_call_python_json_inner options_json",
+            task_call_python_json_inner("rayrust_test", "add", &[], &[], "{\"name\":\"x\0\"}"),
+            "ray_task_call_python",
+            "options_json",
+            10,
+        );
+        assert_nul_rejected(
+            "actor_create_with_options_inner func_name",
+            actor_create_with_options_inner("fac\0tory", &[], &ActorOptions::new()),
+            "ray_actor_create_with_options",
+            "func_name",
+            3,
+        );
+        assert_nul_rejected(
+            "actor_create_python_with_options_inner module",
+            actor_create_python_with_options_inner("mod\0ule", "Cls", &[], &ActorOptions::new()),
+            "ray_actor_create_python_with_options",
+            "module",
+            3,
+        );
+        assert_nul_rejected(
+            "actor_create_python_with_options_inner class",
+            actor_create_python_with_options_inner("module", "Cl\0s", &[], &ActorOptions::new()),
+            "ray_actor_create_python_with_options",
+            "class",
+            2,
+        );
+
+        let cpp_actor = [0x29u8; 16];
+        actor_registry::record(
+            &cpp_actor,
+            ActorLanguage::Cpp,
+            actor_registry::CREATION_DESCRIPTOR_CPP,
+        );
+        assert_nul_rejected(
+            "actor_call_inner func_name",
+            actor_call_inner(&cpp_actor, "counter::in\0c", &[], &[]),
+            "ray_actor_call",
+            "func_name",
+            11,
+        );
+
+        assert_nul_rejected(
+            "placement_group_create_inner name",
+            placement_group_create_inner("pg\0name", "[{\"CPU\":1}]", 0),
+            "ray_placement_group_create",
+            "name",
+            2,
+        );
+        assert_nul_rejected(
+            "placement_group_create_inner bundles_json",
+            placement_group_create_inner("pg_name", "[{\"CPU\":1}]\0", 0),
+            "ray_placement_group_create",
+            "bundles_json",
+            11,
+        );
+        assert_nul_rejected(
+            "placement_group_by_name_inner name",
+            placement_group_by_name_inner("pg\0lookup"),
+            "ray_placement_group_get_by_name",
+            "name",
+            2,
+        );
+        assert_nul_rejected(
+            "get_actor name",
+            get_actor("act\0or", ""),
+            "ray_get_actor",
+            "name",
+            3,
+        );
+        assert_nul_rejected(
+            "get_actor namespace",
+            get_actor("actor", "ns\0name"),
+            "ray_get_actor",
+            "namespace",
+            2,
+        );
+
+        assert!(
+            !unsafe { rayrust_sys::ray_is_initialized() },
+            "入口校验测试激活了 C++ 运行时"
+        );
     }
 }

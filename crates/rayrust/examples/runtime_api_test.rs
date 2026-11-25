@@ -25,8 +25,9 @@
 //!    `last_error()` 说明 16 字节，进程存活（`Ray::kill_actor` 只收 `&ActorHandle`，
 //!    id 恒为 16 字节，短 id 只能从 C ABI 传进来；这个集群里它在修复前会命中
 //!    `ActorID::FromBinary` 的 RAY_CHECK 终止进程）；随后第 4 项合法 actor 的
-//!    `kill_actor` 照旧工作。最后是 actor 名字的边界：空名字与带内部 NUL 的名字都报
-//!    `Ffi`（错误说明名字为空、进程存活），只有空白字符的名字合法且按原样查（`Ok(None)`）。
+//!    `kill_actor` 照旧工作。最后是 actor 名字与命名空间的边界：空名字在 C 入口报
+//!    `Ffi`（错误说明名字为空、进程存活），带内部 NUL 的名字与命名空间在 Rust FFI 边界报
+//!    `Ffi`（点名字段并说明含内部 NUL），只有空白字符的名字合法且按原样查（`Ok(None)`）。
 //! 3c. `placement_group_remove` 的守卫与错误出口（两个模式都跑）：3 字节与空字节 id →
 //!    `Ffi` 且消息说明 18 字节（crate 内侧先拒，进不了 FFI）；从 C ABI 直接调同一入口传
 //!    3 字节与 `(NULL, 0)`/`(NULL, 18)` → 返回 -1、`last_error()` 说明原因、进程存活（C 入口
@@ -111,9 +112,9 @@
 //!   `src/ray/common/function_descriptor.h:67-70`），字段 6 缺席时描述符是
 //!   `EmptyFunctionDescriptor`，`ModuleName()`/`ClassName()` 读越过对象末尾；实测
 //!   SIGSEGV，`PC` 在 `CallActor()`，退出码 139。第 6 项断言拒掉它并且进程存活。
-//! - 集群 `get_actor("")` 与 `get_actor("a\0b")`（`to_cstring` 把带内部 NUL 的名字
-//!   变成空串，#27）没有守卫时会在 `core_worker.cc:2594` 的 `RAY_CHECK(!name.empty())`
-//!   终止进程，本地模式则返回 `Ok(None)`；现在两种模式都报 `Ffi`。
+//! - 集群 `get_actor("", "")` 没有守卫时会在 `core_worker.cc:2594` 的 `RAY_CHECK(!name.empty())`
+//!   终止进程，本地模式原本返回 `Ok(None)`；现在两种模式都在 C 入口报 `Ffi`。带内部 NUL 的
+//!   `name` 或 `namespace` 在进入 C 之前由 Rust FFI 边界报点名字段的 `Ffi`。
 //!   `get_actor(" ", "")` 是合法的未命中，返回 `Ok(None)`。空 namespace 合法：
 //!   `NativeTaskSubmitter::GetActor` 用 job config 的 namespace 顶替它。
 //! - 本地模式没有 core worker，`exit_actor()` 在那里是空操作：退出状态异常会被
@@ -469,21 +470,43 @@ fn actor_handle_payload_checks(ray: &Ray) {
     println!("  进程存活：以上载荷要么在进 Ray 之前被拒，要么在登记之后被拒；最后一条对照成功登记，它的 Python 入口也在进 SDK 之前被拒");
 }
 
-/// actor 名字的边界：空名字与带内部 NUL 的名字都在 C 侧被拒（集群模式里它们会命中
-/// `CoreWorker::GetNamedActorHandle` 的 `RAY_CHECK(!name.empty())`），只有空白字符的
-/// 名字合法、按原样去查。两种模式判定相同，集群与本地各跑一遍。
+/// actor 名字与命名空间的边界：空名字在 C 入口被拒绝（集群模式里它会命中
+/// `CoreWorker::GetNamedActorHandle` 的 `RAY_CHECK(!name.empty())`），带内部 NUL 的
+/// 名字与命名空间在 Rust FFI 边界被拒绝并点名字段，只有空白字符的名字合法、按原样去查。
+/// 两种模式判定相同，集群与本地各跑一遍。
 fn actor_name_boundary_checks(ray: &Ray) {
     println!("\n--- actor 名字的边界 ---");
-    for (label, name) in [
-        ("get_actor(\"\", \"\")", ""),
-        ("get_actor(\"a\\0b\", \"\")", "a\0b"),
+    match ray.get_actor("", "") {
+        Err(RayError::Ffi(message)) => {
+            assert!(
+                message.contains("empty"),
+                "get_actor(\"\", \"\") 的错误里没有说明名字为空: {}",
+                message
+            );
+            println!("  get_actor(\"\", \"\") → Ffi({})", message);
+        }
+        Err(other) => panic!("get_actor(\"\", \"\") 返回了别的错误变体: {}", other),
+        Ok(found) => panic!(
+            "get_actor(\"\", \"\") 返回了 Ok({} 个结果)",
+            found.is_some()
+        ),
+    }
+    for (label, name, namespace, expected_field) in [
+        ("get_actor(\"a\\0b\", \"\")", "a\0b", "", "name"),
+        (
+            "get_actor(\"any\", \"ns\\0b\")",
+            "any",
+            "ns\0b",
+            "namespace",
+        ),
     ] {
-        match ray.get_actor(name, "") {
+        match ray.get_actor(name, namespace) {
             Err(RayError::Ffi(message)) => {
                 assert!(
-                    message.contains("empty"),
-                    "{} 的错误里没有说明名字为空: {}",
+                    message.contains(expected_field) && message.contains("interior NUL"),
+                    "{} 的错误里没有点名 {} 与 interior NUL: {}",
                     label,
+                    expected_field,
                     message
                 );
                 println!("  {} → Ffi({})", label, message);
@@ -502,7 +525,7 @@ fn actor_name_boundary_checks(ray: &Ray) {
         ),
         Err(error) => panic!("get_actor(\" \") 报错: {}", error),
     }
-    println!("  进程存活：空名字在进 Ray 之前被拒");
+    println!("  进程存活：空名字与含内部 NUL 的名字及命名空间在进 Ray 之前被拒绝");
 }
 
 /// 本地模式 init 时配的 namespace，第 1 项的断言要拿它对比。

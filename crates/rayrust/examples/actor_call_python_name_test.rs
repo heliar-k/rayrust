@@ -13,9 +13,9 @@
 //! lossy 呈现原始字节），这个 actor 之后不能再调用。C 入口
 //! `ray_actor_call_python` 在 id 宽度检查之后、取运行时之前拒掉空方法名（两种情形都
 //! 拒，包括方法存在的那种），消息以 `the method name is empty` 开头；被拒的调用不提交
-//! 任务，actor 照常活着。带内部 NUL
-//! 的方法名经 `to_cstring`（crates/rayrust-sys/src/lib.rs:253-255，#27）变成空串，
-//! 同样被这条检查拦住。
+//! 任务，actor 照常活着。带内部 NUL 的方法名在进入 C 之前由 Rust FFI 边界拒绝，返回
+//! 点名 `method_name` 且含 `interior NUL` 的 `RayError::Ffi`，同样不提交任务，actor
+//! 照常存活。
 //!
 //! 只跑集群模式：本地模式整体拒绝这个入口。
 //! ```text
@@ -32,8 +32,8 @@
 //!    `actor_call_python(id, "increment", [1])` 读到 8
 //! 2. `actor_call_python(id, "")`：被拒成 `RayError::Ffi`，消息含
 //!    `the method name is empty`；随后同一个 actor 的 `get` 仍读到 8
-//! 3. `actor_call_python(id, "in\0crement")`：同样被拒成 `RayError::Ffi`、消息含
-//!    `the method name is empty`；随后 `get` 仍读到 8
+//! 3. `actor_call_python(id, "in\0crement")`：在 Rust FFI 边界被拒成 `RayError::Ffi`，
+//!    消息含 `method_name` 与 `interior NUL`；随后 `get` 仍读到 8
 //! 4. 对照：C++ actor（`__rayrust_actor_factory_counter`，构造参数 41）的
 //!    `actor_call(id, "")`：被拒成 `RayError::Ffi`，消息含 `Function not found`；随后
 //!    它的 `get` 读到 41（C++ 入口在驱动里构造 `RemoteFunctionHolder` 时就抛
@@ -75,17 +75,19 @@ fn cluster_config() -> RayConfig {
         .code_search_path(vec![worker_so])
 }
 
-/// 一次应当被拒绝的调用：必须是 `RayError::Ffi`，消息里含 `needle`。
-fn expect_refused<T>(label: &str, result: Result<T, RayError>, needle: &str) {
+/// 一次应当被拒绝的调用：必须是 `RayError::Ffi`，消息里含全部 `needles`。
+fn expect_refused<T>(label: &str, result: Result<T, RayError>, needles: &[&str]) {
     match result {
         Err(RayError::Ffi(message)) => {
-            assert!(
-                message.contains(needle),
-                "{}: 错误文本里没有 {:?}: {}",
-                label,
-                needle,
-                message
-            );
+            for needle in needles {
+                assert!(
+                    message.contains(needle),
+                    "{}: 错误文本里没有 {:?}: {}",
+                    label,
+                    needle,
+                    message
+                );
+            }
             println!("  {} → Ffi({})", label, message);
         }
         Err(other) => panic!("{}: 返回了别的错误变体: {}", label, other),
@@ -141,7 +143,7 @@ fn main() {
     expect_refused(
         "actor_call_python(id, \"\")",
         ray.actor_call_python(counter.id(), "", &[], &[]),
-        "the method name is empty",
+        &["the method name is empty"],
     );
     let value = read_i64(&ray, counter.id(), "get");
     assert_eq!(value, 8, "空方法名之后 get 读到 {}", value);
@@ -151,7 +153,7 @@ fn main() {
     expect_refused(
         "actor_call_python(id, \"in\\0crement\")",
         ray.actor_call_python(counter.id(), "in\0crement", &[], &[]),
-        "the method name is empty",
+        &["method_name", "interior NUL"],
     );
     let value = read_i64(&ray, counter.id(), "get");
     assert_eq!(value, 8, "内部 NUL 之后 get 读到 {}", value);
@@ -174,7 +176,7 @@ fn main() {
     expect_refused(
         "actor_call(cpp_id, \"\")",
         ray.actor_call(cpp_counter.id(), "", &[], &[]),
-        "Function not found",
+        &["Function not found"],
     );
     let value: i64 = ray
         .actor_call(cpp_counter.id(), COUNTER_GET, &[], &[])
