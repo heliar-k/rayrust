@@ -161,6 +161,17 @@ async fn main() {
     let obj = ray.put(&42i32).unwrap();
     println!("ObjectRef id_hex: {} ✓", obj.id_hex());
     println!("is_initialized: {} ✓", ray.is_initialized());
+    let build_ver = Ray::sdk_version();
+    let loaded_ver = Ray::loaded_sdk_version().expect("loaded_sdk_version failed");
+    assert!(
+        !build_ver.is_empty(),
+        "Ray::sdk_version() must be non-empty"
+    );
+    assert_eq!(
+        loaded_ver, build_ver,
+        "loaded libray_api.so version must match Ray::sdk_version()"
+    );
+    println!("SDK version: build={} loaded={} ✓", build_ver, loaded_ver);
 
     // ── 9. Large Payload & Repeated Reads ──────────────────
     println!("\n--- 9. Large Payload & Repeated Reads ---");

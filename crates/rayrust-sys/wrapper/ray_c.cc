@@ -8,60 +8,16 @@
 /// returns use ray_bytes_t (ptr + len).
 
 #include "ray_c.h"
+#include "ray_private_abi.h"
 
 #include <ray/api.h>
+#include <ray/api/function_manager.h>
+#include <ray/api/internal_api.h>
 #include <ray/api/metric.h>
 #include <ray/api/ray_exception.h>
 #include <ray/api/ray_runtime.h>
 #include <ray/api/ray_runtime_holder.h>
 #include <ray/api/serializer.h>
-#include <ray/api/function_manager.h>
-#include <ray/api/internal_api.h>
-
-// `RayIntentionalSystemExitException` 定义在 `cpp/src/ray/runtime/abstract_ray_runtime.h`，
-// wheel 只带 `include/ray/api/*`，所以这里按上游定义重述一次：与 `RayException` 同构，
-// 只有一个构造函数。
-//
-// 它能工作靠的是 C++ ABI 的异常匹配规则。本仓库 `.so` 里这份重述类的 typeinfo 是本地
-// 符号：Rust cdylib 的 version script 把编进去的 C++ 符号全部本地化，
-// `nm -D --defined-only target/release/librayrust_worker.so` 里没有任何
-// `_ZTIN3ray8internal33...` 条目，所以动态链接器没有把它与 libray_api.so 导出的那份统一
-// 过，两份 typeinfo 的地址不同。`GetExecuteResult` 的
-// `catch (RayIntentionalSystemExitException &)` 仍然能接住，是因为 libstdc++ 在 typeinfo
-// 指针不同时退到比较 mangled name：`type_info::operator==` 走
-// `strcmp(__name, __arg.name())`，前提是 `__GXX_MERGED_TYPEINFO_NAMES` 为 0（本机
-// libstdc++ 的默认值）。两份 typeinfo 的名字都是
-// `N3ray8internal33RayIntentionalSystemExitExceptionE`。
-//
-// 前提是重述类与 SDK 的类**同命名空间、同类名、同布局**。命名空间与类名由名字本身
-// 保证；布局用下面的 static_assert 卡住——本类没有数据成员，布局就是基类的布局，SDK
-// 给它加成员或换基类时这里编译不过。改名、换基类的重述实测都停在
-// `task_executor.cc:101` 的通用 catch（它的日志行在 `:110`）。
-//
-// 前提不成立时的可观察现象：`__GXX_MERGED_TYPEINFO_NAMES` 为 1 的平台不做名字比较，
-// 异常掉到 `GetExecuteResult` 的通用 catch（`cpp/src/ray/runtime/task/task_executor.cc:101`，
-// 日志行 `:110`），actor 不会退出、那次方法调用报
-// `RayError::Task`。两组对照（C1 抛基类 `RayException`、C2 只把重述类改名）都停在那里，
-// actor 继续活着；`crates/rayrust/examples/runtime_api_test.rs` 第 4 项
-// （`exit()` 之后的方法必须报错）在那种环境下会失败。
-namespace ray {
-namespace internal {
-class RayIntentionalSystemExitException : public RayException {
- public:
-  RayIntentionalSystemExitException(const std::string &msg) : RayException(msg){};
-};
-
-static_assert(std::is_base_of_v<RayException, RayIntentionalSystemExitException>,
-              "the restated exception must derive from ray::internal::RayException: the "
-              "SDK's catch hierarchy is built on that base");
-static_assert(sizeof(RayIntentionalSystemExitException) == sizeof(RayException),
-              "the restated exception has no data members, so its layout is the base "
-              "class's; a member added to the SDK's class would make the thrown object's "
-              "layout wrong while the mangled name still matches");
-static_assert(alignof(RayIntentionalSystemExitException) == alignof(RayException),
-              "the restated exception must keep the SDK class's alignment");
-}  // namespace internal
-}  // namespace ray
 
 // ─── Thread-local error storage ─────────────────────────────────
 // Instead of fprintf(stderr), we store the error message in a thread-local
@@ -79,10 +35,16 @@ static_assert(alignof(RayIntentionalSystemExitException) == alignof(RayException
 #include <functional>
 #include <limits>
 #include <memory>
+#include <msgpack.hpp>
 #include <mutex>
+#include <new>
+#include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 static thread_local std::string g_last_error;
 static thread_local int g_last_error_kind = RAY_ERROR_KIND_NONE;
@@ -140,181 +102,6 @@ static void set_last_error_exception(const std::exception &e) {
     catch (const std::exception &e) { \
         set_last_error_exception(e); \
     }
-
-// Declare the exported function from libray_api.so.
-// This returns the SAME FunctionManager singleton that the worker uses.
-//
-// IMPORTANT: Do NOT use extern "C" here. GetFunctionManager is a C++ function.
-// With extern "C", the linker resolves the symbol to the BOOST_DLL_ALIAS
-// variable (V type, in .data section), not the actual function (T type, in .text).
-namespace ray { namespace internal {
-    FunctionManager &GetFunctionManager();
-}}
-
-// Forward declarations for the private symbols `ray_cancel` and `ray_put_xlang`
-// call. None of these types are declared in the headers the wheel ships
-// (`ray/api/*.h`), so their layouts are restated from the upstream Ray sources:
-//   - `ray::Buffer` (`src/ray/common/buffer.h:30-57`): pure virtual base with
-//     four const accessors and a virtual destructor.
-//   - `ray::ObjectID` (`src/ray/common/id.h`): `BaseID<ObjectID>` under
-//     `#pragma pack(1)` — a mutable `size_t hash_` at offset 0 followed by
-//     `uint8_t id_[28]`.
-//   - `ray::Status` (`src/ray/common/status.h`): a single `State *` that is
-//     `nullptr` iff the status is ok.
-//   - `ray::RayObject` (`src/ray/common/ray_object.h:28-177`, fields at
-//     `:163-176`): tail layout after `creation_time_nanos_` selected at build
-//     time by `crates/rayrust-sys/build.rs` from `libray_api.so` symbols
-//     (112 bytes with enum on Ray 2.49.0 / 2.51.1, 136 bytes with two
-//     `std::optional<std::string>` fields on Ray 2.55.0 / 2.60.0).
-namespace ray {
-    class Buffer {
-    public:
-        Buffer() = default;
-        virtual uint8_t *Data() const = 0;
-        virtual size_t Size() const = 0;
-        virtual bool OwnsData() const = 0;
-        virtual bool IsPlasmaBuffer() const = 0;
-        virtual ~Buffer() = default;
-        Buffer(const Buffer &) = delete;
-        Buffer &operator=(const Buffer &) = delete;
-    };
-
-    static_assert(sizeof(ray::Buffer) == sizeof(void *),
-                  "ray::Buffer stand-in does not match the SDK layout");
-
-#pragma pack(push, 1)
-    class ObjectID {
-    public:
-        static constexpr size_t kLength = 28;
-
-        ObjectID() : hash_(0), id_{} {}
-
-        // hash_ stays 0, which BaseID<T>::Hash() reads as "not computed yet".
-        ObjectID(const char *data, size_t len) {
-            hash_ = 0;
-            std::memcpy(id_, data, len);
-        }
-
-        std::string Binary() const {
-            return std::string(reinterpret_cast<const char *>(id_), kLength);
-        }
-
-    private:
-        mutable size_t hash_;
-        uint8_t id_[kLength];
-    };
-#pragma pack(pop)
-
-    static_assert(sizeof(ray::ObjectID) == ObjectID::kLength + sizeof(size_t),
-                  "ray::ObjectID stand-in does not match the SDK layout");
-
-    class Status {
-    public:
-        bool ok() const { return state_ == nullptr; }
-        std::string ToString() const;
-        // Defined in libray_api.so (the SDK emits it as a weak symbol) and
-        // deleted through `delete state_`.
-        ~Status();
-
-    private:
-        struct State;
-        State *state_;
-    };
-
-    static_assert(sizeof(ray::Status) == sizeof(void *),
-                  "ray::Status stand-in does not match the SDK layout");
-
-    struct OpaqueObjectReference {};
-
-    class RayObject {
-    public:
-        __attribute__((visibility("hidden")))
-        RayObject(std::shared_ptr<Buffer> data, std::shared_ptr<Buffer> metadata)
-            : data_(std::move(data)), metadata_(std::move(metadata)) {}
-
-        __attribute__((visibility("hidden")))
-        ~RayObject() = default;
-
-    private:
-        std::shared_ptr<Buffer> data_;
-        std::function<const std::shared_ptr<Buffer>()> data_factory_ = nullptr;
-        std::shared_ptr<Buffer> metadata_;
-        std::vector<OpaqueObjectReference> nested_refs_;
-        bool has_data_copy_ = false;
-        bool accessed_ = false;
-        int64_t creation_time_nanos_ = 0;
-#if defined(RAYRUST_RAY_OBJECT_LAYOUT_OPTIONAL_STR)
-        std::optional<std::string> tensor_transport_;
-        std::optional<std::string> direct_transport_metadata_;
-#elif defined(RAYRUST_RAY_OBJECT_LAYOUT_ENUM)
-        int32_t tensor_transport_ = 0;
-#else
-#error "ray::RayObject layout macro not defined by build.rs"
-#endif
-    };
-
-#if defined(RAYRUST_RAY_OBJECT_LAYOUT_OPTIONAL_STR)
-    static_assert(sizeof(ray::RayObject) == 136,
-                  "ray::RayObject stand-in size must be 136 bytes for optional<string> layout");
-#elif defined(RAYRUST_RAY_OBJECT_LAYOUT_ENUM)
-    static_assert(sizeof(ray::RayObject) == 112,
-                  "ray::RayObject stand-in size must be 112 bytes for enum layout");
-#endif
-}
-namespace ray::core {
-    class CoreWorker {
-    public:
-        ray::Status Put(const ray::RayObject &object,
-                        const std::vector<ray::ObjectID> &contained_object_ids,
-                        ray::ObjectID *object_id);
-        ray::Status CancelTask(const ray::ObjectID &object_id,
-                               bool force_kill,
-                               bool recursive);
-    };
-    class CoreWorkerProcess {
-    public:
-        static bool IsInitialized();
-        static CoreWorker& GetCoreWorker();
-    };
-}
-namespace ray::internal {
-    /// 上游 `abstract_ray_runtime.h` 不在 wheel 里。这里按上游定义重述一遍：
-    /// `AbstractRayRuntime` 继承 `RayRuntime`，`GetInstance()` 读的是 `libray_api.so`
-    /// 里进程唯一的那份。
-    class AbstractRayRuntime : public RayRuntime {
-    public:
-        static std::shared_ptr<AbstractRayRuntime> GetInstance();
-    };
-}
-
-#include <cstring>
-#include <msgpack.hpp>
-#include <new>
-#include <string>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
-
-namespace {
-
-/// 本编译单元自持字节的 `ray::Buffer` 实现，控制块与 `virtual` 析构函数均在此完成释放，
-/// 无需依赖上游未导出的 `aligned_malloc` / `aligned_free`。
-class OwnedRayBuffer final : public ray::Buffer {
-public:
-    OwnedRayBuffer(const uint8_t *src, size_t len) : bytes_(src, src + len) {}
-
-    uint8_t *Data() const override {
-        return const_cast<uint8_t *>(bytes_.data());
-    }
-    size_t Size() const override { return bytes_.size(); }
-    bool OwnsData() const override { return true; }
-    bool IsPlasmaBuffer() const override { return false; }
-
-private:
-    std::vector<uint8_t> bytes_;
-};
-
-}  // namespace
 
 // ─── Function Registration ────────────────────────────────────
 
@@ -378,8 +165,20 @@ static msgpack::sbuffer unwrap_callback_result(ray_callback_result_t result) {
     }
 }
 
+static void check_worker_abi_or_throw() {
+    std::string reg_err = rayrust_abi::get_registration_error();
+    if (!reg_err.empty()) {
+        throw ray::internal::RayException(reg_err);
+    }
+    std::string ver_err;
+    if (!rayrust_abi::verify_loaded_sdk_version(ver_err)) {
+        throw ray::internal::RayException(ver_err);
+    }
+}
+
 static msgpack::sbuffer invoke_rust_function(const std::string &func_name,
                                               const ray::internal::ArgsBufferList &args_buffer) {
+    check_worker_abi_or_throw();
     auto &fns = get_rust_functions();
     auto it = fns.find(func_name);
     if (it == fns.end()) {
@@ -398,11 +197,18 @@ static msgpack::sbuffer invoke_rust_function(const std::string &func_name,
 }
 
 void ray_register_function(const char *func_name, ray_func_callback_t callback) {
+    if (!func_name) return;
     std::string name(func_name);
     auto &fns = get_rust_functions();
     fns[name] = callback;
 
-    auto &fm = ray::internal::GetFunctionManager();
+    std::string sym_err;
+    auto get_fm = rayrust_abi::resolve_get_function_manager(sym_err);
+    if (get_fm == nullptr) {
+        rayrust_abi::record_registration_error(sym_err);
+        return;
+    }
+    auto &fm = get_fm();
     auto [map_ref, _] = fm.GetRemoteFunctions();
     auto &map = const_cast<ray::internal::RemoteFunctionMap_t &>(map_ref);
 
@@ -424,6 +230,7 @@ static msgpack::sbuffer invoke_rust_member_function(
     const std::string &func_name,
     msgpack::sbuffer *actor_ptr_buf,
     const ray::internal::ArgsBufferList &args_buffer) {
+    check_worker_abi_or_throw();
     auto &fns = get_rust_member_functions();
     auto it = fns.find(func_name);
     if (it == fns.end()) {
@@ -451,12 +258,18 @@ static msgpack::sbuffer invoke_rust_member_function(
 }
 
 void ray_register_member_function(const char *func_name, ray_member_callback_t callback) {
+    if (!func_name) return;
     std::string name(func_name);
     auto &fns = get_rust_member_functions();
     fns[name] = callback;
 
-    // Register with FunctionManager's map_mem_func_invokers_ via const_cast.
-    auto &fm = ray::internal::GetFunctionManager();
+    std::string sym_err;
+    auto get_fm = rayrust_abi::resolve_get_function_manager(sym_err);
+    if (get_fm == nullptr) {
+        rayrust_abi::record_registration_error(sym_err);
+        return;
+    }
+    auto &fm = get_fm();
     auto [_, mem_map_ref] = fm.GetRemoteFunctions();
     auto &mem_map = const_cast<ray::internal::RemoteMemberFunctionMap_t &>(mem_map_ref);
 
@@ -599,7 +412,10 @@ static int check_actor_id(const char *id_data, size_t id_len) {
 ///
 /// 空串走调用方：集群模式的空地址表示「没有地址」，不是非法形状；环境变量那一路由
 /// `ray_init` 无条件调用，空串在那里按「没有 `:`」拒掉，与上游一致。
-static int check_bootstrap_address(const char *field, const std::string &address) {
+static int check_bootstrap_address(const char *field,
+                                   const std::string &address,
+                                   std::string *out_host = nullptr,
+                                   int *out_port = nullptr) {
     const std::string prefix =
         std::string(field) + " \"" + address + "\" is not host:port: ";
     const size_t pos = address.find_last_of(':');
@@ -638,6 +454,8 @@ static int check_bootstrap_address(const char *field, const std::string &address
             return -1;
         }
     }
+    if (out_host != nullptr) *out_host = host;
+    if (out_port != nullptr) *out_port = value;
     return 0;
 }
 
@@ -950,6 +768,73 @@ void prune_ready_local_tasks(ray::internal::RayRuntime &runtime,
 
 }  // namespace
 
+/// 经 `GlobalStateAccessor::GetInternalKV`（`src/ray/gcs_rpc_client/global_state_accessor.cc:375-382`）
+/// 读取 GCS internal KV 的 `("cluster", "CLUSTER_METADATA")` JSON，核对集群的 `"ray_version"`
+/// （由 `Node._write_cluster_info_to_kv` 在 `python/ray/_private/node.py:1295-1344` 调用
+/// `put_cluster_metadata` 在 `python/ray/_common/usage/usage_lib.py:521-543` 写入）与构建期
+/// `RAYRUST_BUILD_RAY_VERSION` 一致。
+static bool verify_cluster_version_from_gsa(ray::gcs::GlobalStateAccessor *gsa,
+                                            std::string &err_out) {
+    if (gsa == nullptr) {
+        err_out = "failed to verify Ray cluster version: GlobalStateAccessor is null";
+        return false;
+    }
+    auto get_kv_fn = rayrust_abi::resolve_gsa_get_internal_kv(err_out);
+    if (get_kv_fn == nullptr) {
+        return false;
+    }
+    std::unique_ptr<std::string> raw =
+        get_kv_fn(gsa, std::string("cluster"), std::string("CLUSTER_METADATA"));
+    if (!raw) {
+        err_out =
+            "failed to verify Ray cluster version: GCS internal KV entry "
+            "cluster/CLUSTER_METADATA is missing";
+        return false;
+    }
+    nlohmann::json meta;
+    try {
+        meta = nlohmann::json::parse(*raw);
+    } catch (const std::exception &e) {
+        err_out = std::string("failed to parse GCS cluster/CLUSTER_METADATA JSON: ") +
+                  e.what();
+        return false;
+    }
+    if (!meta.is_object() || !meta.contains("ray_version") ||
+        !meta["ray_version"].is_string()) {
+        err_out =
+            "GCS cluster/CLUSTER_METADATA does not contain string field 'ray_version'";
+        return false;
+    }
+    const std::string cluster_version = meta["ray_version"].get<std::string>();
+    if (cluster_version != RAYRUST_BUILD_RAY_VERSION) {
+        err_out = "Ray cluster version mismatch: cluster reports Ray " +
+                  cluster_version +
+                  ", built against Ray C++ SDK " RAYRUST_BUILD_RAY_VERSION;
+        return false;
+    }
+    return true;
+}
+
+static bool verify_cluster_version_from_runtime(std::string &err_out) {
+    auto get_inst_fn = rayrust_abi::resolve_abstract_runtime_get_instance(err_out);
+    if (get_inst_fn == nullptr) {
+        return false;
+    }
+    auto get_gsa_fn = rayrust_abi::resolve_abstract_runtime_get_gsa(err_out);
+    if (get_gsa_fn == nullptr) {
+        return false;
+    }
+    auto abs_rt = get_inst_fn();
+    if (!abs_rt) {
+        err_out =
+            "failed to verify Ray cluster version: AbstractRayRuntime::GetInstance() "
+            "returned null";
+        return false;
+    }
+    const auto &gsa_ptr = get_gsa_fn(abs_rt.get());
+    return verify_cluster_version_from_gsa(gsa_ptr.get(), err_out);
+}
+
 int ray_init(const char *address, int local_mode, const char *node_ip,
              const char *code_search_path,
              const char *runtime_env_json,
@@ -960,6 +845,9 @@ int ray_init(const char *address, int local_mode, const char *node_ip,
     try {
         const bool local = local_mode != 0;
         ray::RayConfig config;
+        std::string gcs_host;
+        int gcs_port = 0;
+        bool has_bootstrap_address = false;
         // 本地模式忽略地址：`ConfigInternal::Init` 只在 `config.address` 非空时调用
         // `SetBootstrapAddress`（cpp/src/ray/config_internal.cc:124-126），而 `SINGLE_PROCESS`
         // 创建的是 `LocalModeRayRuntime`（cpp/src/ray/runtime/abstract_ray_runtime.cc:48-51），
@@ -975,8 +863,11 @@ int ray_init(const char *address, int local_mode, const char *node_ip,
         // `init_namespace()` 的写入推到了新运行时初始化成功之后（见下方），因为已初始化时
         // `ray::Init` 是空操作、运行时不换，命名空间也不该换。
         if (!local && address && address[0] != '\0') {
-            if (check_bootstrap_address("address", address) != 0) return -1;
+            if (check_bootstrap_address("address", address, &gcs_host, &gcs_port) != 0) {
+                return -1;
+            }
             config.address = address;
+            has_bootstrap_address = true;
         }
         config.local_mode = local;
         // 空地址时下游会读取 `RAY_ADDRESS`（cpp/src/ray/config_internal.cc:207-215）并进入
@@ -984,7 +875,12 @@ int ray_init(const char *address, int local_mode, const char *node_ip,
         // 都要判定，空串在那里同样是解析不出地址的输入。
         if (!local && config.address.empty()) {
             const char *env = std::getenv("RAY_ADDRESS");
-            if (env && check_bootstrap_address("RAY_ADDRESS", env) != 0) return -1;
+            if (env) {
+                if (check_bootstrap_address("RAY_ADDRESS", env, &gcs_host, &gcs_port) != 0) {
+                    return -1;
+                }
+                has_bootstrap_address = true;
+            }
         }
 
         // Set default actor lifetime: 0 = NON_DETACHED (default), 1 = DETACHED.
@@ -1012,20 +908,40 @@ int ray_init(const char *address, int local_mode, const char *node_ip,
             }
         }
 
-        // Set runtime_env from JSON string.
-        // 先判形状再反序列化：`ray::RuntimeEnv::Deserialize`
-        // （cpp/src/ray/runtime/runtime_env.cc:67-76）内部对整段文本调用
-        // `nlohmann::json::parse`，异常消息会把输入原样拼进去，一次解析失败会生成与输入
-        // 同长的消息。数组与标量不会让它抛出异常，所以这里与 `apply_runtime_env` 一致，
-        // 要求顶层为 JSON 对象，非对象只报告类型名。
-        if (runtime_env_json && runtime_env_json[0] != '\0') {
+        // 先对 runtime_env_json 做纯 JSON 形状校验（不触碰 SDK），确保参数错误最先报告。
+        std::string raw_runtime_env;
+        const bool has_runtime_env = runtime_env_json && runtime_env_json[0] != '\0';
+        if (has_runtime_env) {
             try {
-                const std::string raw_runtime_env(runtime_env_json);
+                raw_runtime_env.assign(runtime_env_json);
                 const auto parsed_runtime_env = nlohmann::json::parse(raw_runtime_env);
                 if (!parsed_runtime_env.is_object()) {
                     throw std::runtime_error("runtime_env must be a JSON object, got type " +
                                              std::string(parsed_runtime_env.type_name()));
                 }
+            } catch (const std::exception &e) {
+                set_last_error_kind(std::string("runtime_env JSON is invalid: ") + e.what(),
+                                    RAY_ERROR_KIND_GENERIC);
+                return -1;
+            }
+        }
+
+        // 检查 #[ctor] 阶段是否存在 GetFunctionManager 缺失错误，并校验已加载 libray_api.so 版本。
+        const std::string reg_err = rayrust_abi::get_registration_error();
+        if (!reg_err.empty()) {
+            set_last_error(reg_err.c_str());
+            return -1;
+        }
+        std::string sdk_ver_err;
+        if (!rayrust_abi::verify_loaded_sdk_version(sdk_ver_err)) {
+            set_last_error(sdk_ver_err.c_str());
+            return -1;
+        }
+
+        // 已加载 libray_api.so 版本核验通过后，再调用 ray::RuntimeEnv::Deserialize
+        // （cpp/src/ray/runtime/runtime_env.cc:57-76）。
+        if (has_runtime_env) {
+            try {
                 config.runtime_env = ray::RuntimeEnv::Deserialize(raw_runtime_env);
             } catch (const std::exception &e) {
                 set_last_error_kind(std::string("runtime_env JSON is invalid: ") + e.what(),
@@ -1058,10 +974,57 @@ int ray_init(const char *address, int local_mode, const char *node_ip,
             set_last_error("a ray_shutdown is still in progress");
             return -1;
         }
-        // 上游 `ray::Init` 在已经初始化时什么都不做（raysrc/cpp/src/ray/api.cc:25-30）：
+        // 上游 `ray::Init` 在已经初始化时什么都不做（raysrc/cpp/src/ray/api.cc:25-31）：
         // 运行时没有换，登记必须保留，否则在途任务不会被排空。
         const bool already_initialized = ray::IsInitialized();
-        ray::Init(config, argc, const_cast<char**>(arg_ptrs.data()));
+        if (!local) {
+            std::string cluster_err;
+            if (!already_initialized && has_bootstrap_address) {
+                // 分支 A：连接已有集群，在调用 ray::Init 之前经临时 GlobalStateAccessor
+                // 核对集群版本；不匹配时完全不调用 ray::Init，ray::IsInitialized() 保持 false。
+                rayrust_abi::OwnedGlobalStateAccessor temp_gsa;
+                if (!rayrust_abi::create_temp_global_state_accessor(
+                        gcs_host, gcs_port, temp_gsa, cluster_err)) {
+                    set_last_error(cluster_err.c_str());
+                    return -1;
+                }
+                const bool version_ok =
+                    verify_cluster_version_from_gsa(temp_gsa.get(), cluster_err);
+                temp_gsa.reset();
+                if (!version_ok) {
+                    set_last_error(cluster_err.c_str());
+                    return -1;
+                }
+                ray::Init(config, argc, const_cast<char **>(arg_ptrs.data()));
+            } else if (!already_initialized) {
+                // 分支 B：自动启动本地 head 节点，先预检所需私有符号，调用 ray::Init 后
+                // 经运行时持有的 GlobalStateAccessor 核对版本；不匹配时调用 ray::Shutdown 清理。
+                if (rayrust_abi::resolve_abstract_runtime_get_instance(cluster_err) == nullptr ||
+                    rayrust_abi::resolve_abstract_runtime_get_gsa(cluster_err) == nullptr ||
+                    rayrust_abi::resolve_gsa_get_internal_kv(cluster_err) == nullptr) {
+                    set_last_error(cluster_err.c_str());
+                    return -1;
+                }
+                ray::Init(config, argc, const_cast<char **>(arg_ptrs.data()));
+                if (!verify_cluster_version_from_runtime(cluster_err)) {
+                    ray::Shutdown();
+                    set_last_error(cluster_err.c_str());
+                    return -1;
+                }
+            } else {
+                // 分支 C：已经初始化；若当前运行时处于集群模式则通过其 GlobalStateAccessor 复核。
+                auto cur = process_runtime();
+                if (cur && !cur->IsLocalMode()) {
+                    if (!verify_cluster_version_from_runtime(cluster_err)) {
+                        set_last_error(cluster_err.c_str());
+                        return -1;
+                    }
+                }
+                ray::Init(config, argc, const_cast<char **>(arg_ptrs.data()));
+            }
+        } else {
+            ray::Init(config, argc, const_cast<char **>(arg_ptrs.data()));
+        }
         open_runtime_gate();
         if (!already_initialized) {
             local_tasks().ids.clear();
@@ -1179,11 +1142,20 @@ struct RefCountTicket {
 /// 调用命中的也是 `libray_api.so` 的定义。所以自建的那份为空时改问
 /// `AbstractRayRuntime::GetInstance()`：它是 `libray_api.so` 导出的函数，`DoInit()`
 /// 把两个位置都设成同一个指针。
+static std::shared_ptr<ray::internal::RayRuntime> borrowed_abstract_runtime() {
+    std::string err;
+    auto fn = rayrust_abi::resolve_abstract_runtime_get_instance(err);
+    if (fn == nullptr) {
+        return nullptr;
+    }
+    return fn();
+}
+
 static std::shared_ptr<ray::internal::RayRuntime> process_runtime() {
     if (auto runtime = ray::internal::GetRayRuntime()) {
         return runtime;
     }
-    return ray::internal::AbstractRayRuntime::GetInstance();
+    return borrowed_abstract_runtime();
 }
 
 /// 运行时是不是由别的 DSO 建的：本 .so 内联的 `RayRuntimeHolder` 为空，而
@@ -1192,9 +1164,53 @@ static std::shared_ptr<ray::internal::RayRuntime> process_runtime() {
 /// 只给 Rust 侧的代次检查（`object_ref::check_epoch`）用。
 int ray_runtime_is_borrowed(void) {
     return ray::internal::GetRayRuntime() == nullptr &&
-                   ray::internal::AbstractRayRuntime::GetInstance() != nullptr
+                   borrowed_abstract_runtime() != nullptr
                ? 1
                : 0;
+}
+
+ray_bytes_t ray_build_sdk_version(void) {
+    ray_clear_error();
+    ray_bytes_t out = dup_bytes(std::string(RAYRUST_BUILD_RAY_VERSION));
+    if (!out.data) {
+        set_last_error("out of memory copying build SDK version");
+    }
+    return out;
+}
+
+ray_bytes_t ray_loaded_sdk_version(void) {
+    ray_clear_error();
+    const auto &state = rayrust_abi::loaded_sdk_version_state();
+    if (state.loaded_version.empty()) {
+        set_last_error(state.parse_error.empty()
+                           ? "failed to extract kRayVersion from loaded libray_api.so"
+                           : state.parse_error.c_str());
+        return ray_bytes_t{nullptr, 0};
+    }
+    ray_bytes_t out = dup_bytes(state.loaded_version);
+    if (!out.data) {
+        set_last_error("out of memory copying loaded SDK version");
+    }
+    return out;
+}
+
+int ray_check_private_symbol(const char *mangled_name) {
+    ray_clear_error();
+    if (!mangled_name) {
+        set_last_error("mangled_name is null");
+        return -1;
+    }
+    if (mangled_name[0] == '\0') {
+        set_last_error("mangled_name is empty");
+        return -1;
+    }
+    std::string err;
+    const char *human = rayrust_abi::human_name_for_symbol(mangled_name);
+    if (rayrust_abi::resolve_private_symbol(mangled_name, human, err) == nullptr) {
+        set_last_error(err.c_str());
+        return -1;
+    }
+    return 0;
 }
 
 /// 取这次调用要用的运行时。没有运行时、或运行时正在关闭时返回空，并写好
@@ -1411,7 +1427,7 @@ ray_bytes_t ray_put_xlang(const char *data, size_t len) {
         // 本地模式不启动 CoreWorkerProcess 与 Python 执行器，LocalModeObjectStore::PutRaw
         // （cpp/src/ray/runtime/object/local_mode_object_store.cc:34-38、:40-46）只能写入
         // 空 metadata，直接返回错误。
-        if (runtime->IsLocalMode() || !ray::core::CoreWorkerProcess::IsInitialized()) {
+        if (runtime->IsLocalMode()) {
             set_last_error(
                 "put_xlang is not supported in local mode: local mode starts no "
                 "CoreWorkerProcess or Python executor and LocalModeObjectStore "
@@ -1419,15 +1435,31 @@ ray_bytes_t ray_put_xlang(const char *data, size_t len) {
             return ray_bytes_t{nullptr, 0};
         }
 
-        auto data_buf = std::make_shared<OwnedRayBuffer>(
+        std::string sym_err;
+        auto cw_is_init = rayrust_abi::resolve_core_worker_is_initialized(sym_err);
+        auto cw_get = cw_is_init ? rayrust_abi::resolve_core_worker_get(sym_err) : nullptr;
+        auto cw_put = cw_get ? rayrust_abi::resolve_core_worker_put(sym_err) : nullptr;
+        auto st_dtor = cw_put ? rayrust_abi::resolve_status_dtor(sym_err) : nullptr;
+        if (!cw_is_init || !cw_get || !cw_put || !st_dtor) {
+            set_last_error(sym_err.c_str());
+            return ray_bytes_t{nullptr, 0};
+        }
+        if (!cw_is_init()) {
+            set_last_error(
+                "put_xlang is not supported in local mode: local mode starts no "
+                "CoreWorkerProcess or Python executor and LocalModeObjectStore "
+                "cannot attach XLANG metadata");
+            return ray_bytes_t{nullptr, 0};
+        }
+
+        auto data_buf = std::make_shared<rayrust_abi::OwnedRayBuffer>(
             reinterpret_cast<const uint8_t *>(data), len);
-        auto meta_buf = std::make_shared<OwnedRayBuffer>(
+        auto meta_buf = std::make_shared<rayrust_abi::OwnedRayBuffer>(
             reinterpret_cast<const uint8_t *>(ray::internal::METADATA_STR_XLANG.data()),
             ray::internal::METADATA_STR_XLANG.size());
         ray::RayObject object(std::move(data_buf), std::move(meta_buf));
         ray::ObjectID object_id;
-        ray::Status status =
-            ray::core::CoreWorkerProcess::GetCoreWorker().Put(object, {}, &object_id);
+        ray::Status status = cw_put(&cw_get(), object, {}, &object_id);
         if (!status.ok()) {
             throw ray::internal::RayException("Put object error: " + status.ToString());
         }
@@ -1609,10 +1641,22 @@ bool *ray_wait(const ray_bytes_t *ids, size_t count, size_t num_objects, int tim
 /// 读值，0 字节在那里永久等待。所以每个引用参数都要在构造 TaskArg 之前拒掉，
 /// 抛出的消息由入口的 RAY_CATCH 存进 ray_last_error_bytes()。
 static void check_reference_arg_ids(const ray_bytes_t *args, size_t arg_count,
-                                    const bool *is_ref) {
-    if (!is_ref) return;
+                                    const bool *is_ref, size_t is_ref_count) {
     if (arg_count > 0 && !args) {
         throw std::invalid_argument("argument array is null");
+    }
+    if (!is_ref) {
+        if (is_ref_count != 0) {
+            throw std::invalid_argument(
+                "is_ref is null with non-zero is_ref_count (" +
+                std::to_string(is_ref_count) + ")");
+        }
+        return;
+    }
+    if (is_ref_count != arg_count) {
+        throw std::invalid_argument(
+            "is_ref_count (" + std::to_string(is_ref_count) +
+            ") does not match arg_count (" + std::to_string(arg_count) + ")");
     }
     for (size_t i = 0; i < arg_count; i++) {
         if (!is_ref[i]) continue;
@@ -1633,8 +1677,8 @@ static void check_reference_arg_ids(const ray_bytes_t *args, size_t arg_count,
 
 /// Helper: build TaskArg vector for CPP tasks.
 /// `is_ref` array marks which args are ObjectRef references (pass by ID)
-/// vs value args (pass by serialized msgpack). It must be NULL or have one
-/// entry per arg; the Rust side rejects any other length.
+/// vs value args (pass by serialized msgpack). `is_ref == NULL` requires
+/// `is_ref_count == 0`, and `is_ref != NULL` requires `is_ref_count == arg_count`.
 ///
 /// In local mode there is no core worker to deliver the referenced object, so a
 /// reference arg is read into a value before submission, the same thing the SDK
@@ -1648,8 +1692,9 @@ static void check_reference_arg_ids(const ray_bytes_t *args, size_t arg_count,
 static std::vector<ray::internal::TaskArg>
 build_task_args_cpp(ray::internal::RayRuntime *runtime,
                     const ray_bytes_t *args, size_t arg_count,
-                    const bool *is_ref = nullptr) {
-    check_reference_arg_ids(args, arg_count, is_ref);
+                    const bool *is_ref = nullptr,
+                    size_t is_ref_count = 0) {
+    check_reference_arg_ids(args, arg_count, is_ref, is_ref_count);
     std::vector<ray::internal::TaskArg> task_args;
     task_args.reserve(arg_count);
     for (size_t i = 0; i < arg_count; i++) {
@@ -1688,8 +1733,9 @@ build_task_args_cpp(ray::internal::RayRuntime *runtime,
 /// where xlang_header = [msgpack_int(data_len)] [zero_padding to XLANG_HEADER_LEN]
 static std::vector<ray::internal::TaskArg>
 build_task_args_python(const ray_bytes_t *args, size_t arg_count,
-                       const bool *is_ref = nullptr) {
-    check_reference_arg_ids(args, arg_count, is_ref);
+                       const bool *is_ref = nullptr,
+                       size_t is_ref_count = 0) {
+    check_reference_arg_ids(args, arg_count, is_ref, is_ref_count);
     std::vector<ray::internal::TaskArg> task_args;
     task_args.reserve(arg_count * 2);
     for (size_t i = 0; i < arg_count; i++) {
@@ -1747,6 +1793,7 @@ ray_bytes_t ray_task_call_with_options(const char *func_name,
                                          const ray_bytes_t *args,
                                          size_t arg_count,
                                          const bool *is_ref,
+                                         size_t is_ref_count,
                                          const char *options_json) {
     ray_clear_error();
     if (!func_name) {
@@ -1758,12 +1805,13 @@ ray_bytes_t ray_task_call_with_options(const char *func_name,
         ray::internal::RemoteFunctionHolder holder{std::move(fn)};
         // 引用参数先在这里查一次（`build_task_args_cpp` 内部还会再查，幂等），让引用参数
         // 错误优先于关闭错误，与 `ray_c.h` 的判定次序一致。
-        check_reference_arg_ids(args, arg_count, is_ref);
+        check_reference_arg_ids(args, arg_count, is_ref, is_ref_count);
 
         auto runtime = runtime_for_call();
         if (!runtime) return ray_bytes_t{nullptr, 0};
 
-        auto task_args = build_task_args_cpp(runtime.get(), args, arg_count, is_ref);
+        auto task_args =
+            build_task_args_cpp(runtime.get(), args, arg_count, is_ref, is_ref_count);
 
         // The SDK leaves bundle_index uninitialized in CallOptions; -1 means
         // "any bundle" and must be set before parse_call_options may leave it.
@@ -1783,6 +1831,7 @@ static ray_bytes_t submit_python_task(const char *module_name,
                                       const ray_bytes_t *args,
                                       size_t arg_count,
                                       const bool *is_ref,
+                                      size_t is_ref_count,
                                       const char *options_json) {
     ray_clear_error();
     try {
@@ -1819,7 +1868,7 @@ static ray_bytes_t submit_python_task(const char *module_name,
         }
         // 引用参数先在这里查一次（`build_task_args_python` 内部还会再查，幂等），让引用
         // 参数错误优先于关闭错误，与 `ray_c.h` 的判定次序一致。
-        check_reference_arg_ids(args, arg_count, is_ref);
+        check_reference_arg_ids(args, arg_count, is_ref, is_ref_count);
         auto runtime = runtime_for_call();
         if (!runtime) return ray_bytes_t{nullptr, 0};
         if (runtime->IsLocalMode()) {
@@ -1847,7 +1896,7 @@ static ray_bytes_t submit_python_task(const char *module_name,
             std::string(module_name), std::string(function_name),
             "", ray::internal::LangType::PYTHON);
 
-        auto task_args = build_task_args_python(args, arg_count, is_ref);
+        auto task_args = build_task_args_python(args, arg_count, is_ref, is_ref_count);
 
         // 与 ray_task_call_with_options 同一顺序：SDK 把 CallOptions 的 bundle_index
         // 留成未初始化，先置 -1（group 内任意 bundle）再解析 options。
@@ -1876,9 +1925,10 @@ ray_bytes_t ray_task_call_python(const char *module_name,
                                   const char *function_name,
                                   const ray_bytes_t *args,
                                   size_t arg_count,
-                                  const bool *is_ref) {
+                                  const bool *is_ref,
+                                  size_t is_ref_count) {
     return submit_python_task(module_name, function_name, args, arg_count, is_ref,
-                              nullptr);
+                              is_ref_count, nullptr);
 }
 
 /// Call a Python remote function with full CallOptions.
@@ -1888,9 +1938,10 @@ ray_bytes_t ray_task_call_python_with_options(const char *module_name,
                                               const ray_bytes_t *args,
                                               size_t arg_count,
                                               const bool *is_ref,
+                                              size_t is_ref_count,
                                               const char *options_json) {
     return submit_python_task(module_name, function_name, args, arg_count, is_ref,
-                              options_json);
+                              is_ref_count, options_json);
 }
 
 // ─── Actor ────────────────────────────────────────────────────
@@ -2076,7 +2127,8 @@ ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
                             const char *func_name,
                             const ray_bytes_t *args,
                             size_t arg_count,
-                            const bool *is_ref = nullptr) {
+                            const bool *is_ref,
+                            size_t is_ref_count) {
     ray_clear_error();
     try {
         if (check_actor_id(actor_id_data, actor_id_len) != 0)
@@ -2095,12 +2147,13 @@ ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
         ray::internal::RemoteFunctionHolder holder(fn);
         // 引用参数先在这里查一次（`build_task_args_cpp` 内部还会再查，幂等），让引用参数
         // 错误优先于关闭错误，与 `ray_c.h` 的判定次序一致。
-        check_reference_arg_ids(args, arg_count, is_ref);
+        check_reference_arg_ids(args, arg_count, is_ref, is_ref_count);
 
         auto runtime = runtime_for_call();
         if (!runtime) return ray_bytes_t{nullptr, 0};
 
-        auto task_args = build_task_args_cpp(runtime.get(), args, arg_count, is_ref);
+        auto task_args =
+            build_task_args_cpp(runtime.get(), args, arg_count, is_ref, is_ref_count);
 
         std::string actor_id(actor_id_data, actor_id_len);
         ray::internal::CallOptions options;
@@ -2118,7 +2171,8 @@ ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len
                                     const char *method_name,
                                     const ray_bytes_t *args,
                                     size_t arg_count,
-                                    const bool *is_ref) {
+                                    const bool *is_ref,
+                                    size_t is_ref_count) {
     ray_clear_error();
     try {
         // 次序按参数次序：actor id 是第一个参数，宽度检查先报；id 合法之后才轮到方法
@@ -2165,7 +2219,7 @@ ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len
         }
         // 引用参数先在这里查一次（`build_task_args_python` 内部还会再查，幂等），让引用
         // 参数错误优先于关闭错误，与 `ray_c.h` 的判定次序一致。
-        check_reference_arg_ids(args, arg_count, is_ref);
+        check_reference_arg_ids(args, arg_count, is_ref, is_ref_count);
         auto runtime = runtime_for_call();
         if (!runtime) return ray_bytes_t{nullptr, 0};
         if (runtime->IsLocalMode()) {
@@ -2192,7 +2246,7 @@ ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len
             "", std::string(method_name), "",
             ray::internal::LangType::PYTHON);
 
-        auto task_args = build_task_args_python(args, arg_count, is_ref);
+        auto task_args = build_task_args_python(args, arg_count, is_ref, is_ref_count);
 
         std::string actor_id(actor_id_data, actor_id_len);
         ray::internal::CallOptions options;
@@ -2827,9 +2881,6 @@ ray_bytes_t ray_actor_handle_deserialize(const char *serialized_data,
 
 // ─── Placement Group ──────────────────────────────────────────
 
-// nlohmann/json is shipped with the Ray C++ SDK headers.
-#include <nlohmann/json.hpp>
-
 ray_bytes_t ray_placement_group_create(const char *name,
                                         const char *bundles_json,
                                         int strategy) {
@@ -3150,14 +3201,21 @@ int ray_cancel(const char *id_data, size_t id_len, bool force_kill, bool recursi
             return -1;
         }
 
+        std::string sym_err;
+        auto cw_get = rayrust_abi::resolve_core_worker_get(sym_err);
+        auto cw_cancel =
+            cw_get ? rayrust_abi::resolve_core_worker_cancel_task(sym_err) : nullptr;
+        auto st_dtor = cw_cancel ? rayrust_abi::resolve_status_dtor(sym_err) : nullptr;
+        if (!cw_get || !cw_cancel || !st_dtor) {
+            set_last_error(sym_err.c_str());
+            return -1;
+        }
+
         ray::ObjectID object_id(id_data, id_len);
-        auto &core_worker = ray::core::CoreWorkerProcess::GetCoreWorker();
-        ray::Status status = core_worker.CancelTask(object_id, force_kill, recursive);
+        ray::Status status = cw_cancel(&cw_get(), object_id, force_kill, recursive);
         if (!status.ok()) {
-            // The SDK exports ~Status but not ToString/CodeAsString/message(), so
-            // no Ray failure text is readable here, and cancelling an already
-            // finished task returns OK, so a no-op cancel is not reported either.
-            set_last_error("the core worker refused the cancellation");
+            std::string detail = status.ToString();
+            set_last_error(("the core worker refused the cancellation: " + detail).c_str());
             return -1;
         }
         return 0;

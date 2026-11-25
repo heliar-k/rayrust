@@ -211,6 +211,7 @@ fn check_29_entries() {
             std::ptr::null(),
             0,
             std::ptr::null(),
+            0,
             std::ptr::null(),
         )
     };
@@ -229,6 +230,7 @@ fn check_29_entries() {
             std::ptr::null(),
             0,
             std::ptr::null(),
+            0,
         )
     };
     let empty = res.data.is_null();
@@ -246,6 +248,7 @@ fn check_29_entries() {
             std::ptr::null(),
             0,
             std::ptr::null(),
+            0,
             std::ptr::null(),
         )
     };
@@ -293,6 +296,7 @@ fn check_29_entries() {
             std::ptr::null(),
             0,
             std::ptr::null(),
+            0,
         )
     };
     let empty = res.data.is_null();
@@ -311,6 +315,7 @@ fn check_29_entries() {
             std::ptr::null(),
             0,
             std::ptr::null(),
+            0,
         )
     };
     let empty = res.data.is_null();
@@ -687,6 +692,49 @@ fn main() {
     }
     println!(
         "  ray_gauge_create / ray_metric_get_name / ray_metric_destroy 在关闭后正常完成且无错误"
+    );
+
+    // 检查三个 ABI/版本诊断入口在关闭后不受关闭闸门拒绝且不留错误
+    sys::clear_error();
+    let raw_build_ver = unsafe { sys::ray_build_sdk_version() };
+    let build_ver_guard = sys::CBytesGuard::from(raw_build_ver)
+        .unwrap_or_else(|| fail("关闭后 ray_build_sdk_version 返回空指针".to_string()));
+    if build_ver_guard.as_slice() != sys::BUILD_RAY_VERSION.as_bytes()
+        || sys::last_error().is_some()
+    {
+        fail(format!(
+            "关闭后 ray_build_sdk_version 异常: err={:?}",
+            sys::last_error()
+        ));
+    }
+    drop(build_ver_guard);
+
+    sys::clear_error();
+    let raw_loaded_ver = unsafe { sys::ray_loaded_sdk_version() };
+    let loaded_ver_guard = sys::CBytesGuard::from(raw_loaded_ver)
+        .unwrap_or_else(|| fail("关闭后 ray_loaded_sdk_version 返回空指针".to_string()));
+    if loaded_ver_guard.as_slice() != sys::BUILD_RAY_VERSION.as_bytes()
+        || sys::last_error().is_some()
+    {
+        fail(format!(
+            "关闭后 ray_loaded_sdk_version 异常: err={:?}",
+            sys::last_error()
+        ));
+    }
+    drop(loaded_ver_guard);
+
+    let sym_fm = CString::new("_ZN3ray8internal18GetFunctionManagerEv").unwrap();
+    sys::clear_error();
+    let sym_rc = unsafe { sys::ray_check_private_symbol(sym_fm.as_ptr()) };
+    if sym_rc != 0 || sys::last_error().is_some() {
+        fail(format!(
+            "关闭后 ray_check_private_symbol 失败: rc={}, err={:?}",
+            sym_rc,
+            sys::last_error()
+        ));
+    }
+    println!(
+        "  ray_build_sdk_version / ray_loaded_sdk_version / ray_check_private_symbol 在关闭后正常完成且无错误"
     );
 
     // 6. 关闭进行中的拒绝（仅在 local 模式跑）

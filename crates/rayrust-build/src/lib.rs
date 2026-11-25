@@ -1,39 +1,34 @@
 //! Build-time Ray C++ SDK locator and opt-in PyPI wheel fetcher.
 //!
 //! SDK lookup order:
-//! 1. `RAY_CPP_DIR` (used as given; version is not checked)
+//! 1. `RAY_CPP_DIR` (used as given; version is not checked during lookup)
 //! 2. Shared cache `<cache_root>/ray-cpp-<version>-<platform>/` (with optional `.sha256` pin file)
 //! 3. `python3` (`ray/cpp` on `sys.path` whose `ray.__version__` equals `RAY_VERSION`)
 //! 4. Opt-in PyPI wheel download (`RAYRUST_DOWNLOAD=1`), verified against `digests.sha256`
 //!
-//! Runtime version handshake boundary (issue #12):
-//! - The public headers shipped in `ray-cpp` (`include/ray/api.h`, `include/ray/api/*.h`) declare
-//!   neither a version query nor a GCS entry point.
-//! - `libray_api.so` does export C++ symbols for `ray::gcs::GlobalStateAccessor` (`Connect`,
-//!   `GetInternalKV`, `GetAllNodeInfo`, etc.) and `GcsClient` (inspectable via
-//!   `nm -D --defined-only libray_api.so | grep -E 'GlobalStateAccessor|GcsClient' | c++filt`),
-//!   all versioned with `@@VERSION_1.0` as private symbols whose declarations are omitted from the
-//!   SDK; calling them requires hand-written private declarations and matching the `std::string`
-//!   ABI tracked in #19.
-//! - No exported symbol carries the Ray version string
-//!   (`nm -D --defined-only libray_api.so | grep -i version | grep -Ev 'VERSION_1.0|FLAGS_'`).
-//! - Upstream records the cluster version on internal paths: GCS fills
-//!   `CheckAliveReply.ray_version` in `GcsNodeManager::HandleCheckAlive`
-//!   (`src/ray/gcs/gcs_node_manager.cc:154-166`, set at `:158`), which only the raylet calls
-//!   (`src/ray/raylet/node_manager.cc:442`); Python reads cluster metadata from GCS internal KV in
-//!   `get_cluster_metadata` (`ray/_common/usage/usage_lib.py:841-862`) and compares it against
-//!   `ray.__version__` in `_check_ray_version` (`ray/scripts/scripts.py:69-79`).
-//!
-//! Automatic runtime cluster version comparison is therefore deferred to #19; build scripts emit a
-//! `cargo:warning` recording the resolved SDK path, source, and Ray version for manual comparison
-//! with `ray.__version__` on the cluster.
+//! Build-time probing and runtime version handshake:
+//! - [`probe_sdk_version`] inspects `lib/libray_api.so` (reading `_ZL11kRayVersion` from ELF64
+//!   `SHT_SYMTAB`, embedded from `src/ray/common/constants.h:68` at
+//!   `src/ray/core_worker/core_worker_process.cc:780-785`) and falls back to `../_version.py` when
+//!   available.
+//! - `rayrust-sys/build.rs` records the probed version as `RAYRUST_BUILD_RAY_VERSION` and probes
+//!   `ray::RuntimeEnv::Deserialize` in `libray_api.so` to match `_GLIBCXX_USE_CXX11_ABI`.
+//! - At runtime, `ray_init` and worker callback entries verify `kRayVersion` in the loaded
+//!   `libray_api.so`; in cluster mode, `ray_init` also queries GCS internal KV
+//!   `("cluster", "CLUSTER_METADATA")` via `dlsym`-resolved
+//!   `ray::gcs::GlobalStateAccessor::GetInternalKV`
+//!   (`src/ray/gcs_rpc_client/global_state_accessor.cc:375-382`) to verify `ray_version` written
+//!   by `Node._write_cluster_info_to_kv` (`python/ray/_private/node.py:1295-1344`),
+//!   `put_cluster_metadata` (`python/ray/_common/usage/usage_lib.py:521-543`), and
+//!   `_generate_cluster_metadata` (same file `:401-434`), matching `get_cluster_metadata`
+//!   (`:841-862`) and `_check_ray_version` (`python/ray/scripts/scripts.py:69-78`).
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fmt::{self, Write as _};
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
@@ -366,6 +361,221 @@ pub fn version_matches(installed: &str, requested: &str) -> bool {
     let req = requested.trim();
     // Empty installed version means ray.__version__ is unavailable, so ABI compatibility cannot be verified.
     !inst.is_empty() && !req.is_empty() && inst == req
+}
+
+fn read_u16_le(buf: &[u8], pos: usize) -> Option<u16> {
+    let slice = buf.get(pos..pos.checked_add(2)?)?;
+    Some(u16::from_le_bytes([slice[0], slice[1]]))
+}
+
+fn read_u32_le(buf: &[u8], pos: usize) -> Option<u32> {
+    let slice = buf.get(pos..pos.checked_add(4)?)?;
+    Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn read_u64_le(buf: &[u8], pos: usize) -> Option<u64> {
+    let slice = buf.get(pos..pos.checked_add(8)?)?;
+    Some(u64::from_le_bytes([
+        slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+    ]))
+}
+
+#[derive(Clone, Copy)]
+struct Elf64Shdr {
+    sh_type: u32,
+    sh_addr: u64,
+    sh_offset: u64,
+    sh_size: u64,
+    sh_link: u32,
+    sh_entsize: u64,
+}
+
+fn parse_elf64_shdr(raw: &[u8]) -> Option<Elf64Shdr> {
+    if raw.len() < 64 {
+        return None;
+    }
+    Some(Elf64Shdr {
+        sh_type: read_u32_le(raw, 4)?,
+        sh_addr: read_u64_le(raw, 16)?,
+        sh_offset: read_u64_le(raw, 24)?,
+        sh_size: read_u64_le(raw, 32)?,
+        sh_link: read_u32_le(raw, 40)?,
+        sh_entsize: read_u64_le(raw, 56)?,
+    })
+}
+
+fn is_valid_version_ascii(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && bytes.iter().all(|&b| b.is_ascii_graphic())
+}
+
+fn probe_elf64_kray_version(so_path: &Path) -> Option<String> {
+    const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
+    const ELFCLASS64: u8 = 2;
+    const ELFDATA2LSB: u8 = 1;
+    const SHT_SYMTAB: u32 = 2;
+    const SHT_STRTAB: u32 = 3;
+    const SHT_NOBITS: u32 = 8;
+    const TARGET_SYM: &[u8] = b"_ZL11kRayVersion\0";
+
+    let mut file = fs::File::open(so_path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    if file_len < 64 {
+        return None;
+    }
+
+    let mut ehdr = [0u8; 64];
+    file.read_exact(&mut ehdr).ok()?;
+    if &ehdr[0..4] != ELF_MAGIC || ehdr[4] != ELFCLASS64 || ehdr[5] != ELFDATA2LSB {
+        return None;
+    }
+
+    let e_shoff = read_u64_le(&ehdr, 40)?;
+    let e_shentsize = u64::from(read_u16_le(&ehdr, 58)?);
+    let e_shnum = usize::from(read_u16_le(&ehdr, 60)?);
+    if e_shoff == 0 || e_shentsize < 64 || e_shnum == 0 {
+        return None;
+    }
+
+    let sh_table_bytes = e_shentsize.checked_mul(e_shnum as u64)?;
+    if e_shoff.checked_add(sh_table_bytes)? > file_len {
+        return None;
+    }
+    let sh_table_len = usize::try_from(sh_table_bytes).ok()?;
+    let mut sh_table = vec![0u8; sh_table_len];
+    file.seek(SeekFrom::Start(e_shoff)).ok()?;
+    file.read_exact(&mut sh_table).ok()?;
+
+    let shentsize = usize::try_from(e_shentsize).ok()?;
+    let mut sections = Vec::with_capacity(e_shnum);
+    for idx in 0..e_shnum {
+        let start = idx.checked_mul(shentsize)?;
+        let raw = sh_table.get(start..start.checked_add(shentsize)?)?;
+        sections.push(parse_elf64_shdr(raw)?);
+    }
+
+    for sec in &sections {
+        if sec.sh_type != SHT_SYMTAB {
+            continue;
+        }
+        if sec.sh_entsize < 24 || sec.sh_size < sec.sh_entsize {
+            continue;
+        }
+        if sec.sh_offset.checked_add(sec.sh_size)? > file_len {
+            return None;
+        }
+        let str_idx = sec.sh_link as usize;
+        let str_sec = sections.get(str_idx)?;
+        if str_sec.sh_type != SHT_STRTAB || str_sec.sh_size == 0 {
+            continue;
+        }
+        if str_sec.sh_offset.checked_add(str_sec.sh_size)? > file_len {
+            return None;
+        }
+
+        let sym_len = usize::try_from(sec.sh_size).ok()?;
+        let str_len = usize::try_from(str_sec.sh_size).ok()?;
+        let sym_step = usize::try_from(sec.sh_entsize).ok()?;
+
+        let mut symtab = vec![0u8; sym_len];
+        file.seek(SeekFrom::Start(sec.sh_offset)).ok()?;
+        file.read_exact(&mut symtab).ok()?;
+
+        let mut strtab = vec![0u8; str_len];
+        file.seek(SeekFrom::Start(str_sec.sh_offset)).ok()?;
+        file.read_exact(&mut strtab).ok()?;
+
+        let mut pos = 0usize;
+        while let Some(end) = pos.checked_add(sym_step) {
+            if end > symtab.len() {
+                break;
+            }
+            let entry = &symtab[pos..end];
+            pos = end;
+
+            let st_name = read_u32_le(entry, 0)? as usize;
+            let st_shndx = read_u16_le(entry, 6)? as usize;
+            let st_value = read_u64_le(entry, 8)?;
+
+            let Some(name_slice) = strtab.get(st_name..st_name.checked_add(TARGET_SYM.len())?)
+            else {
+                continue;
+            };
+            if name_slice != TARGET_SYM {
+                continue;
+            }
+            if st_shndx == 0 {
+                return None;
+            }
+            let target_sec = sections.get(st_shndx)?;
+            if target_sec.sh_type == SHT_NOBITS {
+                return None;
+            }
+            if target_sec.sh_offset.checked_add(target_sec.sh_size)? > file_len {
+                return None;
+            }
+            let rel = st_value.checked_sub(target_sec.sh_addr)?;
+            if rel >= target_sec.sh_size {
+                return None;
+            }
+            let str_file_pos = target_sec.sh_offset.checked_add(rel)?;
+            let remaining = target_sec.sh_size - rel;
+            let read_cap = usize::try_from(remaining.min(256)).ok()?;
+            let mut raw_ver = vec![0u8; read_cap];
+            file.seek(SeekFrom::Start(str_file_pos)).ok()?;
+            file.read_exact(&mut raw_ver).ok()?;
+
+            let nul_pos = raw_ver.iter().position(|&b| b == 0)?;
+            let ver_bytes = &raw_ver[..nul_pos];
+            if !is_valid_version_ascii(ver_bytes) {
+                return None;
+            }
+            return std::str::from_utf8(ver_bytes).ok().map(str::to_string);
+        }
+    }
+    None
+}
+
+fn probe_parent_version_py(cpp_dir: &Path) -> Option<String> {
+    let version_py = cpp_dir.parent()?.join("_version.py");
+    let contents = fs::read_to_string(version_py).ok()?;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("version") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let rhs = rest.trim();
+        let unquoted = rhs
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .or_else(|| rhs.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')));
+        if let Some(ver) = unquoted {
+            if is_valid_version_ascii(ver.as_bytes()) {
+                return Some(ver.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Probe the exact Ray version embedded in `cpp_dir`.
+///
+/// Priority:
+/// 1. `cpp_dir/lib/libray_api.so` ELF64 `SHT_SYMTAB` local symbol `_ZL11kRayVersion`.
+/// 2. `cpp_dir/../_version.py` (`version = "..."` or `version = '...'`).
+///
+/// Unreadable, non-ELF, or stripped files without `../_version.py` return `None`.
+pub fn probe_sdk_version(cpp_dir: &Path) -> Option<String> {
+    let so_path = cpp_dir.join("lib").join("libray_api.so");
+    if so_path.is_file() {
+        if let Some(ver) = probe_elf64_kray_version(&so_path) {
+            return Some(ver);
+        }
+    }
+    probe_parent_version_py(cpp_dir)
 }
 
 const PYTHON_PROBE_SCRIPT: &str = "\
@@ -1395,5 +1605,143 @@ mod tests {
                 "cargo:warning=Using Ray C++ SDK at /opt/ray/cpp (from download, Ray 2.60.0, sha256 {digest})"
             )
         );
+    }
+
+    fn build_minimal_elf64_with_kray_version(version: &str) -> Vec<u8> {
+        let mut rodata = Vec::new();
+        rodata.extend_from_slice(b"pad\0");
+        let ver_offset_in_rodata = rodata.len() as u64;
+        rodata.extend_from_slice(version.as_bytes());
+        rodata.push(0);
+
+        let mut strtab = vec![0u8];
+        let sym_name_offset = strtab.len() as u32;
+        strtab.extend_from_slice(b"_ZL11kRayVersion\0");
+
+        // Section indices: 0 = SHT_NULL, 1 = .rodata, 2 = .strtab, 3 = .symtab
+        let rodata_vaddr: u64 = 0x400000;
+        let mut symtab = vec![0u8; 48]; // two 24-byte Elf64_Sym entries (0 = null, 1 = _ZL11kRayVersion)
+        symtab[24..28].copy_from_slice(&sym_name_offset.to_le_bytes());
+        symtab[28] = 0x01; // STB_LOCAL | STT_OBJECT
+        symtab[30..32].copy_from_slice(&1u16.to_le_bytes()); // st_shndx = 1 (.rodata)
+        let sym_val = rodata_vaddr + ver_offset_in_rodata;
+        symtab[32..40].copy_from_slice(&sym_val.to_le_bytes());
+        symtab[40..48].copy_from_slice(&((version.len() + 1) as u64).to_le_bytes());
+
+        let ehdr_size = 64usize;
+        let rodata_file_off = ehdr_size;
+        let strtab_file_off = rodata_file_off + rodata.len();
+        let symtab_file_off = strtab_file_off + strtab.len();
+        let shoff = symtab_file_off + symtab.len();
+
+        let write_shdr = |out: &mut Vec<u8>,
+                          sh_type: u32,
+                          sh_addr: u64,
+                          sh_offset: u64,
+                          sh_size: u64,
+                          sh_link: u32,
+                          sh_entsize: u64| {
+            let mut sh = [0u8; 64];
+            sh[4..8].copy_from_slice(&sh_type.to_le_bytes());
+            sh[16..24].copy_from_slice(&sh_addr.to_le_bytes());
+            sh[24..32].copy_from_slice(&sh_offset.to_le_bytes());
+            sh[32..40].copy_from_slice(&sh_size.to_le_bytes());
+            sh[40..44].copy_from_slice(&sh_link.to_le_bytes());
+            sh[56..64].copy_from_slice(&sh_entsize.to_le_bytes());
+            out.extend_from_slice(&sh);
+        };
+
+        let mut elf = vec![0u8; ehdr_size];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // ELFDATA2LSB
+        elf[6] = 1; // EV_CURRENT
+        elf[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
+        elf[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+        elf[60..62].copy_from_slice(&4u16.to_le_bytes()); // e_shnum
+
+        elf.extend_from_slice(&rodata);
+        elf.extend_from_slice(&strtab);
+        elf.extend_from_slice(&symtab);
+
+        // shdr 0: SHT_NULL
+        write_shdr(&mut elf, 0, 0, 0, 0, 0, 0);
+        // shdr 1: .rodata (SHT_PROGBITS = 1)
+        write_shdr(
+            &mut elf,
+            1,
+            rodata_vaddr,
+            rodata_file_off as u64,
+            rodata.len() as u64,
+            0,
+            0,
+        );
+        // shdr 2: .strtab (SHT_STRTAB = 3)
+        write_shdr(
+            &mut elf,
+            3,
+            0,
+            strtab_file_off as u64,
+            strtab.len() as u64,
+            0,
+            0,
+        );
+        // shdr 3: .symtab (SHT_SYMTAB = 2, sh_link = 2, sh_entsize = 24)
+        write_shdr(
+            &mut elf,
+            2,
+            0,
+            symtab_file_off as u64,
+            symtab.len() as u64,
+            2,
+            24,
+        );
+        elf
+    }
+
+    #[test]
+    fn probe_sdk_version_reads_elf64_and_parent_version_py() {
+        let base = test_case_dir("probe_sdk_version");
+        let ray_pkg = base.join("ray");
+        let cpp_dir = ray_pkg.join("cpp");
+        populate_fake_sdk(&cpp_dir);
+
+        // Fake non-ELF .so without _version.py returns None.
+        assert_eq!(probe_sdk_version(&cpp_dir), None);
+
+        // Fallback to ../_version.py with double and single quotes.
+        let version_py = ray_pkg.join("_version.py");
+        fs::write(&version_py, "commit = \"abc\"\nversion = \"2.60.0\"\n")
+            .expect("write _version.py");
+        assert_eq!(probe_sdk_version(&cpp_dir).as_deref(), Some("2.60.0"));
+
+        fs::write(&version_py, "version = '2.49.0'\n").expect("write single-quoted _version.py");
+        assert_eq!(probe_sdk_version(&cpp_dir).as_deref(), Some("2.49.0"));
+
+        // Valid ELF64 .symtab takes priority over ../_version.py.
+        let elf_bytes = build_minimal_elf64_with_kray_version("2.55.0");
+        let so_path = cpp_dir.join("lib").join("libray_api.so");
+        fs::write(&so_path, &elf_bytes).expect("write minimal ELF64");
+        assert_eq!(probe_sdk_version(&cpp_dir).as_deref(), Some("2.55.0"));
+
+        // Truncated ELF prefixes fall back cleanly without panicking.
+        let _ = fs::remove_file(&version_py);
+        for len in [0usize, 4, 63, 64, elf_bytes.len() - 1] {
+            fs::write(&so_path, &elf_bytes[..len]).expect("write truncated ELF");
+            assert_eq!(
+                probe_sdk_version(&cpp_dir),
+                None,
+                "truncated length {len} must return None"
+            );
+        }
+
+        // If RAY_CPP_DIR points to a real SDK on this host, verify probe_sdk_version succeeds.
+        if let Ok(real_dir) = env::var("RAY_CPP_DIR") {
+            let p = Path::new(&real_dir);
+            if p.join("lib").join("libray_api.so").is_file() {
+                let probed = probe_sdk_version(p).expect("probe real RAY_CPP_DIR");
+                assert!(!probed.is_empty());
+            }
+        }
     }
 }
