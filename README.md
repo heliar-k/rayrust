@@ -367,16 +367,50 @@ let futs = (0..10).map(|i| add_remote_async(&ray, i, 1));
 
 ## Benchmark
 
-Rust vs Python on Ray cluster (500 tasks):
-
 ![Benchmark](docs/benchmark.svg)
 
-| Metric | Rust | Python | Speedup |
+### Environment & Methodology
+
+- **Host**: `2 × AMD EPYC 7542 32-Core Processor` (64 cores / 128 threads), 377 GiB RAM, Linux 5.10 `x86_64`
+- **Cluster**: Single-node Ray 2.56.1 cluster (`--num-cpus=16`, `127.0.0.1` loopback)
+- **Build & runtime**: `rustc 1.100.0` (`--release`), `rayrust 0.2.1`, `Python 3.12.3`, `ray[cpp]==2.56.1`
+- **Methodology**: 5 independent runs after warming all 16 C++ and 16 Python workers; cells report **median (`min–max` across 5 runs)**
+
+### 1. SDK Dispatch & Object-Store Overhead
+
+Tiny-task round-trips (`add(a, b)`) are dominated by cross-process gRPC, raylet scheduling, and object-store fetches, putting `rayrust` (via `libray_api.so`) and `Ray Python` in the same latency band. For concurrent fan-out, `Ray::get_many_async` issues a single batched `Wait` and doubles throughput over spawning per-reference `ObjectRef::get_async` tasks (`7,092` vs `3,554 tasks/s`).
+
+| Metric | Rust (`rayrust`) | Python (`ray`) | Median Ratio |
 |---|---|---|---|
-| Async throughput | 4744 tasks/sec | 1918 tasks/sec | **2.5x** |
-| Latency (median) | 617µs | 950µs | **1.5x** |
-| Compute (sum 0..1M) | 2.8ms | 652ms | **234x** |
-| Async runtime (100×50ms) | 521ms (9.6x parallel) | — | — |
+| Concurrent throughput, batched get (`N=500`, `add_remote_async` + `get_many_async` vs `ray.get(refs)`) | 7,092 tasks/s (6,724–7,493)<br>70.50 ms (66.73–74.36) | 6,274 tasks/s (4,897–7,297)<br>79.69 ms (68.52–102.09) | **1.13x** |
+| Concurrent throughput, per-ref `get_async` (`N=500`, `JoinSet` + `ObjectRef::get_async`) | 3,554 tasks/s (3,475–3,798)<br>140.69 ms (131.66–143.87) | — | — |
+| Cross-language concurrent throughput, batched get (`N=500`, Rust → Python `rayrust_test.add` + `get_many_async`) | 5,971 tasks/s (5,615–6,664)<br>83.73 ms (75.02–89.05) | 6,274 tasks/s (4,897–7,297) | **0.95x** |
+| Sequential sync throughput (`N=500`, `add_remote` + `get` vs `ray.get(add.remote)`) | 813 tasks/s (741–992)<br>614.66 ms (504.11–674.44) | 626 tasks/s (556–673)<br>798.09 ms (743.23–899.90) | **1.30x** |
+| Single-task round-trip latency, sync (`N=100`, `add(1, 2)`) | median 1.28 ms (1.15–1.32)<br>p99 1.94 ms (1.55–2.17) | median 1.50 ms (1.38–1.67)<br>p99 2.09 ms (1.72–7.94) | **1.17x** (median) |
+| Single-task round-trip latency, async (`N=100`, `add_remote_async` + `get_async`) | median 1.36 ms (1.24–1.40)<br>p99 1.95 ms (1.73–2.63) | — | **1.10x** (vs Python sync) |
+| Cross-language single-task latency (`N=100`, Rust → Python `rayrust_test.add`) | median 1.40 ms (1.34–1.62)<br>p99 2.59 ms (2.06–3.86) | median 1.50 ms (1.38–1.67) | **1.07x** (median) |
+| Async worker concurrency (`100 × 50 ms` tokio sleep on 16 CPUs; 7 waves = `350 ms` floor) | 371.17 ms (370.87–373.45) | — | **13.47x** (13.39–13.48x vs `5,000 ms` serial) |
+| Complex payload round-trip (`100 × 100` nested `i64` list, `N=50` sequential `echo_list`) | 3.43 ms/iter (3.18–5.70)<br>pure msgpack 128.35 µs · `put` 561.69 µs | 4.03 ms/iter (2.75–4.53) | **1.17x** |
+
+### 2. Task-Body Execution Speed — Language Comparison
+
+Task-body execution speed (compiled Rust `--release` vs interpreted CPython 3.12 language comparison), timed end-to-end across submission, worker execution, and batched result retrieval (`get_many_async` / `ray.get(refs)`) for 10 concurrent tasks:
+
+| Workload | Compiled Rust (`compute`) | Interpreted CPython (`pybench.py` driver) | Interpreted CPython (`raybench` xlang `rayrust_test.compute`) | Task-Body Speedup |
+|---|---|---|---|---|
+| `sum(0..1_000_000) × 10` concurrent tasks (end-to-end batch wall time) | 3.72 ms (3.29–4.13 ms) | 37.52 ms (31.18–47.71 ms) | 34.61 ms (20.78–63.15 ms) | **10.1x** (median ratio vs Python driver)<br>**9.89x** (6.04–16.98x paired xlang median) |
+
+### Reproduce
+
+```bash
+cargo build --release --all-targets
+ray start --head --port=6379 --num-cpus=16 --include-dashboard=false
+
+RAY_ADDRESS=127.0.0.1:6379 RAY_NODE_IP=127.0.0.1 cargo run --release --example raybench
+RAY_ADDRESS=127.0.0.1:6379 RAY_NODE_IP=127.0.0.1 python3 tests/python/pybench.py
+
+ray stop --force
+```
 
 ## Cluster Setup
 
@@ -470,7 +504,7 @@ fn main() {
 | `async_demo` | Concurrent async tasks with tokio |
 | `xlang_complex` | Cross-language complex types (11 tests) |
 | `actor_e2e` | Rust actor e2e with `#[actor]` macro |
-| `raybench` | Performance benchmark (Rust vs Python) |
+| `raybench` | SDK dispatch overhead & task-body benchmark (paired with `tests/python/pybench.py`) |
 
 ## Continuous Integration
 
