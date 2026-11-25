@@ -25,12 +25,17 @@
 //!
 //! The local mode (argv[1] = "local") runs the Rust round-trip of check 5 plus
 //! one check of its own: a C++/Rust driver's local mode runs tasks in-process
-//! through a C++ function descriptor (`local_mode_task_submitter.cc`), so
-//! Python functions cannot run there and `task_call_python` returns the
-//! in-process `nil + [3, "unknown function: ..."]` error instead of a
-//! cross-language payload. Checks 1-4 and 6 need the cluster mode, and check 7
-//! runs there only: it needs a cluster with one CPU (`--num-cpus=1`) whose single
-//! CPU is taken, which local mode has no equivalent of.
+//! through a C++ function descriptor (`LocalModeTaskSubmitter::Submit`,
+//! `cpp/src/ray/runtime/task/local_mode_task_submitter.cc:33-136`, `:39-40`),
+//! so Python functions cannot run there and `task_call_python` produces the
+//! in-process `PackError` payload `nil + [3, "unknown function: ..."]`
+//! (`TaskExecutionHandler`, `cpp/src/ray/runtime/task/task_executor.cc:29-56`,
+//! `:48`; `PackError`, `cpp/src/ray/runtime/abstract_ray_runtime.cc:31-39`).
+//! Both `get()` on `ObjectRef<()>` and `get_value()` reject that payload with
+//! `Err(RayError::Serialization)` because of the trailing error tuple after
+//! the leading `0xc0` nil byte. Checks 1-4 and 6 need the cluster mode, and
+//! check 7 runs there only: it needs a cluster with one CPU (`--num-cpus=1`)
+//! whose single CPU is taken, which local mode has no equivalent of.
 //!
 //! Environment for the cluster mode: RAY_ADDRESS, RAY_NODE_IP, RAY_WORKER_SO, and
 //! a cluster started with `--num-cpus=1`.
@@ -297,15 +302,18 @@ fn check_list_with_custom_object(ray: &Ray) {
 }
 
 /// Local mode: a Python task never reaches a Python worker, so its payload is
-/// the in-process error, not a cross-language value.
+/// the in-process `PackError` (`nil + [3, "unknown function: ..."]`).
 ///
-/// The local-mode task submitter always builds a C++ function descriptor
-/// (`local_mode_task_submitter.cc`) and the in-process executor answers an
-/// unknown function with `nil + [3, "unknown function: ..."]`
-/// (`task_executor.cc:48`). Neither shape carries a 9-byte header, so this run
-/// proves that a local run can produce no pickle5 payload at all.
+/// `LocalModeTaskSubmitter::Submit`
+/// (`cpp/src/ray/runtime/task/local_mode_task_submitter.cc:33-136`, `:39-40`)
+/// builds a C++ function descriptor and `TaskExecutionHandler`
+/// (`cpp/src/ray/runtime/task/task_executor.cc:29-56`, `:48`) answers an
+/// unknown function via `PackError`
+/// (`cpp/src/ray/runtime/abstract_ray_runtime.cc:31-39`). Both `get()` on
+/// `ObjectRef<()>` and `get_value()` reject the trailing `[3, ...]` tuple
+/// after the leading `0xc0` nil byte with `RayError::Serialization`.
 fn check_local_mode_python_task(ray: &Ray) {
-    println!("\n--- local mode: task_call_python returns the in-process error ---");
+    println!("\n--- local mode: task_call_python returns the in-process PackError ---");
     let obj_ref = ray
         .task_call_python(PYTHON_MODULE, "return_list", &[], &[])
         .expect("submit return_list() in local mode");
@@ -324,16 +332,43 @@ fn check_local_mode_python_task(ray: &Ray) {
         &raw[..raw.len().min(3)]
     );
 
-    let value = obj_ref
-        .get_value()
-        .expect("get_value() of the local-mode error");
-    assert!(
-        value.is_nil(),
-        "the local-mode error decoded to {:?}, not Nil; raw bytes {:02x?}",
-        value,
-        raw
-    );
-    println!("  get_value() → Nil ✓ (no cross-language payload exists in local mode)");
+    match obj_ref.get() {
+        Ok(()) => panic!(
+            "get() on the local-mode PackError succeeded as (); raw bytes {:02x?}",
+            raw
+        ),
+        Err(RayError::Serialization(msg)) => {
+            assert!(
+                msg.contains("trailing bytes"),
+                "get() failed without reporting trailing bytes: {}",
+                msg
+            );
+            println!("  get() → Err(RayError::Serialization({})) ✓", msg);
+        }
+        Err(other) => panic!(
+            "get() on the local-mode PackError returned {:?}, expected RayError::Serialization",
+            other
+        ),
+    }
+
+    match obj_ref.get_value() {
+        Ok(value) => panic!(
+            "get_value() on the local-mode PackError decoded to {:?}; raw bytes {:02x?}",
+            value, raw
+        ),
+        Err(RayError::Serialization(msg)) => {
+            assert!(
+                msg.contains("trailing bytes"),
+                "get_value() failed without reporting trailing bytes: {}",
+                msg
+            );
+            println!("  get_value() → Err(RayError::Serialization({})) ✓", msg);
+        }
+        Err(other) => panic!(
+            "get_value() on the local-mode PackError returned {:?}, expected RayError::Serialization",
+            other
+        ),
+    }
 }
 
 /// Check 5: values Rust wrote itself round-trip; `put_xlang` refuses local mode

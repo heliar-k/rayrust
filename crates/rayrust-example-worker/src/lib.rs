@@ -242,6 +242,12 @@ pub fn soundness_panic_sync(msg: String) -> i64 {
     panic!("{}", msg);
 }
 
+/// 在返回单元类型 `()` 的同步 `#[remote]` 任务体内触发 `panic!`。
+#[remote]
+pub fn soundness_panic_unit(msg: String) {
+    panic!("{}", msg);
+}
+
 /// 在异步 `#[remote] async fn` 跨越 `.await` 之后触发 `panic!`。
 #[remote]
 pub async fn soundness_panic_async(msg: String) -> i64 {
@@ -303,6 +309,10 @@ impl SoundnessActor {
     }
 
     fn panic_method(&mut self, msg: String) -> i64 {
+        panic!("{}", msg);
+    }
+
+    fn panic_unit_method(&mut self, msg: String) {
         panic!("{}", msg);
     }
 
