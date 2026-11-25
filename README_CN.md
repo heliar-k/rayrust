@@ -27,7 +27,7 @@ Ray 的 Rust SDK —— 通过 FFI 封装 Ray C++ SDK，提供地道的 Rust API
 | `get_actor`（命名 actor，跨 namespace） | ✅ | ✅ |
 | `cancel`（任务取消；本地模式没有取消路径，返回错误，见 #58） | ❌ | ✅ |
 | `kill_actor`（本地模式返回错误，actor 随进程结束，见 #53） | ❌ | ✅ |
-| XLANG header 自动检测（兼容 Ray 2.51.1+） | ✅ | ✅ |
+| XLANG header 自动检测（兼容 Ray 2.56.1+） | ✅ | ✅ |
 | `rmpv::Value` 动态反序列化 | ✅ | ✅ |
 | `put_xlang`（集群模式经 `CoreWorker::Put` 写入 9 字节 XLANG 头与 `XLANG` metadata；本地模式无 `CoreWorker` 与 Python 执行器，返回错误，见 #21） | ❌ | ✅ |
 | `ray_last_error_bytes()`（带长度的线程局部错误字节；Rust 提取格式化异常文本，失败时按 UTF-8 lossy 回退） | ✅ | ✅ |
@@ -261,14 +261,14 @@ libray_api.so（Ray C++ SDK）  ->  Ray Core (raylet / GCS / object store)
 
 ## 构建系统
 
-各包的 `build.rs` 共用 `rayrust-build` 获取 Ray C++ SDK：
+`rayrust` 要求 **`Ray >= 2.56.1`**，任何低于 `2.56.1` 的 `RAY_VERSION` 或 `RAY_CPP_DIR` SDK 在构建期即被拒绝。各包的 `build.rs` 共用 `rayrust-build` 获取 Ray C++ SDK：
 
-1. **`RAY_CPP_DIR` 环境变量** — 使用指定的 SDK 目录，按给定值使用，不做版本比对
+1. **`RAY_CPP_DIR` 环境变量** — 使用指定的 SDK 目录（探测最低支持版本 `>= 2.56.1`，无需与 `RAY_VERSION` 相同）
 2. **`~/.cache/rayrust/ray-cpp-{version}-{platform}/`**（或 `$RAYRUST_CACHE_DIR/ray-cpp-{version}-{platform}/`）— 共享缓存（debug + release）
 3. **`python3`（`ray[cpp]`）** — 在 `sys.path` 中查找已安装的 `ray/cpp/`，要求其 `ray` 版本与 `RAY_VERSION` 一致
 4. **显式开启从 PyPI 下载（`RAYRUST_DOWNLOAD=1`）** — 仅在启用 `RAYRUST_DOWNLOAD`（`1`/`true`/`yes`；`0`/`false`/`no` 或未设置时关闭）时执行：从 PyPI JSON 索引获取对应版本的 `ray-cpp` wheel，按 `digests.sha256` 流式校验 SHA-256（摘要写进缓存旁边的 `ray-cpp-{version}-{platform}.sha256`），解开 `ray/cpp/`。不设置该变量时构建不发出任何网络请求，失败信息列出取得 SDK 的三种办法（设置 `RAY_CPP_DIR`、`pip install ray[cpp]` 或设置 `RAYRUST_DOWNLOAD=1`）。
 
-`RAY_VERSION`（默认 `2.51.1`）决定第 2 步的缓存目录名、第 3 步的版本匹配与第 4 步下载的 wheel；第 1 步直接使用 `RAY_CPP_DIR` 给出的目录，不比对版本。缓存目录旁的 `.sha256` pin 文件记录下载时的产物身份；缓存命中时读取并校验该 pin 文件格式，每次构建不重新计算 SDK 目录内容的哈希。
+`RAY_VERSION`（默认 `2.56.1`）决定第 2 步的缓存目录名、第 3 步的版本匹配与第 4 步下载的 wheel；第 1 步直接使用 `RAY_CPP_DIR` 给出的目录并校验其版本 `>= 2.56.1`。缓存目录旁的 `.sha256` pin 文件记录下载时的产物身份；缓存命中时读取并校验该 pin 文件格式，每次构建不重新计算 SDK 目录内容的哈希。
 
 `RAY_CPP_DIR` 与 `RAYRUST_CACHE_DIR` 中的相对路径按执行 `cargo` 的目录（`PWD`；`PWD` 未设时按工作区根）解释；`~` 不做展开，需要家用目录时写 `$HOME`。
 
@@ -279,7 +279,7 @@ libray_api.so（Ray C++ SDK）  ->  Ray Core (raylet / GCS / object store)
 - `cargo:warning=Using Ray C++ SDK at <dir> (from python3, Ray <ver>)`
 - `cargo:warning=Using Ray C++ SDK at <dir> (from download, Ray <ver>, sha256 <64 个十六进制字符的摘要>)`
 
-wheel 附带的公开头文件（`include/ray/api.h`、`include/ray/api/*.h`）没有版本查询，也没有 GCS 访问入口；动态库 `libray_api.so` 导出了 `ray::gcs::GlobalStateAccessor`（`Connect`、`GetInternalKV`、`GetAllNodeInfo` 等）与 `GcsClient` 相关的 C++ 符号（可通过 `nm -D --defined-only libray_api.so | grep -E 'GlobalStateAccessor|GcsClient' | c++filt` 查看），这些符号都带有 `@@VERSION_1.0` 后缀且属于私有符号，SDK 未附带对应声明，调用它们需要手写私有声明并承接 `std::string` ABI（#19 记录了这类依赖）；导出的全部符号均不携带 Ray 版本号（`nm -D --defined-only libray_api.so | grep -i version | grep -Ev 'VERSION_1.0|FLAGS_'`）。上游在内部路径保存集群版本：GCS 在 `GcsNodeManager::HandleCheckAlive`（`src/ray/gcs/gcs_node_manager.cc:154-166`，`:158` 赋值）中写入 `CheckAliveReply.ray_version` 且仅有 raylet 调用 `CheckAlive`（`src/ray/raylet/node_manager.cc:442`），Python 侧则通过 `get_cluster_metadata` 读取 GCS 内部 KV 的 cluster metadata（`ray/_common/usage/usage_lib.py:841-862`）并在 `_check_ray_version`（`ray/scripts/scripts.py:69-79`）中拿它与 `ray.__version__` 比对。运行时的集群版本自动比对因此推迟到 #19；构建警告会输出解析到的版本，请与集群侧 `ray.__version__` 手动对照。
+构建期 `rayrust-sys/build.rs` 从 `libray_api.so` 的 ELF64 `SHT_SYMTAB` 提取 `_ZL11kRayVersion`（无符号表时读取 `../_version.py`），校验版本 `>= 2.56.1` 并记录为 `RAYRUST_BUILD_RAY_VERSION`，同时通过 `ray::RuntimeEnv::Deserialize` 导出符号探测 `_GLIBCXX_USE_CXX11_ABI` 并校验 136 字节 `ray::RayObject` 布局。运行期 `Ray::connect` 与工人回调核对已加载 `libray_api.so` 的 `kRayVersion` 与构建版本一致；集群模式下连接时通过 `dlsym` 解析的 `ray::gcs::GlobalStateAccessor::GetInternalKV` 自动读取 GCS 内部 KV `("cluster", "CLUSTER_METADATA")`，校验集群 `ray_version` 与构建版本一致（低于 `2.56.1` 时同时指明最低版本要求 `Ray >= 2.56.1`）。
 
 ## 关键设计决策
 
@@ -289,7 +289,7 @@ wheel 附带的公开头文件（`include/ray/api.h`、`include/ray/api/*.h`）�
 | C ABI 封装层 | C++ 模板无稳定 ABI |
 | `build.rs` 显式下载开关（`RAYRUST_DOWNLOAD=1`） | 默认不联网；开启后经 SHA-256 校验获取 wheel，构建无需依赖 Python 环境 |
 | 二进制安全 ID（`ptr + len`） | Ray ObjectID 可能包含 null 字节 |
-| XLANG header 自动检测 | Ray 2.51.1+ 改变了 header 格式（非零 padding） |
+| XLANG header 自动检测 | Ray 2.56.1+ header 格式（非零 padding） |
 | `rmpv::Value` 动态类型 | Python 返回类型编译时未知 |
 | 持久化全局 tokio runtime | 避免每次调用创建 runtime 的开销 |
 | `#[actor]` 宏 | 将 40 行样板代码减少到 10 行 |
@@ -359,7 +359,7 @@ Rust Actor 与 `#[remote]` 任务都使用 Ray C++ SDK 的 worker 进程（`defa
 
 ```bash
 # 在所有 worker 节点上（不仅仅是 driver 节点）：
-pip install "ray[cpp]==2.51.1"
+pip install "ray[cpp]==2.56.1"
 ```
 
 如果节点只安装了 `pip install ray`（仅 Python，没有 `[cpp]`），则缺少：
@@ -449,8 +449,8 @@ fn main() {
 
 GitHub Actions（`.github/workflows/ci.yml`）在 `ubuntu-24.04` 上通过 `actions/setup-python@v7`（Python 3.12）运行，仅验证 `linux/x86_64` 平台（CI 未测试 macOS、Windows 与 `linux/aarch64`）：
 
-- **`build` 任务** — 按版本矩阵（`2.49.0`、`2.51.1`、`2.55.0`、`2.60.0`）逐一下载并解压 `ray-cpp` wheel，将 `RAY_CPP_DIR` 指向解压出的 `ray/cpp` 目录，依次执行 `cargo build --release --all-targets`、`cargo test`、`cargo test --release`、`cargo test --doc` 与 `cargo doc --no-deps`；并在 `2.60.0` 矩阵项上清除 `RAY_CPP_DIR`、设置 `RAYRUST_DOWNLOAD=1` 与全新 `RAYRUST_CACHE_DIR` 验证显式开启的 PyPI 下载分支（首次空缓存下载的警告带有 wheel 摘要：`(from download, Ray 2.60.0, sha256 <digest>)`，再次构建复用缓存断言 `(from cache, Ray 2.60.0, sha256 <digest>)`）。
-- **`cluster` 任务** — 通过 `actions/setup-python@v7`（Python 3.12）安装 `ray[cpp]==2.51.1` 且不设置 `RAY_CPP_DIR`（验证通过 `python3` 查找已安装 SDK 的路径），设置 `RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE=1` 使对象存储大小超过 `/dev/shm` 时回退到 Ray 自己的临时目录，随后启动单节点集群（`ray start --head --num-cpus=2`），依次运行 `full_test`、`actor_e2e`、`async_demo` 与 `error_kinds_test` 四个示例，最后执行 `ray stop --force` 停止集群。
+- **`build` 任务** — 按版本矩阵（`2.56.1`、`2.58.2`、`2.60.1`）逐一下载并解压 `ray-cpp` wheel，将 `RAY_CPP_DIR` 指向解压出的 `ray/cpp` 目录，依次执行 `cargo build --release --all-targets`、`cargo test`、`cargo test --release`、`cargo test --doc` 与 `cargo doc --no-deps`；并在 `2.60.1` 矩阵项上清除 `RAY_CPP_DIR`、设置 `RAYRUST_DOWNLOAD=1` 与全新 `RAYRUST_CACHE_DIR` 验证显式开启的 PyPI 下载分支（首次空缓存下载的警告带有 wheel 摘要：`(from download, Ray 2.60.1, sha256 <digest>)`，再次构建复用缓存断言 `(from cache, Ray 2.60.1, sha256 <digest>)`）。
+- **`cluster` 任务** — 通过 `actions/setup-python@v7`（Python 3.12）安装 `ray[cpp]==2.56.1` 且不设置 `RAY_CPP_DIR`（验证通过 `python3` 查找已安装 SDK 的路径），设置 `RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE=1` 使对象存储大小超过 `/dev/shm` 时回退到 Ray 自己的临时目录，随后启动单节点集群（`ray start --head --num-cpus=2`），依次运行 `full_test`、`actor_e2e`、`async_demo`、`error_kinds_test`、`mixed_batch_test`、`worker_runtime_test`、`actor_soundness_test`、`xlang_decode_test`、`object_ref_args_test` 与 `shutdown_gate_test` 示例，最后执行 `ray stop --force` 停止集群。
 
 CI 未包含 `cargo fmt --check` 与 `cargo clippy`：仓库在 `main` 分支上已存在既有的 `rustfmt` 格式差异与 `clippy` 警告，`cargo fmt --check` 在 `main` 上无法通过。
 

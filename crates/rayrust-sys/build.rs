@@ -37,6 +37,7 @@ fn main() {
             sdk.version.clone()
         }
     };
+    rayrust_build::check_minimum_ray_version(&build_ray_version).unwrap_or_else(|e| panic!("{e}"));
 
     let so_bytes = std::fs::read(&lib_so)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", lib_so.display(), e));
@@ -69,10 +70,8 @@ fn main() {
         ),
     };
 
-    // 探测 `libray_api.so` 中 `CoreWorker::CreateOwnedAndIncrementLocalRef` 的导出符号签名，
-    // 以匹配上游 `src/ray/common/ray_object.h` 中 `ray::RayObject` 的尾部成员布局：
-    // - Ray 2.49.0 / 2.51.1：尾部为 4 字节枚举 `rpc::TensorTransport`；
-    // - Ray 2.55.0 / 2.60.0：尾部为两个 `std::optional<std::string>`。
+    // 校验 `libray_api.so` 中 `CoreWorker::CreateOwnedAndIncrementLocalRef` 的导出符号签名，
+    // 确认 `src/ray/common/ray_object.h` 中 `ray::RayObject` 尾部包含 `std::optional<std::string>`（136 字节，Ray >= 2.56.1）。
     const SYMBOL_PREFIX: &[u8] = b"_ZN3ray4core10CoreWorker31CreateOwnedAndIncrementLocalRefE";
     const OPTIONAL_STR_LEGACY: &[u8] = b"St8optionalISsE";
     const OPTIONAL_STR_CXX11: &[u8] =
@@ -88,6 +87,13 @@ fn main() {
         });
     let uses_optional_str = contains_subslice(matched_symbol, OPTIONAL_STR_LEGACY)
         || contains_subslice(matched_symbol, OPTIONAL_STR_CXX11);
+    if !uses_optional_str {
+        panic!(
+            "unsupported ray::RayObject layout in {}: symbol CoreWorker::CreateOwnedAndIncrementLocalRef lacks optional<std::string> (rayrust requires Ray >= {})",
+            lib_so.display(),
+            rayrust_build::MIN_SUPPORTED_RAY_VERSION
+        );
+    }
 
     let wrapper_dir = PathBuf::from("wrapper");
 
@@ -110,11 +116,6 @@ fn main() {
         "RAYRUST_BUILD_RAY_VERSION",
         format!("\"{build_ray_version}\"").as_str(),
     );
-    if uses_optional_str {
-        build.define("RAYRUST_RAY_OBJECT_LAYOUT_OPTIONAL_STR", "1");
-    } else {
-        build.define("RAYRUST_RAY_OBJECT_LAYOUT_ENUM", "1");
-    }
 
     build.compile("ray_c");
 

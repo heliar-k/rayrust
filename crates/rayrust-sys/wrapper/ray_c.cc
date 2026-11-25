@@ -806,10 +806,16 @@ static bool verify_cluster_version_from_gsa(ray::gcs::GlobalStateAccessor *gsa,
         return false;
     }
     const std::string cluster_version = meta["ray_version"].get<std::string>();
-    if (cluster_version != RAYRUST_BUILD_RAY_VERSION) {
+    if (cluster_version != RAYRUST_BUILD_RAY_VERSION ||
+        rayrust_abi::is_below_minimum_ray_version(cluster_version)) {
         err_out = "Ray cluster version mismatch: cluster reports Ray " +
                   cluster_version +
                   ", built against Ray C++ SDK " RAYRUST_BUILD_RAY_VERSION;
+        if (rayrust_abi::is_below_minimum_ray_version(cluster_version)) {
+            err_out += std::string("; Ray ") + cluster_version +
+                       " is unsupported; rayrust requires Ray >= " +
+                       rayrust_abi::kMinSupportedRayVersion;
+        }
         return false;
     }
     return true;
