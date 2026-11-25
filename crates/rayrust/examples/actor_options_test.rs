@@ -283,6 +283,7 @@ fn create_task_with_raw_options(options_json: &str) -> Result<Vec<u8>, RayError>
             std::ptr::null(),
             0,
             std::ptr::null(),
+            0,
             options.as_ptr(),
         )
     };
@@ -942,8 +943,8 @@ async fn default_actor_cpu_check(ray: &Ray, cluster: bool) {
 
     // f) 只有内存键：不补 CPU，照样完成。
     let memory_only_opts = ActorOptions::new().resource("memory", 1.0);
-    let memory_only = counter_actor_create(ray, &memory_only_opts, 45i64)
-        .expect("创建只有 memory 1 的 actor");
+    let memory_only =
+        counter_actor_create(ray, &memory_only_opts, 45i64).expect("创建只有 memory 1 的 actor");
     actors.push(memory_only.clone());
     let value: i64 = counter_get_sync(ray, &memory_only)
         .expect("submit get on the memory-only actor")
@@ -963,9 +964,11 @@ async fn default_actor_cpu_check(ray: &Ray, cluster: bool) {
     );
     tokio::time::sleep(Duration::from_secs(CPU_RELEASE_SETTLE_S)).await;
     for (label, call, expected) in queued {
-        let value: i64 = call.get_timeout(ACTOR_START_TIMEOUT_MS).unwrap_or_else(|error| {
-            panic!("释放 CPU 之后 {} 的 actor 调用仍没完成: {}", label, error)
-        });
+        let value: i64 = call
+            .get_timeout(ACTOR_START_TIMEOUT_MS)
+            .unwrap_or_else(|error| {
+                panic!("释放 CPU 之后 {} 的 actor 调用仍没完成: {}", label, error)
+            });
         assert_eq!(value, expected, "{} 的 actor 读到 {}", label, value);
         println!(
             "  释放 CPU 之后 {} 的 actor → get() = {}（前面的超时来自 CPU 被占住）",

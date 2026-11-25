@@ -60,6 +60,12 @@ pub const RAY_CALLBACK_ERROR: c_int = 1;
 pub const RAY_CALLBACK_INTENTIONAL_EXIT: c_int = 2;
 pub const RAY_CALLBACK_EXIT_OUTSIDE_ACTOR: c_int = 3;
 
+/// Build-time Ray C++ SDK version embedded by `rayrust-sys/build.rs`.
+pub const BUILD_RAY_VERSION: &str = env!("RAYRUST_BUILD_RAY_VERSION");
+
+/// Build-time `_GLIBCXX_USE_CXX11_ABI` setting (`"0"` or `"1"`) probed from `libray_api.so`.
+pub const BUILD_GLIBCXX_CXX11_ABI: &str = env!("RAYRUST_GLIBCXX_CXX11_ABI");
+
 // ─── extern "C" function declarations ─────────────────────────
 
 extern "C" {
@@ -96,6 +102,7 @@ extern "C" {
         args: *const RayBytes,
         arg_count: usize,
         is_ref: *const bool,
+        is_ref_count: usize,
         options_json: *const c_char,
     ) -> RayBytes;
     pub fn ray_task_call_python(
@@ -104,6 +111,7 @@ extern "C" {
         args: *const RayBytes,
         arg_count: usize,
         is_ref: *const bool,
+        is_ref_count: usize,
     ) -> RayBytes;
     pub fn ray_task_call_python_with_options(
         module_name: *const c_char,
@@ -111,6 +119,7 @@ extern "C" {
         args: *const RayBytes,
         arg_count: usize,
         is_ref: *const bool,
+        is_ref_count: usize,
         options_json: *const c_char,
     ) -> RayBytes;
 
@@ -135,6 +144,7 @@ extern "C" {
         args: *const RayBytes,
         arg_count: usize,
         is_ref: *const bool,
+        is_ref_count: usize,
     ) -> RayBytes;
     pub fn ray_actor_call_python(
         actor_id_data: *const c_char,
@@ -143,6 +153,7 @@ extern "C" {
         args: *const RayBytes,
         arg_count: usize,
         is_ref: *const bool,
+        is_ref_count: usize,
     ) -> RayBytes;
     pub fn ray_actor_kill(actor_id_data: *const c_char, actor_id_len: usize, no_restart: bool);
     pub fn ray_actor_handle_serialize(
@@ -194,6 +205,9 @@ extern "C" {
     /// 运行时是不是由别的 DSO 建的（`wrapper/ray_c.h` 的 `ray_runtime_is_borrowed`）。
     /// 1 表示本 .so 内联的 holder 为空而进程里已有别人建的运行时，也就是工人进程。
     pub fn ray_runtime_is_borrowed() -> c_int;
+    pub fn ray_build_sdk_version() -> RayBytes;
+    pub fn ray_loaded_sdk_version() -> RayBytes;
+    pub fn ray_check_private_symbol(mangled_name: *const c_char) -> c_int;
     pub fn ray_get_namespace() -> RayBytes;
     pub fn ray_get_actor(
         name: *const c_char,

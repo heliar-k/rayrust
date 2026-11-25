@@ -375,6 +375,16 @@ impl Ray {
     /// initialized, without terminating the process. A non-object value is
     /// reported by its JSON type name, so the message stays short whatever the
     /// input length.
+    ///
+    /// # Version handshake
+    ///
+    /// Before calling into the Ray C++ SDK, `connect` checks that the loaded
+    /// `libray_api.so` `kRayVersion` matches [`Ray::sdk_version`], returning
+    /// [`RayError::Ffi`] on mismatch in both local and cluster modes. In cluster
+    /// mode, `connect` also verifies `ray_version` in GCS internal KV
+    /// `("cluster", "CLUSTER_METADATA")` against [`Ray::sdk_version`]; when an
+    /// explicit `address` or `RAY_ADDRESS` is set, this GCS query runs before
+    /// `ray::Init` so a mismatch leaves `ray_is_initialized()` as `false`.
     pub fn connect(config: &RayConfig) -> Result<Self, RayError> {
         // 取锁之前先看一眼：关闭线程在排空期间不持有 LIVE（见 `Drop for RayInner`），
         // 这一眼让任务体在绝大多数情况下连锁都不用碰。
@@ -434,6 +444,26 @@ impl Ray {
     /// Connect in local mode (no cluster, single process).
     pub fn local() -> Result<Self, RayError> {
         Self::connect(&RayConfig::local())
+    }
+
+    /// Return the Ray C++ SDK version embedded at build time.
+    pub const fn sdk_version() -> &'static str {
+        rayrust_sys::BUILD_RAY_VERSION
+    }
+
+    /// Return `kRayVersion` extracted from the `libray_api.so` loaded in the
+    /// current process.
+    pub fn loaded_sdk_version() -> Result<String, RayError> {
+        rayrust_sys::clear_error();
+        let raw = unsafe { rayrust_sys::ray_loaded_sdk_version() };
+        let guard = CBytesGuard::from(raw).ok_or_else(|| ffi_error("ray_loaded_sdk_version"))?;
+        std::str::from_utf8(guard.as_slice())
+            .map(str::to_string)
+            .map_err(|e| {
+                RayError::Ffi(format!(
+                    "ray_loaded_sdk_version returned invalid UTF-8: {e}"
+                ))
+            })
     }
 
     // ── Object Store ──────────────────────────────────────────
@@ -1760,10 +1790,10 @@ pub(crate) fn task_call_json_inner(
     check_is_ref_len(args.len(), is_ref)?;
     let func_c = to_cstring(func_name);
     let args_arr = build_args_array(args);
-    let is_ref_ptr = if is_ref.is_empty() {
-        std::ptr::null()
+    let (is_ref_ptr, is_ref_count) = if is_ref.is_empty() {
+        (std::ptr::null(), 0)
     } else {
-        is_ref.as_ptr()
+        (is_ref.as_ptr(), is_ref.len())
     };
     let options_json_c = to_cstring(options_json);
 
@@ -1773,6 +1803,7 @@ pub(crate) fn task_call_json_inner(
             args_arr.as_ptr(),
             args_arr.len(),
             is_ref_ptr,
+            is_ref_count,
             if options_json_c.as_bytes().is_empty() {
                 std::ptr::null()
             } else {
@@ -1825,10 +1856,10 @@ pub(crate) fn task_call_python_json_inner(
     let func_c = to_cstring(function);
     let args_arr = build_args_array(args);
     let options_c = to_cstring(options_json);
-    let is_ref_ptr = if is_ref.is_empty() {
-        std::ptr::null()
+    let (is_ref_ptr, is_ref_count) = if is_ref.is_empty() {
+        (std::ptr::null(), 0)
     } else {
-        is_ref.as_ptr()
+        (is_ref.as_ptr(), is_ref.len())
     };
 
     let bytes = unsafe {
@@ -1838,6 +1869,7 @@ pub(crate) fn task_call_python_json_inner(
             args_arr.as_ptr(),
             args_arr.len(),
             is_ref_ptr,
+            is_ref_count,
             if options_c.as_bytes().is_empty() {
                 std::ptr::null()
             } else {
@@ -2704,10 +2736,10 @@ pub(crate) fn actor_call_inner(
     check_is_ref_len(args.len(), is_ref)?;
     let func_c = to_cstring(func_name);
     let args_arr = build_args_array(args);
-    let is_ref_ptr = if is_ref.is_empty() {
-        std::ptr::null()
+    let (is_ref_ptr, is_ref_count) = if is_ref.is_empty() {
+        (std::ptr::null(), 0)
     } else {
-        is_ref.as_ptr()
+        (is_ref.as_ptr(), is_ref.len())
     };
 
     let bytes = unsafe {
@@ -2718,6 +2750,7 @@ pub(crate) fn actor_call_inner(
             args_arr.as_ptr(),
             args_arr.len(),
             is_ref_ptr,
+            is_ref_count,
         )
     };
 
@@ -2783,10 +2816,10 @@ pub(crate) fn actor_call_python_inner(
     check_is_ref_len(args.len(), is_ref)?;
     let method_c = to_cstring(method_name);
     let args_arr = build_args_array(args);
-    let is_ref_ptr = if is_ref.is_empty() {
-        std::ptr::null()
+    let (is_ref_ptr, is_ref_count) = if is_ref.is_empty() {
+        (std::ptr::null(), 0)
     } else {
-        is_ref.as_ptr()
+        (is_ref.as_ptr(), is_ref.len())
     };
 
     let bytes = unsafe {
@@ -2797,6 +2830,7 @@ pub(crate) fn actor_call_python_inner(
             args_arr.as_ptr(),
             args_arr.len(),
             is_ref_ptr,
+            is_ref_count,
         )
     };
 
@@ -4482,6 +4516,7 @@ mod tests {
                     std::ptr::null(),
                     0,
                     std::ptr::null(),
+                    0,
                 )
             };
             assert!(
@@ -4524,6 +4559,7 @@ mod tests {
                 std::ptr::null(),
                 0,
                 std::ptr::null(),
+                0,
             )
         };
         assert!(bytes.data.is_null(), "没有运行时却交回了调用结果");

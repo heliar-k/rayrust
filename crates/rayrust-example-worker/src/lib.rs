@@ -104,6 +104,7 @@ fn call_actor_by_raw_id(actor_id: &[u8]) -> String {
             std::ptr::null(),
             0,
             std::ptr::null(),
+            0,
         )
     };
     if out.data.is_null() {
@@ -189,6 +190,7 @@ pub fn submit_nested(value: i64) -> Result<(Vec<u8>, i64), String> {
             args.as_ptr(),
             args.len(),
             std::ptr::null(),
+            0,
             std::ptr::null(),
         )
     };
@@ -221,6 +223,7 @@ pub fn call_actor_in_worker(serialized_handle: Vec<u8>, n: i64) -> Result<(Vec<u
             args.as_ptr(),
             args.len(),
             std::ptr::null(),
+            0,
         )
     };
     let guard = rayrust::sys::CBytesGuard::from(raw).ok_or_else(|| {

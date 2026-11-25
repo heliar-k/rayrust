@@ -174,6 +174,16 @@ typedef struct {
 /// be waited for on shutdown. The address checks still run first, so a malformed
 /// address returns -1 there even though `ray::Init` itself does nothing at that
 /// point (cpp/src/ray/api.cc:25-31).
+/// Version handshake: after parameter validation and before any SDK call,
+/// `ray_init` checks that the loaded `libray_api.so` `kRayVersion` matches the
+/// build-time `RAYRUST_BUILD_RAY_VERSION` (in both local and cluster modes). In
+/// cluster mode, when connecting to an explicit `address` or `RAY_ADDRESS` while
+/// uninitialized, `ray_init` opens a temporary `GlobalStateAccessor` via `dlsym`
+/// before calling `ray::Init` and verifies `ray_version` in GCS internal KV
+/// `("cluster", "CLUSTER_METADATA")`, returning -1 with `ray_is_initialized()`
+/// remaining `false` on mismatch; when `ray::Init` auto-starts a local head
+/// node, `ray_init` checks the runtime's `GlobalStateAccessor` immediately after
+/// `ray::Init` and calls `ray::Shutdown()` before returning -1 on mismatch.
 int ray_init(const char *address, int local_mode, const char *node_ip,
              const char *code_search_path,
              const char *runtime_env_json,
@@ -260,8 +270,11 @@ void ray_shutdown(void);
 ///   `ray_register_member_function` 只写 `FunctionManager`，不访问运行时；
 ///   `ray_gauge_create`、`ray_counter_create`、`ray_histogram_create`、
 ///   `ray_sum_create`、`ray_metric_get_name` 与 `ray_metric_destroy` 只构造、读取或
-///   释放 `ray::Metric` 对象，不访问 `RayRuntime`；`ray_add_local_reference` 与
-///   `ray_remove_local_reference` 在关闭开始后直接返回 0 且不记录错误。
+///   释放 `ray::Metric` 对象，不访问 `RayRuntime`；`ray_build_sdk_version`、
+///   `ray_loaded_sdk_version` 与 `ray_check_private_symbol` 只读取编译期版本常量或
+///   检查已加载 `libray_api.so` 的 ELF / `dlsym` 符号，不访问 `RayRuntime`；
+///   `ray_add_local_reference` 与 `ray_remove_local_reference` 在关闭开始后直接返回 0
+///   且不记录错误。
 
 // ─── Object Store ─────────────────────────────────────────────
 
@@ -389,11 +402,14 @@ bool *ray_wait(const ray_bytes_t *ids, size_t count, size_t num_objects, int tim
 ///   catch records as RAY_ERROR_KIND_RAY. Both checks run before the runtime
 ///   lookup and before the closing check, so a null or empty name without a
 ///   runtime reports the name error.
-/// `args` is an array of msgpack-serialized arguments.
-/// `is_ref` is an array of booleans (same length as args). If is_ref[i] is true,
-///   args[i] is treated as a binary ObjectRef ID (pass by reference).
-///   Pass NULL to treat all args as values. Any other length is rejected by the
-///   Rust side; this function itself does not know arg_count's relation to it.
+/// `args` is an array of msgpack-serialized arguments (`args` must be non-NULL
+///   whenever `arg_count > 0`, checked before the runtime lookup).
+/// `is_ref` is an array of booleans of length `is_ref_count`. If `is_ref` is
+///   NULL, `is_ref_count` must be 0 and all `arg_count` arguments are treated as
+///   values. If `is_ref` is non-NULL, `is_ref_count` must equal `arg_count`; any
+///   other `is_ref_count` is rejected with `RAY_ERROR_KIND_GENERIC` before
+///   reading `is_ref` or looking up the runtime. When `is_ref[i]` is true,
+///   `args[i]` is treated as a binary ObjectRef ID (pass by reference).
 ///   A reference argument must be exactly 28 bytes (the Ray 2.51.1 ObjectID
 ///   length); any other length is rejected before the TaskArg is built, with the
 ///   argument index in ray_last_error_bytes(). A length mismatch would hit a RAY_CHECK
@@ -440,6 +456,7 @@ ray_bytes_t ray_task_call_with_options(const char *func_name,
                                          const ray_bytes_t *args,
                                          size_t arg_count,
                                          const bool *is_ref,
+                                         size_t is_ref_count,
                                          const char *options_json);
 
 /// Call a Python remote function.
@@ -449,7 +466,11 @@ ray_bytes_t ray_task_call_with_options(const char *func_name,
 /// `ray_task_call_python_with_options` for any of those.
 /// `module_name` and `function_name` are null-terminated C strings.
 /// `args` are msgpack-serialized arguments (will be wrapped with xlang header).
-/// `is_ref[i] = true` means args[i] is an ObjectRef ID (pass by reference).
+/// `is_ref` and `is_ref_count` follow the boundary rules of
+///   `ray_task_call_with_options`: `is_ref == NULL` requires `is_ref_count == 0`
+///   (all arguments passed as values), and `is_ref != NULL` requires
+///   `is_ref_count == arg_count`. `is_ref[i] = true` means `args[i]` is an
+///   ObjectRef ID (pass by reference).
 ///   Such an id must be exactly 28 bytes, the same requirement and the same
 ///   rejection as ray_task_call_with_options.
 ///   Such an id must be a reference the calling process holds and whose owner
@@ -505,7 +526,8 @@ ray_bytes_t ray_task_call_python(const char *module_name,
                                   const char *function_name,
                                   const ray_bytes_t *args,
                                   size_t arg_count,
-                                  const bool *is_ref);
+                                  const bool *is_ref,
+                                  size_t is_ref_count);
 
 /// Call a Python remote function with full CallOptions.
 /// `options_json` is a JSON string with any subset of the fields
@@ -555,6 +577,7 @@ ray_bytes_t ray_task_call_python_with_options(const char *module_name,
                                               const ray_bytes_t *args,
                                               size_t arg_count,
                                               const bool *is_ref,
+                                              size_t is_ref_count,
                                               const char *options_json);
 
 // ─── Actor ────────────────────────────────────────────────────
@@ -709,12 +732,14 @@ ray_bytes_t ray_actor_create_python_with_options(const char *module_name,
 /// this entry, so a driver through that crate never reaches the RAY_CHECK.
 /// The method call this entry builds is a C++ one (hence the language note in
 /// `rayrust`'s `Ray::actor_call`).
-/// `is_ref` is an array of booleans (same length as args). If is_ref[i] is true,
-///   args[i] is treated as a binary ObjectRef ID (pass by reference).
-///   Pass NULL to treat all args as values. Any other length is rejected by the
-///   Rust side. A reference argument must be exactly 28 bytes, the same
-///   requirement and the same rejection as ray_task_call_with_options. The same
-///   owner requirement applies as well.
+/// `is_ref` is an array of booleans of length `is_ref_count`. If `is_ref` is
+///   NULL, `is_ref_count` must be 0 and all arguments are treated as values. If
+///   `is_ref` is non-NULL, `is_ref_count` must equal `arg_count`; any other
+///   `is_ref_count` is rejected with `RAY_ERROR_KIND_GENERIC` before reading
+///   `is_ref` or looking up the runtime. When `is_ref[i]` is true, `args[i]` is
+///   treated as a binary ObjectRef ID (pass by reference). A reference argument
+///   must be exactly 28 bytes, the same requirement and the same rejection as
+///   ray_task_call_with_options. The same owner requirement applies as well.
 /// `func_name` is the member function name. A null pointer is rejected with
 ///   RAY_ERROR_KIND_GENERIC and `func_name is null`. The empty string is refused
 ///   too: the single-argument `RemoteFunctionHolder` constructor throws
@@ -727,7 +752,8 @@ ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
                             const char *func_name,
                             const ray_bytes_t *args,
                             size_t arg_count,
-                            const bool *is_ref);
+                            const bool *is_ref,
+                            size_t is_ref_count);
 
 /// Call a method on a Python actor.
 /// `actor_id_data`/`actor_id_len` must be exactly 16 bytes, the same requirement
@@ -773,7 +799,10 @@ ray_bytes_t ray_actor_call(const char *actor_id_data, size_t actor_id_len,
 /// holds no method table and cannot tell a valid name from an invalid one. Measured
 /// on 2.51.1 such a name ends the actor's worker with the same traceback as an empty
 /// one, so the caller must pass a method name that really exists.
-/// `is_ref[i] = true` means args[i] is an ObjectRef ID (pass by reference).
+/// `is_ref` and `is_ref_count` follow the boundary rules of
+///   `ray_task_call_with_options`: `is_ref == NULL` requires `is_ref_count == 0`,
+///   and `is_ref != NULL` requires `is_ref_count == arg_count`. `is_ref[i] = true`
+///   means `args[i]` is an ObjectRef ID (pass by reference).
 ///   Such an id must be exactly 28 bytes, the same requirement and the same
 ///   rejection as ray_task_call_with_options.
 ///   It must also be a reference the calling process holds and whose owner
@@ -797,7 +826,8 @@ ray_bytes_t ray_actor_call_python(const char *actor_id_data, size_t actor_id_len
                                     const char *method_name,
                                     const ray_bytes_t *args,
                                     size_t arg_count,
-                                    const bool *is_ref);
+                                    const bool *is_ref,
+                                    size_t is_ref_count);
 
 /// Kill an actor.
 /// `actor_id_data`/`actor_id_len` is the binary actor ID and must be exactly 16
@@ -1064,6 +1094,23 @@ bool ray_is_local_mode(void);
 /// 只给 Rust 侧的代次检查（`object_ref::check_epoch`）用：它决定代次 0 的重建引用
 /// 能不能进入包装层。没有错误通道，也不需要：每个分支都是一个可读的布尔结果。
 int ray_runtime_is_borrowed(void);
+
+/// Return a heap-allocated copy of the build-time `RAYRUST_BUILD_RAY_VERSION`
+/// string. Unaffected by the closing gate. Caller frees via `ray_free_bytes`.
+ray_bytes_t ray_build_sdk_version(void);
+
+/// Return a heap-allocated copy of `kRayVersion` extracted from the loaded
+/// `libray_api.so` ELF `.symtab` section. Returns `{NULL, 0}` with
+/// `RAY_ERROR_KIND_GENERIC` recorded in `ray_last_error_bytes()` when the
+/// version cannot be extracted. Unaffected by the closing gate. Caller frees
+/// via `ray_free_bytes`.
+ray_bytes_t ray_loaded_sdk_version(void);
+
+/// Verify that `mangled_name` (non-NULL and non-empty) resolves via `dlsym` in
+/// the loaded `libray_api.so` using the wrapper's private symbol resolver.
+/// Returns 0 on success, -1 on failure with `RAY_ERROR_KIND_GENERIC` recorded in
+/// `ray_last_error_bytes()`. Unaffected by the closing gate.
+int ray_check_private_symbol(const char *mangled_name);
 
 /// Get the namespace of this job.
 /// Returns a ray_bytes_t containing the namespace string.
