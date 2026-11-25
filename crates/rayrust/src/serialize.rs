@@ -30,21 +30,28 @@
 //! `NativeObjectStore::GetRaw` 把 metadata 交给 `CheckException` 之后丢弃，
 //! `RayRuntime::Get` 只返回 msgpack 数据。
 //!
-//! - 声明长度等于剩余字节：msgpack 段就是整段，正常解码；
+//! - 声明长度等于剩余字节：msgpack 段就是整段，要求被单个值完整消费，段内残留尾随
+//!   字节返回 [`RayError::Serialization`]；
 //! - 声明长度小于剩余字节：后面还有 pickle5 段，Rust 无法解码，
 //!   `deserialize_xlang` 与 `deserialize_xlang_value` 返回
 //!   [`RayError::Serialization`]，需要原始字节的调用方改用
 //!   `ObjectRef::get_raw_bytes`；
 //! - 声明长度大于剩余字节：同样返回 [`RayError::Serialization`]。
 //!
+//! 四个公开解码入口（[`deserialize`]、[`deserialize_value`]、[`deserialize_xlang`]、
+//! [`deserialize_xlang_value`]）均要求目标 msgpack 字节段被单个值完整消费；首个值
+//! 之后残留任何尾随字节都会返回 [`RayError::Serialization`]。
+//!
 //! 对象读取入口在解码之前先用 `rayrust_sys::error_payload::extract` 判定载荷是否为
 //! 未翻译错误对象的帧（`9 + N` 字节的 protobuf）：命中即返回携带该错误文本的
 //! [`RayError::Unclassified`]，未命中才解码，解码失败仍是 [`RayError::Serialization`]。
-//! 判定必须前置：帧本身是合法 msgpack（跨语言路径剥掉 9 字节头后是 `bin`，非跨语言
-//! 路径首值是正文长度），对 `Vec<u8>`、`rmpv::Value` 与非跨语言的整数类型都能解出
-//! 成功值。帧规则（总长恰为 `9 + N`、正文是 msgpack `bin`、protobuf 顶层字段号与
-//! wire type 都在允许集合内、文本非空且是合法 UTF-8）之外的字节不会被判成帧；恰好
-//! 拼成这些规则的载荷会被报成 [`RayError::Unclassified`]，代价是该载荷不再参与解码。
+//! 判定必须前置：跨语言路径剥掉 9 字节头后正文是单个完整 msgpack `bin`，对
+//! `Vec<u8>` 与 `rmpv::Value` 都能解出成功值；非跨语言路径首值是正文长度、后跟填充
+//! 与 `bin` 正文，前置判定让它返回携带错误文本的 [`RayError::Unclassified`]，避免
+//! 进入解码器被报告为尾随字节的 [`RayError::Serialization`]。帧规则（总长恰为
+//! `9 + N`、正文是 msgpack `bin`、protobuf 顶层字段号与 wire type 都在允许集合内、
+//! 文本非空且是合法 UTF-8）之外的字节不会被判定为帧；恰好拼成这些规则的载荷会被报告为
+//! [`RayError::Unclassified`]，代价是该载荷不再参与解码。
 //!
 //! For dynamic/generic deserialization (when the Rust caller doesn't know the
 //! exact Python return type), use `rmpv::Value` which is msgpack's equivalent
@@ -64,10 +71,22 @@ pub fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, RayError> {
     Ok(buf)
 }
 
-/// Deserialize a value from msgpack bytes.
+/// Deserialize a single value from msgpack bytes.
+///
+/// The entire `data` slice must be consumed by that single msgpack value; any
+/// trailing bytes after the first value return [`RayError::Serialization`].
 pub fn deserialize<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T, RayError> {
-    let mut de = rmp_serde::Deserializer::from_read_ref(data);
-    T::deserialize(&mut de).map_err(RayError::from)
+    let mut de = rmp_serde::Deserializer::new(data);
+    let value = T::deserialize(&mut de)?;
+    let remaining = de.into_inner();
+    if !remaining.is_empty() {
+        return Err(RayError::Serialization(format!(
+            "trailing bytes after msgpack value: {} unconsumed byte(s) out of {}",
+            remaining.len(),
+            data.len()
+        )));
+    }
+    Ok(value)
 }
 
 // ─── Cross-language (XLANG) support ────────────────────────────
@@ -172,7 +191,7 @@ fn xlang_msgpack_bytes(data: &[u8]) -> Result<&[u8], RayError> {
     }
 }
 
-/// Deserialize a value from cross-language (Python) result bytes.
+/// Deserialize a single value from cross-language (Python) result bytes.
 ///
 /// Payloads carrying `XLANG` / `PYTHON` metadata start with a 9-byte header
 /// whose integer field records only the length of the msgpack part. This
@@ -188,6 +207,10 @@ fn xlang_msgpack_bytes(data: &[u8]) -> Result<&[u8], RayError> {
 ///
 /// Data without an XLANG header (local mode, values Rust wrote itself) is
 /// deserialized from offset 0.
+///
+/// In both the header and no-header paths, the msgpack byte slice must be
+/// consumed in full by a single value; any trailing bytes return
+/// [`RayError::Serialization`].
 pub fn deserialize_xlang<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T, RayError> {
     deserialize(xlang_msgpack_bytes(data)?)
 }
@@ -198,7 +221,8 @@ pub fn deserialize_xlang<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<
 /// Python return value at compile time. The returned `rmpv::Value` can
 /// hold any msgpack type: nil, bool, int, float, str, bin, array, or map.
 ///
-/// A payload that also carries a pickle5 section is rejected with
+/// A payload that also carries a pickle5 section, or that leaves any trailing
+/// bytes unconsumed after the first msgpack value, is rejected with
 /// [`RayError::Serialization`]; see [`deserialize_xlang`].
 ///
 /// # Example
@@ -212,16 +236,25 @@ pub fn deserialize_xlang<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<
 /// }
 /// ```
 pub fn deserialize_xlang_value(data: &[u8]) -> Result<rmpv::Value, RayError> {
-    let mut reader = xlang_msgpack_bytes(data)?;
-    rmpv::decode::read_value(&mut reader)
-        .map_err(|e| RayError::Serialization(format!("msgpack value decode error: {}", e)))
+    deserialize_value(xlang_msgpack_bytes(data)?)
 }
 
 /// Deserialize raw msgpack bytes into a generic msgpack Value (no XLANG header).
+///
+/// The entire `data` slice must be consumed by a single msgpack value; any
+/// trailing bytes after the first value return [`RayError::Serialization`].
 pub fn deserialize_value(data: &[u8]) -> Result<rmpv::Value, RayError> {
     let mut reader = data;
-    rmpv::decode::read_value(&mut reader)
-        .map_err(|e| RayError::Serialization(format!("msgpack value decode error: {}", e)))
+    let value = rmpv::decode::read_value(&mut reader)
+        .map_err(|e| RayError::Serialization(format!("msgpack value decode error: {}", e)))?;
+    if !reader.is_empty() {
+        return Err(RayError::Serialization(format!(
+            "trailing bytes after msgpack value: {} unconsumed byte(s) out of {}",
+            reader.len(),
+            data.len()
+        )));
+    }
+    Ok(value)
 }
 
 // ─── Tests ─────────────────────────────────────────────────────
@@ -229,6 +262,7 @@ pub fn deserialize_value(data: &[u8]) -> Result<rmpv::Value, RayError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
     use std::collections::HashMap;
 
     // ── Basic round-trip ──────────────────────────────────────
@@ -835,5 +869,293 @@ mod tests {
 
         let val_back: i64 = deserialize_xlang(&inner).unwrap();
         assert_eq!(val_back, 42);
+    }
+
+    // ── 尾随字节拒绝：四个公开解码入口均要求单值完整消费 ──────────
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct SampleRecord {
+        id: i64,
+        label: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    enum SampleEnum {
+        Unit,
+        Newtype(i64),
+        Tuple(i64, String),
+        Struct { ok: bool },
+    }
+
+    fn assert_trailing_error<T: std::fmt::Debug>(
+        res: Result<T, RayError>,
+        expected_unconsumed: usize,
+        expected_total: usize,
+        context: &str,
+    ) {
+        let expected_msg = format!(
+            "trailing bytes after msgpack value: {} unconsumed byte(s) out of {}",
+            expected_unconsumed, expected_total
+        );
+        match res {
+            Err(RayError::Serialization(msg)) => {
+                assert_eq!(msg, expected_msg, "unexpected message for {context}");
+            }
+            other => panic!("expected Err(RayError::Serialization({expected_msg:?})) for {context}, got {other:?}"),
+        }
+    }
+
+    fn check_typed_trailing<T>(val: &T, label: &str)
+    where
+        T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        let encoded = serialize(val).unwrap();
+        let clean: T = deserialize(&encoded).unwrap();
+        assert_eq!(&clean, val, "{label} clean round-trip");
+
+        // 有效编码 + 1 个尾随字节（覆盖正 fixint 0x00、nil 0xc0、保留标记 0xc1、fixarray(1) 0x91）
+        for &tail_byte in &[0x00u8, 0xc0, 0xc1, 0x91] {
+            let mut with_one = encoded.clone();
+            with_one.push(tail_byte);
+            assert_trailing_error(
+                deserialize::<T>(&with_one),
+                1,
+                with_one.len(),
+                &format!("{label} + {tail_byte:#04x}"),
+            );
+        }
+
+        // 有效编码 + 第二个完整编码值
+        let extra = serialize(&("extra".to_string(), 99i64)).unwrap();
+        let mut with_second = encoded.clone();
+        with_second.extend_from_slice(&extra);
+        assert_trailing_error(
+            deserialize::<T>(&with_second),
+            extra.len(),
+            with_second.len(),
+            &format!("{label} + second value"),
+        );
+    }
+
+    #[test]
+    fn test_deserialize_rejects_trailing_bytes_across_types() {
+        check_typed_trailing(&(), "unit");
+        check_typed_trailing(&None::<i64>, "Option::None");
+        check_typed_trailing(&Some(7i64), "Option::Some(7)");
+        check_typed_trailing(&true, "bool(true)");
+        check_typed_trailing(&false, "bool(false)");
+        check_typed_trailing(&(-42i64), "i64(-42)");
+        check_typed_trailing(&42i64, "i64(42)");
+        check_typed_trailing(&"hello".to_string(), "String");
+        check_typed_trailing(&vec![1i64, 2, 3], "Vec<i64>");
+        check_typed_trailing(
+            &SampleRecord {
+                id: 11,
+                label: "item".to_string(),
+            },
+            "SampleRecord",
+        );
+        check_typed_trailing(&(9i64, "tuple".to_string(), true), "tuple");
+
+        // 覆盖枚举单元变体与带数据变体，确认 Deserializer 的 marker 缓存路径不会吞掉 1 个尾随字节
+        check_typed_trailing(&SampleEnum::Unit, "SampleEnum::Unit");
+        check_typed_trailing(&SampleEnum::Newtype(99), "SampleEnum::Newtype");
+        check_typed_trailing(
+            &SampleEnum::Tuple(5, "tag".to_string()),
+            "SampleEnum::Tuple",
+        );
+        check_typed_trailing(&SampleEnum::Struct { ok: true }, "SampleEnum::Struct");
+    }
+
+    #[test]
+    fn test_local_mode_pack_error_rejected_by_all_decoders() {
+        // 本地模式 PackError 形状：0xc0 (nil) 后跟 (3i32, "boom".to_string()) 的 msgpack 编码
+        let mut pack_error = serialize(&()).unwrap();
+        assert_eq!(pack_error, vec![0xc0]);
+        let err_tuple = serialize(&(3i32, "boom".to_string())).unwrap();
+        assert_eq!(&err_tuple[..2], &[0x92, 0x03]);
+        pack_error.extend_from_slice(&err_tuple);
+        assert_eq!(&pack_error[..3], &[0xc0, 0x92, 0x03]);
+        assert!(split_xlang(&pack_error).unwrap().is_none());
+
+        let unconsumed = err_tuple.len();
+        let total = pack_error.len();
+
+        assert_trailing_error(
+            deserialize::<()>(&pack_error),
+            unconsumed,
+            total,
+            "PackError as ()",
+        );
+        assert_trailing_error(
+            deserialize::<Option<i64>>(&pack_error),
+            unconsumed,
+            total,
+            "PackError as Option<i64>",
+        );
+        assert_trailing_error(
+            deserialize_value(&pack_error),
+            unconsumed,
+            total,
+            "PackError as rmpv::Value",
+        );
+        assert_trailing_error(
+            deserialize_xlang::<()>(&pack_error),
+            unconsumed,
+            total,
+            "PackError via deserialize_xlang::<()>",
+        );
+        assert_trailing_error(
+            deserialize_xlang::<Option<i64>>(&pack_error),
+            unconsumed,
+            total,
+            "PackError via deserialize_xlang::<Option<i64>>",
+        );
+        assert_trailing_error(
+            deserialize_xlang_value(&pack_error),
+            unconsumed,
+            total,
+            "PackError via deserialize_xlang_value",
+        );
+    }
+
+    #[test]
+    fn test_deserialize_value_rejects_trailing_bytes() {
+        let fixtures: Vec<(&str, Vec<u8>)> = vec![
+            ("Nil", serialize(&()).unwrap()),
+            ("Integer", serialize(&42i64).unwrap()),
+            ("String", serialize(&"abc".to_string()).unwrap()),
+            ("Array", serialize(&vec![1i64, 2, 3]).unwrap()),
+            (
+                "Map",
+                serialize(&rmpv::Value::Map(vec![(
+                    rmpv::Value::String("k".into()),
+                    rmpv::Value::Integer(1.into()),
+                )]))
+                .unwrap(),
+            ),
+        ];
+        let second_val = serialize(&vec!["trailing".to_string()]).unwrap();
+
+        for (name, encoded) in fixtures {
+            assert!(deserialize_value(&encoded).is_ok(), "{name} clean decode");
+
+            for &tail_byte in &[0x00u8, 0xc0, 0xc1, 0x91] {
+                let mut with_one = encoded.clone();
+                with_one.push(tail_byte);
+                assert_trailing_error(
+                    deserialize_value(&with_one),
+                    1,
+                    with_one.len(),
+                    &format!("deserialize_value({name}) + {tail_byte:#04x}"),
+                );
+            }
+
+            let mut with_second = encoded.clone();
+            with_second.extend_from_slice(&second_val);
+            assert_trailing_error(
+                deserialize_value(&with_second),
+                second_val.len(),
+                with_second.len(),
+                &format!("deserialize_value({name}) + second value"),
+            );
+        }
+    }
+
+    #[test]
+    fn test_deserialize_xlang_rejects_trailing_bytes_inside_msgpack_and_fallback() {
+        let payload = serialize(&vec![10i64, 20, 30]).unwrap();
+        let second = serialize(&"extra-value".to_string()).unwrap();
+
+        // 1. 有 XLANG 头且 tail == 0，声明的 msgpack 段内部在首个值之后跟 1 字节
+        for &tail_byte in &[0x00u8, 0xc0, 0xc1, 0x91] {
+            let mut body = payload.clone();
+            body.push(tail_byte);
+            let data = xlang_payload(body.len(), &body);
+            let (part, tail) = split_xlang(&data).unwrap().expect("an XLANG header");
+            assert_eq!(part.len(), body.len());
+            assert_eq!(tail, 0);
+
+            assert_trailing_error(
+                deserialize_xlang::<Vec<i64>>(&data),
+                1,
+                body.len(),
+                &format!("xlang msgpack section + {tail_byte:#04x}"),
+            );
+            assert_trailing_error(
+                deserialize_xlang_value(&data),
+                1,
+                body.len(),
+                &format!("xlang_value msgpack section + {tail_byte:#04x}"),
+            );
+        }
+
+        // 2. 有 XLANG 头且 tail == 0，声明的 msgpack 段内部跟第二个完整值
+        let mut body_two = payload.clone();
+        body_two.extend_from_slice(&second);
+        let data_two = xlang_payload(body_two.len(), &body_two);
+        assert_trailing_error(
+            deserialize_xlang::<Vec<i64>>(&data_two),
+            second.len(),
+            body_two.len(),
+            "xlang msgpack section + second value",
+        );
+        assert_trailing_error(
+            deserialize_xlang_value(&data_two),
+            second.len(),
+            body_two.len(),
+            "xlang_value msgpack section + second value",
+        );
+
+        // 3. 无 XLANG 头的回退路径（短正整数载荷与非整数开头的长载荷）带有尾随字节
+        let mut short_fallback = serialize(&42i32).unwrap();
+        short_fallback.push(0x00);
+        assert!(short_fallback.len() < XLANG_HEADER_LEN);
+        assert!(split_xlang(&short_fallback).unwrap().is_none());
+        assert_trailing_error(
+            deserialize_xlang::<i32>(&short_fallback),
+            1,
+            short_fallback.len(),
+            "short fallback + 0x00",
+        );
+        assert_trailing_error(
+            deserialize_xlang_value(&short_fallback),
+            1,
+            short_fallback.len(),
+            "short fallback value + 0x00",
+        );
+
+        let mut long_fallback = serialize(&"non-integer-prefix-payload".to_string()).unwrap();
+        long_fallback.extend_from_slice(&second);
+        assert!(long_fallback.len() >= XLANG_HEADER_LEN);
+        assert!(split_xlang(&long_fallback).unwrap().is_none());
+        assert_trailing_error(
+            deserialize_xlang::<String>(&long_fallback),
+            second.len(),
+            long_fallback.len(),
+            "long fallback + second value",
+        );
+        assert_trailing_error(
+            deserialize_xlang_value(&long_fallback),
+            second.len(),
+            long_fallback.len(),
+            "long fallback value + second value",
+        );
+
+        // 4. 对照：tail > 0（pickle5 段）仍返回原有的 pickle5 错误消息
+        let mut with_pickle5 = xlang_payload(payload.len(), &payload);
+        with_pickle5.extend_from_slice(&[0x80, 0x05, 0x95]);
+        match deserialize_xlang::<Vec<i64>>(&with_pickle5) {
+            Err(RayError::Serialization(msg)) => {
+                assert!(msg.contains("pickle5"), "expected pickle5 message: {msg}");
+            }
+            other => panic!("expected pickle5 Serialization error, got {other:?}"),
+        }
+        match deserialize_xlang_value(&with_pickle5) {
+            Err(RayError::Serialization(msg)) => {
+                assert!(msg.contains("pickle5"), "expected pickle5 message: {msg}");
+            }
+            other => panic!("expected pickle5 Serialization error, got {other:?}"),
+        }
     }
 }

@@ -313,7 +313,9 @@ fn main() {
         ),
     }
 
-    // 非跨语言任务（`is_xlang = false`）：帧首值是正文长度，按整数读会得到伪造的成功值。
+    // 非跨语言任务（`is_xlang = false`）：帧首值是正文长度、后跟头内填充与 `bin` 正文，
+    // 前置判定让它返回携带错误文本的 `RayError::Unclassified`，避免进入解码器被报告为
+    // 尾随字节的 `RayError::Serialization`。
     let bad_env_rust: ObjectRef<i64> = ray
         .task_call("add", &[&arg1, &arg1], &[], &bad_env_opts)
         .expect("submit a Rust task with a bad runtime_env")

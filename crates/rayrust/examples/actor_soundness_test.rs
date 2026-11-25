@@ -16,6 +16,7 @@ const GET_TIMEOUT_MS: i32 = 15_000;
 
 const TASK_ECHO: &str = "soundness_echo_i32";
 const TASK_PANIC_SYNC: &str = "soundness_panic_sync";
+const TASK_PANIC_UNIT: &str = "soundness_panic_unit";
 const TASK_PANIC_ASYNC: &str = "soundness_panic_async";
 
 const ACTOR_FACTORY: &str = "__rayrust_actor_factory_soundnessactor";
@@ -24,6 +25,7 @@ const ACTOR_READ_STATE: &str = "__rayrust_actor_factory_soundnessactor::read_sta
 const ACTOR_ADD_PID: &str = "__rayrust_actor_factory_soundnessactor::add_and_pid";
 const ACTOR_GET_VALUE: &str = "__rayrust_actor_factory_soundnessactor::get_value";
 const ACTOR_PANIC_METHOD: &str = "__rayrust_actor_factory_soundnessactor::panic_method";
+const ACTOR_PANIC_UNIT_METHOD: &str = "__rayrust_actor_factory_soundnessactor::panic_unit_method";
 const ACTOR_WORKER_PID: &str = "__rayrust_actor_factory_soundnessactor::worker_pid";
 
 const PANIC_CTOR_FACTORY: &str = "__rayrust_actor_factory_panickingctoractor";
@@ -101,6 +103,17 @@ async fn run_cluster(worker_so: String) {
         }
         other => panic!("expected RayError::Task, got {other:?}"),
     }
+    let unit_msg = serialize(&"unit-task-panic-t46".to_string()).unwrap();
+    let unit_ref: ObjectRef<()> = ray
+        .task_call(TASK_PANIC_UNIT, &[&unit_msg], &[], &TaskOptions::new())
+        .expect("submit unit panic task");
+    match unit_ref.get_timeout(GET_TIMEOUT_MS) {
+        Err(RayError::Task(msg)) => {
+            assert!(msg.contains("unit-task-panic-t46"), "got: {msg}");
+            println!("  soundness_panic_unit → Task({msg})");
+        }
+        other => panic!("expected RayError::Task for unit panic task, got {other:?}"),
+    }
     let echo_arg = serialize(&123i32).unwrap();
     let echo_val: i32 = ray
         .task_call(TASK_ECHO, &[&echo_arg], &[], &TaskOptions::new())
@@ -156,6 +169,23 @@ async fn run_cluster(worker_so: String) {
         other => panic!("expected RayError::Task, got {other:?}"),
     }
 
+    let mut trailing_i32 = serialize(&123i32).unwrap();
+    trailing_i32.push(0x00);
+    let trailing_task_ref = ray
+        .task_call(TASK_ECHO, &[&trailing_i32], &[], &TaskOptions::new())
+        .expect("submit echo with trailing arg byte")
+        .cast::<i32>();
+    match trailing_task_ref.get_timeout(GET_TIMEOUT_MS) {
+        Err(RayError::Task(msg)) => {
+            assert!(
+                msg.contains("argument 0 of soundness_echo_i32") && msg.contains("trailing bytes"),
+                "got: {msg}"
+            );
+            println!("  trailing arg byte → Task({msg})");
+        }
+        other => panic!("expected RayError::Task with trailing bytes, got {other:?}"),
+    }
+
     let echo_after: i32 = ray
         .task_call(TASK_ECHO, &[&echo_arg], &[], &TaskOptions::new())
         .expect("submit echo after arg errors")
@@ -206,6 +236,24 @@ async fn run_cluster(worker_so: String) {
             println!("  actor wrong arg count → Task({msg})");
         }
         other => panic!("expected RayError::Task, got {other:?}"),
+    }
+
+    let mut trailing_i64 = serialize(&5i64).unwrap();
+    trailing_i64.push(0x00);
+    match ray
+        .actor_call(actor_a.id(), ACTOR_ADD_PID, &[&trailing_i64], &[])
+        .expect("submit actor trailing arg byte")
+        .cast::<(i64, u32)>()
+        .get_timeout(GET_TIMEOUT_MS)
+    {
+        Err(RayError::Task(msg)) => {
+            assert!(
+                msg.contains("argument 0") && msg.contains("trailing bytes"),
+                "got: {msg}"
+            );
+            println!("  actor trailing arg byte → Task({msg})");
+        }
+        other => panic!("expected RayError::Task with trailing bytes, got {other:?}"),
     }
 
     let (v_after, pid_after): (i64, u32) = ray
@@ -314,6 +362,26 @@ async fn run_cluster(worker_so: String) {
     assert_eq!(pid_after_panic, pid_before);
     println!("  worker_pid after panic → {pid_after_panic} (same worker alive)");
 
+    let actor_unit = ray
+        .actor_create(ACTOR_FACTORY, &[&start_arg], &ActorOptions::new())
+        .expect("create SoundnessActor for unit panic method");
+    let unit_actor_msg = serialize(&"actor-unit-method-panic-t46".to_string()).unwrap();
+    let unit_actor_ref: ObjectRef<()> = ray
+        .actor_call(
+            actor_unit.id(),
+            ACTOR_PANIC_UNIT_METHOD,
+            &[&unit_actor_msg],
+            &[],
+        )
+        .expect("submit panic_unit_method");
+    match unit_actor_ref.get_timeout(GET_TIMEOUT_MS) {
+        Err(RayError::Task(msg)) => {
+            assert!(msg.contains("actor-unit-method-panic-t46"), "got: {msg}");
+            println!("  panic_unit_method → Task({msg})");
+        }
+        other => panic!("expected RayError::Task for panic_unit_method, got {other:?}"),
+    }
+
     // 7. Actor 构造函数 new() panic 与构造函数参数类型错误
     println!("\n--- 7. Actor constructor panic & bad constructor arg ---");
     let ctor_panic_arg = serialize(&"ctor-panic-t43".to_string()).unwrap();
@@ -359,6 +427,7 @@ async fn run_cluster(worker_so: String) {
     println!("\n--- 8. Cleanup ---");
     ray.kill_actor(&actor_a, true).expect("kill actor_a");
     ray.kill_actor(&actor_b, true).expect("kill actor_b");
+    ray.kill_actor(&actor_unit, true).expect("kill actor_unit");
     println!("  killed surviving test actors");
     tokio::time::sleep(Duration::from_millis(100)).await;
     drop(ray);
@@ -411,6 +480,19 @@ fn run_local(worker_so: String) {
         "local task bad arg count",
         &bad_count_raw,
         &["expected 1 argument(s), got 0"],
+    );
+
+    let mut local_trailing_i32 = serialize(&123i32).unwrap();
+    local_trailing_i32.push(0x00);
+    let bad_trailing_raw = ray
+        .task_call(TASK_ECHO, &[&local_trailing_i32], &[], &TaskOptions::new())
+        .expect("submit local task trailing arg byte")
+        .get_raw_bytes()
+        .expect("raw bytes for local task trailing arg byte");
+    assert_local_pack_error(
+        "local task trailing arg byte",
+        &bad_trailing_raw,
+        &["argument 0 of soundness_echo_i32", "trailing bytes"],
     );
 
     let ok_arg = serialize(&456i32).unwrap();
@@ -489,6 +571,19 @@ fn run_local(worker_so: String) {
         &["expected 1 argument(s), got 0"],
     );
 
+    let mut local_trailing_i64 = serialize(&5i64).unwrap();
+    local_trailing_i64.push(0x00);
+    let actor_trailing_raw = ray
+        .actor_call(local_actor.id(), ACTOR_ADD_PID, &[&local_trailing_i64], &[])
+        .expect("submit local actor trailing arg byte")
+        .get_raw_bytes()
+        .expect("raw bytes for local actor trailing arg byte");
+    assert_local_pack_error(
+        "local actor trailing arg byte",
+        &actor_trailing_raw,
+        &["argument 0", "trailing bytes"],
+    );
+
     let five = serialize(&5i64).unwrap();
     let (after_bad_val, _pid): (i64, u32) = ray
         .actor_call(local_actor.id(), ACTOR_ADD_PID, &[&five], &[])
@@ -549,6 +644,101 @@ fn run_local(worker_so: String) {
             println!("  local actor_call after ctor panic → Ffi({msg})");
         }
         other => panic!("expected RayError::Ffi, got {other:?}"),
+    }
+
+    // 6. 本地模式下返回 () 的失败任务、未注册函数与失败 Actor 方法均拒绝解码为 Ok(()) 或 Ok(Nil)
+    println!("\n--- 6. Local mode unit-returning task & actor failures rejected on decode ---");
+    let unit_panic_msg = serialize(&"local-unit-task-panic-t46".to_string()).unwrap();
+    let unit_panic_ref: ObjectRef<()> = ray
+        .task_call(
+            TASK_PANIC_UNIT,
+            &[&unit_panic_msg],
+            &[],
+            &TaskOptions::new(),
+        )
+        .expect("submit local soundness_panic_unit");
+    let unit_panic_raw = unit_panic_ref
+        .get_raw_bytes()
+        .expect("raw bytes for local soundness_panic_unit");
+    assert_local_pack_error(
+        "local soundness_panic_unit",
+        &unit_panic_raw,
+        &["local-unit-task-panic-t46"],
+    );
+    match unit_panic_ref.get_timeout(GET_TIMEOUT_MS) {
+        Err(RayError::Serialization(msg)) => {
+            assert!(msg.contains("trailing bytes"), "got: {msg}");
+            println!("  soundness_panic_unit get_timeout::<()>() → Serialization({msg})");
+        }
+        other => panic!("expected RayError::Serialization with trailing bytes, got {other:?}"),
+    }
+    match unit_panic_ref.get_value() {
+        Err(RayError::Serialization(msg)) => {
+            assert!(msg.contains("trailing bytes"), "got: {msg}");
+            println!("  soundness_panic_unit get_value() → Serialization({msg})");
+        }
+        other => panic!("expected RayError::Serialization with trailing bytes, got {other:?}"),
+    }
+
+    let unreg_ref: ObjectRef<()> = ray
+        .task_call("unregistered_local_unit_fn", &[], &[], &TaskOptions::new())
+        .expect("submit unregistered local unit task");
+    let unreg_raw = unreg_ref
+        .get_raw_bytes()
+        .expect("raw bytes for unregistered local unit task");
+    assert_local_pack_error(
+        "local unregistered fn",
+        &unreg_raw,
+        &["unknown function: unregistered_local_unit_fn"],
+    );
+    match unreg_ref.get_timeout(GET_TIMEOUT_MS) {
+        Err(RayError::Serialization(msg)) => {
+            assert!(msg.contains("trailing bytes"), "got: {msg}");
+            println!("  unregistered_local_unit_fn get_timeout::<()>() → Serialization({msg})");
+        }
+        other => panic!("expected RayError::Serialization with trailing bytes, got {other:?}"),
+    }
+    match unreg_ref.get_value() {
+        Err(RayError::Serialization(msg)) => {
+            assert!(msg.contains("trailing bytes"), "got: {msg}");
+            println!("  unregistered_local_unit_fn get_value() → Serialization({msg})");
+        }
+        other => panic!("expected RayError::Serialization with trailing bytes, got {other:?}"),
+    }
+
+    let unit_local_actor = ray
+        .actor_create(ACTOR_FACTORY, &[&start_arg], &ActorOptions::new())
+        .expect("create separate local SoundnessActor for panic_unit_method");
+    let unit_actor_msg = serialize(&"local-unit-actor-panic-t46".to_string()).unwrap();
+    let unit_actor_ref: ObjectRef<()> = ray
+        .actor_call(
+            unit_local_actor.id(),
+            ACTOR_PANIC_UNIT_METHOD,
+            &[&unit_actor_msg],
+            &[],
+        )
+        .expect("submit local panic_unit_method");
+    let unit_actor_raw = unit_actor_ref
+        .get_raw_bytes()
+        .expect("raw bytes for local panic_unit_method");
+    assert_local_pack_error(
+        "local actor panic_unit_method",
+        &unit_actor_raw,
+        &["local-unit-actor-panic-t46"],
+    );
+    match unit_actor_ref.get_timeout(GET_TIMEOUT_MS) {
+        Err(RayError::Serialization(msg)) => {
+            assert!(msg.contains("trailing bytes"), "got: {msg}");
+            println!("  panic_unit_method get_timeout::<()>() → Serialization({msg})");
+        }
+        other => panic!("expected RayError::Serialization with trailing bytes, got {other:?}"),
+    }
+    match unit_actor_ref.get_value() {
+        Err(RayError::Serialization(msg)) => {
+            assert!(msg.contains("trailing bytes"), "got: {msg}");
+            println!("  panic_unit_method get_value() → Serialization({msg})");
+        }
+        other => panic!("expected RayError::Serialization with trailing bytes, got {other:?}"),
     }
 
     drop(ray);

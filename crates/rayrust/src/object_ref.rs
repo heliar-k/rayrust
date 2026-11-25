@@ -704,8 +704,9 @@ mod tests {
 
     #[test]
     fn decode_value_rejects_a_non_xlang_frame_before_reading_the_length() {
-        // 非跨语言读：帧首值是 msgpack 整数 N（正文长度），`rmp_serde` 读完它就返回，
-        // 目标类型是整数时得到伪造的成功值。判定必须在解码之前。
+        // 非跨语言读：帧首值是 msgpack 整数 N（正文长度），后跟头内填充与 `bin` 正文；
+        // 前置判定让它返回携带错误文本的 `RayError::Unclassified`，避免进入解码器被
+        // 报告为尾随字节的 `RayError::Serialization`。
         let text = b"ValueError: unschedulable";
         let mut pb = Vec::new();
         pb.push((5 << 3) | 2);
