@@ -34,7 +34,7 @@ fn raw_put_i64(value: i64) -> Vec<u8> {
     let guard = rayrust::sys::CBytesGuard::from(bytes).unwrap_or_else(|| {
         panic!(
             "ray_put failed: {:?}",
-            rayrust::sys::last_error().unwrap_or_else(|| "没有留下错误".to_string())
+            rayrust::sys::last_error().unwrap_or_else(|| "no error recorded".to_string())
         )
     });
     guard.as_slice().to_vec()
@@ -49,7 +49,7 @@ fn raw_get_it(id: &[u8]) -> i64 {
     let guard = rayrust::sys::CBytesGuard::from(bytes).unwrap_or_else(|| {
         panic!(
             "ray_get failed: {:?}",
-            rayrust::sys::last_error().unwrap_or_else(|| "没有留下错误".to_string())
+            rayrust::sys::last_error().unwrap_or_else(|| "no error recorded".to_string())
         )
     });
     deserialize(guard.as_slice()).expect("decode the value ray_put wrote")
@@ -59,23 +59,23 @@ fn raw_get_it(id: &[u8]) -> i64 {
 fn raw_c_driver_rejects_a_rebuilt_reference_with_epoch_zero() {
     assert!(
         !unsafe { rayrust::sys::ray_is_initialized() },
-        "这个测试要求进程里没有 Ray runtime"
+        "this test requires no active Ray runtime at start"
     );
 
-    assert_eq!(direct_init_local(), 0, "直接调 ray_init 失败了");
+    assert_eq!(direct_init_local(), 0, "direct ray_init failed");
     assert!(
         unsafe { rayrust::sys::ray_is_initialized() },
-        "ray_init 成功之后运行时仍未初始化"
+        "runtime not initialized after ray_init succeeded"
     );
     assert_eq!(
         unsafe { rayrust::sys::ray_runtime_is_borrowed() },
         0,
-        "本进程的运行时由自己的 ray_init 建立，不该被当成借来的"
+        "runtime created by own ray_init should not be reported as borrowed"
     );
 
     let id = raw_put_i64(73);
-    assert_eq!(id.len(), 28, "ray_put 交回的 id 不是 28 字节");
-    assert_eq!(raw_get_it(&id), 73, "ray_put 写入的对象读不回来");
+    assert_eq!(id.len(), 28, "ray_put did not return a 28-byte id");
+    assert_eq!(raw_get_it(&id), 73, "failed to read back ray_put object");
 
     // 代次为 0 的重建引用必须被拒：本进程的运行时不是别人建的。
     let rebuilt: ObjectRef<i64> = ObjectRef::from(id.clone());
@@ -83,7 +83,7 @@ fn raw_c_driver_rejects_a_rebuilt_reference_with_epoch_zero() {
         Err(RayError::Runtime(message)) => {
             assert!(
                 message.contains("epoch 0"),
-                "拒绝消息里没有代次 0: {}",
+                "rejection message missing epoch 0: {}",
                 message
             );
             println!("RAW_DRIVER_zero_rebuilt_get -> Err(Runtime({}))", message);
@@ -95,7 +95,7 @@ fn raw_c_driver_rejects_a_rebuilt_reference_with_epoch_zero() {
     unsafe { rayrust::sys::ray_shutdown() };
     assert!(
         !unsafe { rayrust::sys::ray_is_initialized() },
-        "ray_shutdown 之后运行时仍在"
+        "runtime still active after ray_shutdown"
     );
     match rebuilt.get_timeout(1000) {
         Err(RayError::Runtime(message)) => {

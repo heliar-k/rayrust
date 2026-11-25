@@ -8,7 +8,7 @@ Ray 的 Rust SDK —— 通过 FFI 封装 Ray C++ SDK，提供地道的 Rust API
 
 | 特性 | 本地模式 | 集群模式 |
 |---|:---:|:---:|
-| `Ray::connect` / `drop`（RAII 生命周期管理） | ✅ | ✅ |
+| `Ray::connect` / `Ray::local` / `drop`（RAII 生命周期管理；`Ray::local()` 为本地模式快捷入口） | ✅ | ✅ |
 | `put` / `get` / `wait` | ✅ | ✅ |
 | `get_many` / `get_many_timeout`（批量获取，可带期限；一次 `Wait` 加逐元素 `Get`，见 #41） | ✅ | ✅ |
 | `get_many_async` / `get_many_timeout_async` / `wait_async`（批量获取与 `Wait` 跑在 tokio blocking pool 上） | ✅ | ✅ |
@@ -30,6 +30,9 @@ Ray 的 Rust SDK —— 通过 FFI 封装 Ray C++ SDK，提供地道的 Rust API
 | XLANG header 自动检测（兼容 Ray 2.56.1+） | ✅ | ✅ |
 | `rmpv::Value` 动态反序列化 | ✅ | ✅ |
 | `put_xlang`（集群模式经 `CoreWorker::Put` 写入 9 字节 XLANG 头与 `XLANG` metadata；本地模式无 `CoreWorker` 与 Python 执行器，返回错误，见 #21） | ❌ | ✅ |
+| `ActorHandle::serialize()` / `ActorHandle::from_serialized()`（跨进程交接 actor 句柄；本地模式无 `CoreWorker`，返回 `RayError::Ffi`） | ❌ | ✅ |
+| `exit_actor()` / `Ray::was_current_actor_restarted()`（actor 方法内的生命周期辅助接口；本地模式下 `exit_actor()` 为空操作且 `was_current_actor_restarted()` 始终返回 `false`） | ✅ | ✅ |
+| 指标 API（基于 `libray_api.so` 的 `Gauge`、`Counter`、`Histogram`、`Sum`；本地模式空操作返回；上游将 `metrics_agent_port` 固定为 `-1`，仅在进程内注册与聚合） | ✅ | ✅ |
 | `ray_last_error_bytes()`（带长度的线程局部错误字节；Rust 提取格式化异常文本，失败时按 UTF-8 lossy 回退） | ✅ | ✅ |
 
 ## 快速开始
@@ -202,6 +205,10 @@ let handle = ray.actor_create(
 )?;
 ```
 
+集群模式下每个任务默认请求 1 个 CPU（与 Python 的 `@ray.remote` 默认行为一致），因此 `--num-cpus` 会限制同时运行的任务数量。如果任务只需要等待或执行 I/O、不希望占用 CPU 槽位，可以通过 `.resource("CPU", 0.0)` 显式清零。仅指定其他资源而未设置 `CPU` 键时，默认值 `1.0` 仍会被合并进去，任务依旧请求 1 个 CPU。这一规则适用于两个接收 `TaskOptions` 的任务入口：`Ray::task_call` 与 `Ray::task_call_python_with_options` 都可以借此将 CPU 设为 0，而无选项入口 `Ray::task_call_python` 始终沿用 1 个 CPU 的默认值。本地模式会忽略全部资源需求，上述规则仅在集群模式生效。
+
+Actor 在 C++ SDK 支持范围内遵循 Ray 的两套默认预设：未指定 `resources` 时，Actor 在整个生命周期内不预留 CPU（与 Python 无选项 Actor 一致；由于 `ActorCreationOptions` 不提供方法级 CPU 字段，方法调用本身也不占用 CPU）。一旦指定了除 `memory` 和 `object_store_memory` 之外的任何资源，就会默认同时为 Actor 的生命周期预留 1 个 CPU；调用 `.resource("CPU", 0.0)` 可显式取消该默认预留，仅指定 `memory` 或 `object_store_memory` 时同样保持为 0 CPU。
+
 ### 对象存储
 
 ```rust
@@ -232,6 +239,32 @@ let (ready, unready) = ray.wait(&[obj1, obj2], 2, 5000)?;
 引用计数，在那里 drop 引用不会释放任何东西。从 id 字节重建的引用
 （`ObjectRef::from(id_bytes)`）不持有引用：对象能不能活到你读它的时候取决于别处
 是否还有引用，读取时用 `get_timeout`。
+
+### 指标
+
+```rust
+use rayrust::prelude::*;
+
+let gauge = Gauge::new("queue_depth", "Pending items", "items", &["worker"])?;
+gauge.set(4.0, &[("worker", "w1")])?;
+
+let counter = Counter::new("requests_total", "Processed requests", "count", &["status"])?;
+counter.inc(1.0, &[("status", "ok")])?;
+
+let hist = Histogram::new(
+    "request_latency_ms",
+    "Request latency",
+    "ms",
+    &[1.0, 5.0, 10.0, 50.0],
+    &["route"],
+)?;
+hist.observe(3.5, &[("route", "/predict")])?;
+
+let sum = Sum::new("bytes_transferred", "Net payload delta", "bytes", &[])?;
+sum.record(256.0, &[])?;
+```
+
+指标句柄可在 `Ray::connect` 之前或任务与 actor 内部构造，并可跨越运行时关闭与重建周期复用。录制调用在参数校验之后受活跃运行时的关闭闸门保护：本地模式不启动 `CoreWorker` 且作为空操作返回 `Ok(())`，集群模式受上游 `ProcessHelper::RayStart` 将 `CoreWorkerOptions::metrics_agent_port` 固定设为 `-1` 的限制只在进程内完成注册与聚合。
 
 ## 架构
 

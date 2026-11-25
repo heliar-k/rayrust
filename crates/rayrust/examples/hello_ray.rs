@@ -72,7 +72,7 @@ fn main() {
     println!("Namespace: {:?}", namespace);
     assert_eq!(
         namespace, "",
-        "本地模式没配置 namespace，读回来的是 {:?}",
+        "local mode without namespace config returned {:?}",
         namespace
     );
 

@@ -39,7 +39,7 @@ fn c_namespace() -> Option<String> {
     let text = unsafe {
         let slice = std::slice::from_raw_parts(bytes.data as *const u8, bytes.len);
         std::str::from_utf8(slice)
-            .expect("C 入口返回的 namespace 必须是合法 UTF-8")
+            .expect("namespace returned from C entry must be valid UTF-8")
             .to_string()
     };
     unsafe { rayrust::sys::ray_free_bytes(&mut bytes) };
@@ -61,20 +61,20 @@ fn assert_nul_ffi_error<T>(
             );
             assert!(
                 message.starts_with(&prefix),
-                "{}: 错误消息 {:?} 未以 {:?} 开头",
+                "{}: error message {:?} did not start with {:?}",
                 label,
                 message,
                 prefix
             );
             assert!(
                 message.contains("cannot cross the C string FFI boundary"),
-                "{}: 错误消息缺少 FFI 边界说明: {:?}",
+                "{}: error message missing FFI boundary note: {:?}",
                 label,
                 message
             );
         }
-        Err(other) => panic!("{}: 预期 Err(RayError::Ffi), 得到 {:?}", label, other),
-        Ok(_) => panic!("{}: 含内部 NUL 的输入返回了 Ok", label),
+        Err(other) => panic!("{}: expected Err(RayError::Ffi), got {:?}", label, other),
+        Ok(_) => panic!("{}: input with interior NUL returned Ok", label),
     }
 }
 
@@ -202,7 +202,7 @@ fn local_lifecycle_rejects_interior_nul_configs_and_calls_cleanly() {
     //    不启动运行时、不写入本地模式 namespace。
     assert!(
         !unsafe { rayrust::sys::ray_is_initialized() },
-        "初始状态要求进程里没有 Ray runtime"
+        "initial state requires no active Ray runtime"
     );
     assert_eq!(c_namespace(), None);
 
@@ -210,13 +210,13 @@ fn local_lifecycle_rejects_interior_nul_configs_and_calls_cleanly() {
         assert_nul_ffi_error(label, Ray::connect(&cfg), "ray_init", field, pos);
         assert!(
             !unsafe { rayrust::sys::ray_is_initialized() },
-            "{} 被拒绝后启动了运行时",
+            "{}: runtime started despite rejection",
             label
         );
         assert_eq!(
             c_namespace(),
             None,
-            "{} 被拒绝后留下了可读的 namespace",
+            "{}: readable namespace left behind despite rejection",
             label
         );
     }
@@ -285,7 +285,7 @@ fn local_lifecycle_rejects_interior_nul_configs_and_calls_cleanly() {
     drop(ray);
     assert!(
         !unsafe { rayrust::sys::ray_is_initialized() },
-        "drop(ray) 后运行时未关闭"
+        "runtime still active after drop(ray)"
     );
 
     for (label, cfg, field, pos) in rejected_config_cases() {
@@ -298,13 +298,13 @@ fn local_lifecycle_rejects_interior_nul_configs_and_calls_cleanly() {
         );
         assert!(
             !unsafe { rayrust::sys::ray_is_initialized() },
-            "关闭后 {} 被拒绝却启动了运行时",
+            "after shutdown {}: runtime started despite rejection",
             label
         );
         assert_eq!(
             c_namespace(),
             None,
-            "关闭后 {} 被拒绝却写入了 namespace",
+            "after shutdown {}: namespace written despite rejection",
             label
         );
     }
@@ -318,6 +318,6 @@ fn local_lifecycle_rejects_interior_nul_configs_and_calls_cleanly() {
     drop(ray2);
     assert!(
         !unsafe { rayrust::sys::ray_is_initialized() },
-        "drop(ray2) 后运行时未关闭"
+        "runtime still active after drop(ray2)"
     );
 }

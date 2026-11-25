@@ -81,10 +81,10 @@ where
 {
     match obj.get() {
         Ok(value) => {
-            assert_eq!(value, expected, "{}: drop 之前读到的值不对", label);
-            println!("  {}: before drop → Ok({:?})", label, value);
+            assert_eq!(value, expected, "{}: unexpected value before drop", label);
+            println!("  {}: before drop -> Ok({:?})", label, value);
         }
-        Err(e) => panic!("{}: drop 之前就读不到: {}", label, e),
+        Err(e) => panic!("{}: failed to read before drop: {}", label, e),
     }
 }
 
@@ -101,31 +101,31 @@ where
     let rebuilt: ObjectRef<T> = ObjectRef::from(id);
     let started = std::time::Instant::now();
     match rebuilt.get_timeout(PROBE_TIMEOUT_MS) {
-        Ok(_) => panic!("{}: 引用已经 drop，重建的引用却读到了值", label),
+        Ok(_) => panic!("{}: rebuilt ref unexpectedly read value after drop", label),
         Err(RayError::Ffi(_)) => {
             let elapsed = started.elapsed();
             assert!(
                 elapsed < std::time::Duration::from_secs(1),
-                "{}: 快速失败变成了等满期限: {:?}",
+                "{}: expected fast failure, waited {:?}",
                 label,
                 elapsed
             );
             println!(
-                "  {}: rebuilt get_timeout → Ffi after {:?}",
+                "  {}: rebuilt get_timeout -> Ffi after {:?}",
                 label, elapsed
             )
         }
-        Err(e) => panic!("{}: 重建的引用返回了别的错误变体: {}", label, e),
+        Err(e) => panic!("{}: rebuilt ref returned unexpected error: {}", label, e),
     }
     match ray.wait(std::slice::from_ref(&rebuilt), 1, PROBE_TIMEOUT_MS) {
-        Err(RayError::Ffi(_)) => println!("  {}: rebuilt wait → Ffi", label),
+        Err(RayError::Ffi(_)) => println!("  {}: rebuilt wait -> Ffi", label),
         Ok((ready, unready)) => panic!(
-            "{}: 对象已经释放，wait 却返回 ready={} unready={}",
+            "{}: object was released, yet wait returned ready={} unready={}",
             label,
             ready.len(),
             unready.len()
         ),
-        Err(e) => panic!("{}: wait 返回了别的错误变体: {}", label, e),
+        Err(e) => panic!("{}: wait returned unexpected error: {}", label, e),
     }
 }
 
@@ -138,10 +138,10 @@ where
     let rebuilt: ObjectRef<T> = ObjectRef::from(id);
     let value = rebuilt
         .get_timeout(PROBE_TIMEOUT_MS)
-        .expect("本地模式 drop 之后对象应当仍然可读");
-    assert_eq!(value, expected, "{}: 本地模式读到的值不对", label);
+        .expect("object should remain readable after drop in local mode");
+    assert_eq!(value, expected, "{}: unexpected value in local mode", label);
     println!(
-        "  {}: drop 之后重建的引用仍读到 {:?}（本地模式不释放）",
+        "  {}: rebuilt ref after drop still returned {:?} (local mode does not release)",
         label, value
     );
 }
@@ -173,25 +173,25 @@ fn run_cluster(ray: &Ray) {
 
     // 对照：释放掉一个对象之后运行时本身照常工作。
     let fresh = ray.put(&99i32).expect("put(99) after the released object");
-    let value = fresh.get().expect("新 put 的对象读不到");
-    assert_eq!(value, 99, "对照场景读到的值不对");
-    println!("  control: 新 put(99) 仍读到 {}", value);
+    let value = fresh.get().expect("fresh put(99) should be readable");
+    assert_eq!(value, 99, "control put(99) returned unexpected value");
+    println!("  control: fresh put(99) still returned {}", value);
 
     // ── 2. clone 的引用 ────────────────────────────────────
-    println!("\n--- 2. put(7) 加 Clone ---");
+    println!("\n--- 2. put(7) + Clone ---");
     let original = ray.put(&7i32).expect("put(7)");
     let clone = original.clone();
     let id = original.id().to_vec();
     drop(original);
-    println!("  原引用已 drop");
-    let value = clone.get().expect("clone 读不到值");
-    assert_eq!(value, 7, "clone 读到的值不对");
-    println!("  clone: 原引用 drop 之后仍读到 {}", value);
+    println!("  original ref dropped");
+    let value = clone.get().expect("clone should remain readable");
+    assert_eq!(value, 7, "clone returned unexpected value");
+    println!("  clone: still returned {} after original drop", value);
     drop(clone);
     assert_released::<i32>(ray, "clone", id);
 
     // ── 3. Rust 任务与 Python 任务的结果 ───────────────────
-    println!("\n--- 3. Rust 任务 add(10, 32) ---");
+    println!("\n--- 3. Rust task add(10, 32) ---");
     let arg1 = rayrust::serialize(&10i32).expect("serialize 10");
     let arg2 = rayrust::serialize(&32i32).expect("serialize 32");
     let args: Vec<&[u8]> = vec![&arg1, &arg2];
@@ -204,32 +204,32 @@ fn run_cluster(ray: &Ray) {
     drop(task_ref);
     assert_released::<i32>(ray, "rust_task", id);
 
-    println!("\n--- 3. Python 任务 add(10, 32) ---");
+    println!("\n--- 3. Python task add(10, 32) ---");
     let py_ref = ray
         .task_call_python(PYTHON_MODULE, "add", &args, &[])
         .expect("task_call_python add");
     let id = py_ref.id().to_vec();
     match py_ref.get_value() {
-        Ok(value) => println!("  python_task: before drop → Ok({})", value),
-        Err(e) => panic!("python_task: drop 之前就读不到: {}", e),
+        Ok(value) => println!("  python_task: before drop -> Ok({})", value),
+        Err(e) => panic!("python_task: failed to read before drop: {}", e),
     }
     drop(py_ref);
     assert_released::<i32>(ray, "python_task", id);
 
     // ── 4. 转成字节之后引用保留 ────────────────────────────
-    println!("\n--- 4. ObjectRef 转成 Vec<u8> ---");
+    println!("\n--- 4. ObjectRef converted to Vec<u8> ---");
     let obj = ray.put(&11i32).expect("put(11)");
     let id: Vec<u8> = obj.into();
-    println!("  转成 {} 字节的 id", id.len());
+    println!("  converted to {}-byte id", id.len());
     let rebuilt: ObjectRef<i32> = ObjectRef::from(id);
     let value = rebuilt
         .get_timeout(PROBE_TIMEOUT_MS)
-        .expect("转成字节之后对象应当仍然活着");
-    assert_eq!(value, 11, "转成字节之后读到的值不对");
-    println!("  转成字节之后重建的引用读到 {}（引用随字节保留）", value);
+        .expect("object should stay alive after Vec<u8> conversion");
+    assert_eq!(value, 11, "unexpected value after Vec<u8> conversion");
+    println!("  rebuilt ref after Vec<u8> conversion returned {} (ref kept)", value);
 
     // ── 5. 嵌套引用不可见 ────────────────────────────────────
-    println!("\n--- 5. Python 返回装着 ObjectRef 的 dict ---");
+    println!("\n--- 5. Python returns dict containing ObjectRef ---");
     let nested = ray
         .task_call_python(PYTHON_MODULE, "return_dict_with_ref", &[], &[])
         .expect("task_call_python return_dict_with_ref");
@@ -239,7 +239,7 @@ fn run_cluster(ray: &Ray) {
         .expect("wait return_dict_with_ref");
     assert!(
         ready.len() == 1 && unready.is_empty(),
-        "return_dict_with_ref 没有就绪: ready={} unready={}",
+        "return_dict_with_ref not ready: ready={} unready={}",
         ready.len(),
         unready.len()
     );
@@ -247,18 +247,20 @@ fn run_cluster(ray: &Ray) {
     // src/ray/common/ray_object.h），RayRuntime::Get 只返回 msgbuffer。所以嵌套
     // 引用在 Rust 侧不可见：dict 里那个 ObjectRef 进了 pickle5 段，Rust 解不开，
     // 也不会因为它保持存活。这个检查钉住的就是这个限制。
-    let raw = nested.get_raw_bytes().expect("return_dict_with_ref 的原始字节");
-    let declared = declared_msgpack_len(&raw).expect("9 字节头里的 msgpack 段长度");
+    let raw = nested
+        .get_raw_bytes()
+        .expect("raw bytes of return_dict_with_ref");
+    let declared = declared_msgpack_len(&raw).expect("declared msgpack length in 9-byte header");
     assert!(
         raw.len() > XLANG_HEADER_LEN + declared,
-        "载荷里没有 pickle5 段: len={} 头={} 声明的 msgpack 段={}",
+        "payload missing pickle5 section: len={} header={} declared_msgpack={}",
         raw.len(),
         XLANG_HEADER_LEN,
         declared
     );
     let pickle = raw.len() - XLANG_HEADER_LEN - declared;
     println!(
-        "  raw len={} 前 9 字节={} 声明的 msgpack 段={} pickle5 段={}",
+        "  raw len={} header9={} declared_msgpack={} pickle5={}",
         raw.len(),
         hex(&raw[..XLANG_HEADER_LEN]),
         declared,
@@ -266,10 +268,10 @@ fn run_cluster(ray: &Ray) {
     );
     match nested.get_value() {
         Err(RayError::Serialization(msg)) => {
-            println!("  get_value → Serialization({})", msg)
+            println!("  get_value -> Serialization({})", msg)
         }
-        Ok(value) => panic!("嵌套引用应当读不出来，却读到了 {}", value),
-        Err(e) => panic!("get_value 返回了别的错误变体: {}", e),
+        Ok(value) => panic!("nested ref should not decode, yet got {}", value),
+        Err(e) => panic!("get_value returned unexpected error variant: {}", e),
     }
 }
 
@@ -282,18 +284,18 @@ fn run_local(ray: &Ray) {
     drop(obj);
     assert_survives_drop("put", id, 42);
 
-    println!("\n--- 2. put(7) 加 Clone ---");
+    println!("\n--- 2. put(7) + Clone ---");
     let original = ray.put(&7i32).expect("put(7)");
     let clone = original.clone();
     let id = original.id().to_vec();
     drop(original);
-    let value = clone.get().expect("clone 读不到值");
-    assert_eq!(value, 7, "clone 读到的值不对");
-    println!("  clone: 原引用 drop 之后仍读到 {}", value);
+    let value = clone.get().expect("clone should remain readable");
+    assert_eq!(value, 7, "clone returned unexpected value");
+    println!("  clone: still returned {} after original drop", value);
     drop(clone);
     assert_survives_drop("clone", id, 7);
 
-    println!("\n--- 3. Rust 任务 add(10, 32) ---");
+    println!("\n--- 3. Rust task add(10, 32) ---");
     let task_ref = add_remote(ray, 10, 32).expect("submit add(10, 32)");
     let id = task_ref.id().to_vec();
     read_before_drop(&task_ref, 42, "rust_task");
@@ -305,7 +307,7 @@ fn main() {
     let mode = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "cluster".to_string());
-    println!("=== Ray 引用计数 ({}) ===", mode);
+    println!("=== Ray ref counting ({}) ===", mode);
     let config = match mode.as_str() {
         "local" => RayConfig::local(),
         "cluster" => cluster_config(),
@@ -320,12 +322,12 @@ fn main() {
     }
 
     // ── 6. 最后一个句柄 drop 之后 drop 活着的引用 ──────────
-    println!("\n--- 收尾：最后一个句柄 drop 之后 drop 活着的引用 ---");
+    println!("\n--- Teardown: drop live ref after last Ray handle drop ---");
     let survivor = ray.put(&5i32).expect("put(5)");
     drop(ray);
-    println!("  最后一个 Ray 句柄已 drop");
+    println!("  last Ray handle dropped");
     drop(survivor);
-    println!("  活着的引用 drop 完成，引用计数被代次守卫跳过");
+    println!("  live ref dropped, ref counting skipped by epoch guard");
 
-    println!("\n✓ 引用计数检查全部通过");
+    println!("\nPASS: all ref counting checks passed");
 }

@@ -85,7 +85,7 @@ pub fn exit_from_task() -> i64 {
 #[remote]
 pub fn handle_handoff(serialized: Vec<u8>, raw_id: Vec<u8>) -> (Vec<u8>, Vec<u8>, String, String) {
     let restored = match rayrust::ActorHandle::from_serialized(&serialized) {
-        Ok(handle) => format!("Ok({} 字节 id)", handle.id().len()),
+        Ok(handle) => format!("Ok({}-byte id)", handle.id().len()),
         Err(error) => format!("Err({})", error),
     };
     let called = call_actor_by_raw_id(&raw_id);
@@ -109,12 +109,13 @@ fn call_actor_by_raw_id(actor_id: &[u8]) -> String {
         )
     };
     if out.data.is_null() {
-        let message = rayrust::sys::last_error().unwrap_or_else(|| "没有留下错误".to_string());
+        let message =
+            rayrust::sys::last_error().unwrap_or_else(|| "no error recorded".to_string());
         return format!("Err({})", message);
     }
     let len = out.len;
     unsafe { rayrust::sys::ray_free_bytes(&mut out) };
-    format!("Ok({} 字节 object id)", len)
+    format!("Ok({}-byte object id)", len)
 }
 
 /// 在工人进程里经 `ObjectRef::from(id).get()` 读取驱动写入的对象。

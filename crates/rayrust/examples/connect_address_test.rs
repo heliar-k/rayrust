@@ -44,22 +44,22 @@ fn expect_rejected(label: &str, config: &RayConfig, field: &str, sentence: &str)
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains(&format!("{} \"", field)),
-                "{}: 错误文本里没有点名 {}: {}",
+                "{}: error message does not name {}: {}",
                 label,
                 field,
                 message
             );
             assert!(
                 message.contains(sentence),
-                "{}: 错误文本里没有 {:?}: {}",
+                "{}: error message does not contain {:?}: {}",
                 label,
                 sentence,
                 message
             );
-            println!("  {} → Ffi({})", label, message);
+            println!("  {} -> Ffi({})", label, message);
         }
-        Err(other) => panic!("{}: 返回了别的错误变体: {}", label, other),
-        Ok(_) => panic!("{}: 被接受了", label),
+        Err(other) => panic!("{}: returned unexpected error variant: {}", label, other),
+        Ok(_) => panic!("{}: unexpectedly succeeded", label),
     }
 }
 
@@ -69,7 +69,7 @@ fn connect_local(label: &str, address: &str) -> Ray {
     config.address = address.to_string();
     match Ray::connect(&config) {
         Ok(ray) => ray,
-        Err(e) => panic!("{}: 本地模式拒绝了地址 {:?}: {}", label, address, e),
+        Err(e) => panic!("{}: local mode rejected address {:?}: {}", label, address, e),
     }
 }
 
@@ -77,18 +77,18 @@ fn connect_local(label: &str, address: &str) -> Ray {
 fn expect_local_works(label: &str, ray: &Ray) {
     let object = match ray.put(&42i32) {
         Ok(object) => object,
-        Err(e) => panic!("{}: 本地模式 put 失败: {}", label, e),
+        Err(e) => panic!("{}: local mode put failed: {}", label, e),
     };
     match object.get() {
-        Ok(value) => assert_eq!(value, 42, "{}: get 读回的值不是 42: {}", label, value),
-        Err(e) => panic!("{}: 本地模式 get 失败: {}", label, e),
+        Ok(value) => assert_eq!(value, 42, "{}: get returned {} instead of 42", label, value),
+        Err(e) => panic!("{}: local mode get failed: {}", label, e),
     }
-    println!("  {} → Ok，put/get 读回 42", label);
+    println!("  {} -> Ok, put/get returned 42", label);
 }
 
 fn main() {
     // 拒绝项全部用集群模式，地址非空时不会走到 `RAY_ADDRESS` 那一路。
-    println!("--- 1. 集群 + \"local\" ---");
+    println!("--- 1. cluster + \"local\" ---");
     expect_rejected(
         "cluster \"local\"",
         &RayConfig::new("local"),
@@ -96,7 +96,7 @@ fn main() {
         "no ':' separator",
     );
 
-    println!("\n--- 2. 集群 + \"127.0.0.1:abc\" ---");
+    println!("\n--- 2. cluster + \"127.0.0.1:abc\" ---");
     expect_rejected(
         "cluster \"127.0.0.1:abc\"",
         &RayConfig::new("127.0.0.1:abc"),
@@ -104,7 +104,7 @@ fn main() {
         "the port must be decimal digits",
     );
 
-    println!("\n--- 3. 集群 + \"127.0.0.1\" ---");
+    println!("\n--- 3. cluster + \"127.0.0.1\" ---");
     expect_rejected(
         "cluster \"127.0.0.1\"",
         &RayConfig::new("127.0.0.1"),
@@ -112,7 +112,7 @@ fn main() {
         "no ':' separator",
     );
 
-    println!("\n--- 4. 集群 + \"::1\" ---");
+    println!("\n--- 4. cluster + \"::1\" ---");
     expect_rejected(
         "cluster \"::1\"",
         &RayConfig::new("::1"),
@@ -120,7 +120,7 @@ fn main() {
         "an IPv6 host must be bracketed",
     );
 
-    println!("\n--- 5. 集群 + \":6399\" ---");
+    println!("\n--- 5. cluster + \":6399\" ---");
     expect_rejected(
         "cluster \":6399\"",
         &RayConfig::new(":6399"),
@@ -128,7 +128,7 @@ fn main() {
         "the host is empty",
     );
 
-    println!("\n--- 6. 集群 + \"127.0.0.1:\" ---");
+    println!("\n--- 6. cluster + \"127.0.0.1:\" ---");
     expect_rejected(
         "cluster \"127.0.0.1:\"",
         &RayConfig::new("127.0.0.1:"),
@@ -136,7 +136,7 @@ fn main() {
         "the port is empty",
     );
 
-    println!("\n--- 7. 集群 + \"127.0.0.1:65536\" ---");
+    println!("\n--- 7. cluster + \"127.0.0.1:65536\" ---");
     expect_rejected(
         "cluster \"127.0.0.1:65536\"",
         &RayConfig::new("127.0.0.1:65536"),
@@ -144,7 +144,7 @@ fn main() {
         "the port must be 0..=65535",
     );
 
-    println!("\n--- 8. 集群 + \"127.0.0.1:-1\" ---");
+    println!("\n--- 8. cluster + \"127.0.0.1:-1\" ---");
     expect_rejected(
         "cluster \"127.0.0.1:-1\"",
         &RayConfig::new("127.0.0.1:-1"),
@@ -152,7 +152,7 @@ fn main() {
         "the port must be decimal digits",
     );
 
-    println!("\n--- 9. 集群 + 空地址 + RAY_ADDRESS=\"local\" ---");
+    println!("\n--- 9. cluster + empty address + RAY_ADDRESS=\"local\" ---");
     std::env::set_var("RAY_ADDRESS", "local");
     let result = Ray::connect(&RayConfig::new(""));
     std::env::remove_var("RAY_ADDRESS");
@@ -160,33 +160,33 @@ fn main() {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains("RAY_ADDRESS \""),
-                "第 9 项: 错误文本里没有点名 RAY_ADDRESS: {}",
+                "case 9: error message does not name RAY_ADDRESS: {}",
                 message
             );
             assert!(
                 message.contains("no ':' separator"),
-                "第 9 项: 错误文本里没有分隔符那一句: {}",
+                "case 9: error message missing separator detail: {}",
                 message
             );
-            println!("  cluster \"\" + RAY_ADDRESS=\"local\" → Ffi({})", message);
+            println!("  cluster \"\" + RAY_ADDRESS=\"local\" -> Ffi({})", message);
         }
-        Err(other) => panic!("第 9 项: 返回了别的错误变体: {}", other),
-        Ok(_) => panic!("第 9 项: 被接受了"),
+        Err(other) => panic!("case 9: returned unexpected error variant: {}", other),
+        Ok(_) => panic!("case 9: unexpectedly succeeded"),
     }
 
-    println!("\n--- 10. 本地 + \"local\" ---");
+    println!("\n--- 10. local + \"local\" ---");
     expect_local_works(
         "local \"local\"",
         &connect_local("local \"local\"", "local"),
     );
 
-    println!("\n--- 11. 本地 + \"127.0.0.1:abc\" ---");
+    println!("\n--- 11. local + \"127.0.0.1:abc\" ---");
     expect_local_works(
         "local \"127.0.0.1:abc\"",
         &connect_local("local \"127.0.0.1:abc\"", "127.0.0.1:abc"),
     );
 
-    println!("\n--- 12. 本地 + \"127.0.0.1:6399\" + RAY_ADDRESS=\"local\" ---");
+    println!("\n--- 12. local + \"127.0.0.1:6399\" + RAY_ADDRESS=\"local\" ---");
     // `RAY_ADDRESS` 那一路只在集群模式跑：本地模式必须忽略它。去掉 `ray_init` 里的
     // `!local &&`，这里的 connect 会拿到 `Ffi`。
     std::env::set_var("RAY_ADDRESS", "local");
@@ -196,14 +196,14 @@ fn main() {
     std::env::remove_var("RAY_ADDRESS");
     let ray = match connected {
         Ok(ray) => ray,
-        Err(e) => panic!("第 12 项: 本地模式被 RAY_ADDRESS 影响，返回了 {}", e),
+        Err(e) => panic!("case 12: local mode was affected by RAY_ADDRESS: {}", e),
     };
     assert!(
         std::env::var_os("RAY_ADDRESS").is_none(),
-        "第 12 项: RAY_ADDRESS 没有从环境里删掉"
+        "case 12: RAY_ADDRESS was not removed from env"
     );
     expect_local_works("local \"127.0.0.1:6399\" + RAY_ADDRESS=\"local\"", &ray);
     drop(ray);
 
-    println!("\n✓ 地址校验在 12 个形态上成立");
+    println!("\nPASS: address validation passed on all 12 cases");
 }

@@ -180,15 +180,15 @@ fn expect_ffi_containing<T>(what: &str, result: Result<T, RayError>, needle: &st
         Err(RayError::Ffi(msg)) => {
             assert!(
                 msg.contains(needle),
-                "{} 的错误文本里没有 {:?}: {}",
+                "{} error message does not contain {:?}: {}",
                 what,
                 needle,
                 msg
             );
-            println!("  {} → Ffi({})", what, msg);
+            println!("  {} -> Ffi({})", what, msg);
         }
-        Err(other) => panic!("{} 返回了别的错误变体: {}", what, other),
-        Ok(_) => panic!("{} 返回了 Ok，本该被拒", what),
+        Err(other) => panic!("{} returned unexpected error variant: {}", what, other),
+        Ok(_) => panic!("{} returned Ok, expected refusal", what),
     }
 }
 
@@ -212,8 +212,8 @@ fn create_counter_python(ray: &Ray, opts: &ActorOptions) -> Result<ActorHandle, 
 /// 承诺的行为：拒绝时错误类别必须是 `RAY_ERROR_KIND_GENERIC`，所以这里直接把类别
 /// 读出来断言，不用示例自己造的错误自证。
 fn create_actor_with_raw_options(options_json: &str) -> Result<Vec<u8>, RayError> {
-    let factory = std::ffi::CString::new(COUNTER_FACTORY).expect("factory 名不含 NUL");
-    let options = std::ffi::CString::new(options_json).expect("options JSON 不含 NUL");
+    let factory = std::ffi::CString::new(COUNTER_FACTORY).expect("factory name has no NUL");
+    let options = std::ffi::CString::new(options_json).expect("options JSON has no NUL");
     // 与本进程其它创建路径一样传一个构造函数参数：拒绝逻辑失效时工人真的会去构造
     // Counter，缺参数会让它在反序列化处 panic 并留下一份 core。
     let start = serialize(&1i64).expect("serialize the constructor argument");
@@ -231,11 +231,12 @@ fn create_actor_with_raw_options(options_json: &str) -> Result<Vec<u8>, RayError
         assert_eq!(
             kind,
             rayrust::sys::ErrorKind::Generic,
-            "options JSON {} 的错误类别不是 Generic: {:?}",
+            "options JSON {} error kind was not Generic: {:?}",
             options_json,
             kind
         );
-        let message = rayrust::sys::last_error().unwrap_or_else(|| "没有留下错误".to_string());
+        let message =
+            rayrust::sys::last_error().unwrap_or_else(|| "no error recorded".to_string());
         return Err(RayError::Ffi(message));
     }
     let id = unsafe { std::slice::from_raw_parts(bytes.data as *const u8, bytes.len) }.to_vec();
@@ -248,9 +249,9 @@ fn create_actor_with_raw_options(options_json: &str) -> Result<Vec<u8>, RayError
 /// 第 10 项用它建一个带名字的 Python actor：这个入口同样不经过 crate 的登记表，
 /// `get_actor` 因此是首次登记，读出的语言与创建描述符类型才能被断言。
 fn create_python_actor_with_raw_options(options_json: &str) -> Result<Vec<u8>, RayError> {
-    let module = std::ffi::CString::new("rayrust_test").expect("module 名不含 NUL");
-    let class = std::ffi::CString::new("Counter").expect("class 名不含 NUL");
-    let options = std::ffi::CString::new(options_json).expect("options JSON 不含 NUL");
+    let module = std::ffi::CString::new("rayrust_test").expect("module name has no NUL");
+    let class = std::ffi::CString::new("Counter").expect("class name has no NUL");
+    let options = std::ffi::CString::new(options_json).expect("options JSON has no NUL");
     let mut bytes = unsafe {
         rayrust::sys::ray_actor_create_python_with_options(
             module.as_ptr(),
@@ -261,7 +262,8 @@ fn create_python_actor_with_raw_options(options_json: &str) -> Result<Vec<u8>, R
         )
     };
     if bytes.data.is_null() {
-        let message = rayrust::sys::last_error().unwrap_or_else(|| "没有留下错误".to_string());
+        let message =
+            rayrust::sys::last_error().unwrap_or_else(|| "no error recorded".to_string());
         return Err(RayError::Ffi(message));
     }
     let id = unsafe { std::slice::from_raw_parts(bytes.data as *const u8, bytes.len) }.to_vec();
@@ -275,8 +277,9 @@ fn create_python_actor_with_raw_options(options_json: &str) -> Result<Vec<u8>, R
 /// 调用；这条入口就是任务那一行的运行时覆盖。函数名在本地模式与集群模式都不会被执行：
 /// 拒绝发生在提交之前。
 fn create_task_with_raw_options(options_json: &str) -> Result<Vec<u8>, RayError> {
-    let func = std::ffi::CString::new("__rayrust_no_such_function").expect("函数名不含 NUL");
-    let options = std::ffi::CString::new(options_json).expect("options JSON 不含 NUL");
+    let func =
+        std::ffi::CString::new("__rayrust_no_such_function").expect("function name has no NUL");
+    let options = std::ffi::CString::new(options_json).expect("options JSON has no NUL");
     let mut bytes = unsafe {
         rayrust::sys::ray_task_call_with_options(
             func.as_ptr(),
@@ -292,11 +295,12 @@ fn create_task_with_raw_options(options_json: &str) -> Result<Vec<u8>, RayError>
         assert_eq!(
             kind,
             rayrust::sys::ErrorKind::Generic,
-            "options JSON {} 的错误类别不是 Generic: {:?}",
+            "options JSON {} error kind was not Generic: {:?}",
             options_json,
             kind
         );
-        let message = rayrust::sys::last_error().unwrap_or_else(|| "没有留下错误".to_string());
+        let message =
+            rayrust::sys::last_error().unwrap_or_else(|| "no error recorded".to_string());
         return Err(RayError::Ffi(message));
     }
     let id = unsafe { std::slice::from_raw_parts(bytes.data as *const u8, bytes.len) }.to_vec();
@@ -306,16 +310,16 @@ fn create_task_with_raw_options(options_json: &str) -> Result<Vec<u8>, RayError>
 
 /// 1. 默认值：两个构造入口与结构体更新语法的 `bundle_index` 都是 -1。
 async fn defaults_check(ray: &Ray) {
-    println!("\n--- 1. 默认值 ---");
+    println!("\n--- 1. Defaults ---");
     assert_eq!(
         ActorOptions::default().bundle_index,
         -1,
-        "ActorOptions::default() 的 bundle_index 不是 -1"
+        "ActorOptions::default().bundle_index is not -1"
     );
     assert_eq!(
         ActorOptions::new().bundle_index,
         -1,
-        "ActorOptions::new() 的 bundle_index 不是 -1"
+        "ActorOptions::new().bundle_index is not -1"
     );
     let grouped = ActorOptions {
         placement_group_id: vec![0x01u8; 18],
@@ -323,37 +327,37 @@ async fn defaults_check(ray: &Ray) {
     };
     assert_eq!(
         grouped.bundle_index, -1,
-        "只给 placement_group_id 时 bundle_index 不是 -1"
+        "bundle_index with placement_group_id only is not -1"
     );
-    println!("  default()/new()/结构体更新语法的 bundle_index = -1（组内任意 bundle）");
+    println!("  default()/new()/struct update syntax bundle_index = -1 (any bundle)");
 
-    let handle = counter_actor_create(ray, &ActorOptions::new(), 7i64).expect("创建 Counter");
+    let handle = counter_actor_create(ray, &ActorOptions::new(), 7i64).expect("create Counter");
     let value: i64 = counter_get_sync(ray, &handle)
         .expect("submit get")
         .get_timeout(GET_TIMEOUT_MS)
         .expect("read get");
-    assert_eq!(value, 7, "默认 options 的 actor 读到 {}", value);
-    println!("  ActorOptions::new() 建的 actor → get() = 7");
-    println!("  to_json 的形状（默认空串、带组时两个键都在）由单元测试覆盖");
+    assert_eq!(value, 7, "default-options actor returned {}", value);
+    println!("  ActorOptions::new() actor -> get() = 7");
+    println!("  to_json shape (empty by default, both keys when grouped) covered by unit tests");
 }
 
 /// 2. id 长度与格式：四次拒绝，随后普通 actor 照常工作。
 async fn id_format_check(ray: &Ray) {
-    println!("\n--- 2. id 长度与格式 ---");
+    println!("\n--- 2. ID length and format ---");
     // 17 与 19 字节：C 侧的长度检查。
     let short = ActorOptions::new().placement_group(vec![0u8; 17], 0);
-    expect_ffi_containing("17 字节 id", create_counter(ray, &short), "18 bytes");
+    expect_ffi_containing("17-byte id", create_counter(ray, &short), "18 bytes");
     let long = ActorOptions::new().placement_group(vec![0u8; 19], 0);
-    expect_ffi_containing("19 字节 id", create_counter(ray, &long), "18 bytes");
+    expect_ffi_containing("19-byte id", create_counter(ray, &long), "18 bytes");
 
     // 空串与非法 hex：`hex_decode` 对两者都返回空串，C 侧报「必须是 18 字节 hex」。
     expect_ffi_containing(
-        "空串 id",
+        "empty string id",
         create_actor_with_raw_options(r#"{"placement_group_id":"","bundle_index":0}"#),
         "hex",
     );
     expect_ffi_containing(
-        "非 hex id",
+        "non-hex id",
         create_actor_with_raw_options(
             r#"{"placement_group_id":"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz","bundle_index":0}"#,
         ),
@@ -361,39 +365,39 @@ async fn id_format_check(ray: &Ray) {
     );
 
     // 四次拒绝之后运行时仍然可用。
-    let handle = counter_actor_create(ray, &ActorOptions::new(), 21i64).expect("创建 Counter");
+    let handle = counter_actor_create(ray, &ActorOptions::new(), 21i64).expect("create Counter");
     let value: i64 = counter_get(ray, &handle)
         .await
         .expect("submit get")
         .get_timeout(GET_TIMEOUT_MS)
         .expect("read get");
-    assert_eq!(value, 21, "拒绝之后的 actor 读到 {}", value);
-    println!("  四次拒绝之后 → 普通 actor 的 get() = 21（进程与运行时都存活）");
+    assert_eq!(value, 21, "actor after rejections returned {}", value);
+    println!("  after 4 rejections -> regular actor get() = 21 (process and runtime alive)");
 }
 
 /// 3. `bundle_index` 的范围：-1，或 0 .. INT_MAX。两种模式都跑。
 async fn bundle_index_range_check(ray: &Ray, cluster: bool) {
-    println!("\n--- 3. bundle_index 的范围 ---");
+    println!("\n--- 3. bundle_index range ---");
     // 范围检查在组解码与本地模式检查之前，所以本地模式同样可达：集群模式用一个真组，
     // 本地模式用任意 18 字节 id，这条分支不需要组存在。
     let pg_id = if cluster {
         let id = ray
             .placement_group_create("rayrust_actor_options_neg", r#"[{"CPU":1}]"#, 0)
             .expect("create the single-bundle placement group");
-        println!("  placement_group_create([CPU 1]) → {} 字节 id", id.len());
+        println!("  placement_group_create([CPU 1]) -> {}-byte id", id.len());
         id
     } else {
-        println!("  本地模式：用任意 18 字节 id（下面这条拒绝来自 bundle_index 的范围检查，");
-        println!("  发生在组解码与本地模式检查之前）");
+        println!("  local mode: using arbitrary 18-byte id (refusal below comes from");
+        println!("  bundle_index range check before group decode and local mode check)");
         vec![0u8; 18]
     };
     let pg_hex = hex_of(&pg_id);
 
     let opts = ActorOptions::new().placement_group(pg_id.clone(), -2);
     let label = if cluster {
-        "真组 + bundle_index=-2（类型化 API）"
+        "real group + bundle_index=-2 (typed API)"
     } else {
-        "任意 id + bundle_index=-2（类型化 API）"
+        "arbitrary id + bundle_index=-2 (typed API)"
     };
     expect_ffi_containing(label, create_counter(ray, &opts), "-1 or between");
 
@@ -402,17 +406,17 @@ async fn bundle_index_range_check(ray: &Ray, cluster: bool) {
     let out_of_range = [
         (
             "-4294967296",
-            "= -2^32；get<int>() 截断成 0，会钉在第一个 bundle",
+            "= -2^32; get<int>() truncates to 0 (pins bundle 0)",
         ),
         (
             "-4294967297",
-            "= -(2^32+1)；get<int>() 截断成 -1，会当成任意 bundle",
+            "= -(2^32+1); get<int>() truncates to -1 (any bundle)",
         ),
-        ("-2147483649", "= -(2^31+1)；get<int>() 截断成 2147483647"),
-        ("9999999999999", "get<int>() 截断成 1316134911"),
+        ("-2147483649", "= -(2^31+1); get<int>() truncates to 2147483647"),
+        ("9999999999999", "get<int>() truncates to 1316134911"),
         (
             "18446744073709551615",
-            "= 2^64-1；get<int>() 截断成 -1（get<int64_t>() 也会回绕成 -1），会当成任意 bundle",
+            "= 2^64-1; get<int>() and get<int64_t>() wrap to -1",
         ),
     ];
     for (raw, note) in out_of_range {
@@ -421,7 +425,7 @@ async fn bundle_index_range_check(ray: &Ray, cluster: bool) {
             pg_hex, raw
         );
         expect_ffi_containing(
-            &format!("原始 ABI bundle_index={}（{}，现在被拒绝）", raw, note),
+            &format!("raw ABI bundle_index={} ({}, rejected)", raw, note),
             create_actor_with_raw_options(&json),
             "-1 or between",
         );
@@ -433,7 +437,7 @@ async fn bundle_index_range_check(ray: &Ray, cluster: bool) {
         pg_hex
     );
     expect_ffi_containing(
-        "原始 ABI 的任务提交 bundle_index=-4294967296（任务路径共用一个解码器）",
+        "raw ABI task submit bundle_index=-4294967296 (shared decoder)",
         create_task_with_raw_options(&task_json),
         "-1 or between",
     );
@@ -441,18 +445,17 @@ async fn bundle_index_range_check(ray: &Ray, cluster: bool) {
     if cluster {
         ray.placement_group_remove(&pg_id)
             .expect("remove the placement group after the raw ABI check");
-        println!("  placement group 已 remove；进程存活");
+        println!("  placement group removed; process alive");
     } else {
-        println!("  进程存活（本地模式没有组需要移除）");
+        println!("  process alive (no group to remove in local mode)");
     }
 }
 
 /// 4. 未知的合法 18 字节 id：不静默在组外建 actor。
 async fn unknown_group_check(ray: &Ray, cluster: bool) {
-    println!("\n--- 4. 未知 placement group ---");
+    println!("\n--- 4. Unknown placement group ---");
     if !cluster {
-        println!("  本地模式跳过：本地模式在查组之前就报错（见第 8 项），");
-        println!("  查不到组这条分支走不到。");
+        println!("  skipped in local mode: local mode errors before group lookup (see step 8).");
         return;
     }
     let unknown: Vec<u8> = (0..18u8).collect();
@@ -462,49 +465,48 @@ async fn unknown_group_check(ray: &Ray, cluster: bool) {
         Err(RayError::Ffi(msg)) => {
             assert!(
                 msg.contains("placement group not found for id"),
-                "错误文本没有指出查不到组: {}",
+                "error message does not mention missing placement group: {}",
                 msg
             );
             assert!(
                 msg.contains(&unknown_hex),
-                "错误文本里没有 id {}: {}",
+                "error message missing id {}: {}",
                 unknown_hex,
                 msg
             );
-            println!("  随机 18 字节 id {} → Ffi({})", unknown_hex, msg);
+            println!("  random 18-byte id {} -> Ffi({})", unknown_hex, msg);
         }
-        Err(other) => panic!("未知组返回了别的错误变体: {}", other),
-        Ok(_) => panic!("未知组的 actor 被建出来了（静默在组外创建）"),
+        Err(other) => panic!("unknown group returned unexpected error variant: {}", other),
+        Ok(_) => panic!("actor with unknown group was created outside any group"),
     }
-    println!("  进程存活：错误发生在创建侧，没有 abort");
+    println!("  process alive: error reported on creation without aborting");
 }
 
 /// 5 + 6. 孤立的 `bundle_index`：两个入口都在创建之前拒绝。
 async fn standalone_bundle_index_check(ray: &Ray) {
-    println!("\n--- 5+6. 孤立 bundle_index（两个入口） ---");
+    println!("\n--- 5+6. Standalone bundle_index (both entries) ---");
     let opts = ActorOptions {
         bundle_index: 2,
         ..Default::default()
     };
     expect_ffi_containing(
-        "Ray::actor_create 的孤立 bundle_index=2",
+        "Ray::actor_create standalone bundle_index=2",
         create_counter(ray, &opts),
         "would be dropped",
     );
     expect_ffi_containing(
-        "Ray::actor_create_python 的孤立 bundle_index=2",
+        "Ray::actor_create_python standalone bundle_index=2",
         create_counter_python(ray, &opts),
         "would be dropped",
     );
-    println!("  两个入口都在进 C 之前拒绝，字段不会被静默丢掉");
+    println!("  both entries refused before C layer so field is never silently dropped");
 }
 
 /// 7. 默认 `bundle_index = -1` 真的不钉在 bundle 0。
 async fn default_bundle_index_not_pinned_check(ray: &Ray, cluster: bool) {
-    println!("\n--- 7. 默认 bundle_index 不钉在 bundle 0 ---");
+    println!("\n--- 7. Default bundle_index is not pinned to bundle 0 ---");
     if !cluster {
-        println!("  本地模式跳过：placement groups are not supported in local mode，");
-        println!("  bundle 与资源都没有意义。");
+        println!("  skipped in local mode: placement groups are not supported in local mode.");
         return;
     }
 
@@ -516,7 +518,7 @@ async fn default_bundle_index_not_pinned_check(ray: &Ray, cluster: bool) {
         )
         .expect("create the two-bundle placement group");
     println!(
-        "  placement_group_create([CPU 1, CPU 1]) → {} 字节 id",
+        "  placement_group_create([CPU 1, CPU 1]) -> {}-byte id",
         pg_id.len()
     );
 
@@ -531,9 +533,9 @@ async fn default_bundle_index_not_pinned_check(ray: &Ray, cluster: bool) {
     let value = short
         .get_timeout(ACTOR_START_TIMEOUT_MS)
         .expect("the short task bound to bundle 0 must finish");
-    assert_eq!(value, 0, "sleep_for 返回了 {}", value);
+    assert_eq!(value, 0, "sleep_for returned {}", value);
     println!(
-        "  绑 bundle 0 的短任务 → 完成，耗时 {:?}（组已生效）",
+        "  short task bound to bundle 0 -> finished in {:?} (group active)",
         started.elapsed()
     );
 
@@ -544,7 +546,7 @@ async fn default_bundle_index_not_pinned_check(ray: &Ray, cluster: bool) {
     let long = sleep_for_remote_with_options(ray, &long_opts, LONG_SLEEP_S)
         .expect("submit the long task bound to bundle 0");
     println!(
-        "  绑 bundle 0 的长任务已提交（sleep_for({}s)）",
+        "  long task bound to bundle 0 submitted (sleep_for({}s))",
         LONG_SLEEP_S
     );
 
@@ -557,9 +559,9 @@ async fn default_bundle_index_not_pinned_check(ray: &Ray, cluster: bool) {
         resources: vec![("CPU".to_string(), 1.0)],
         ..Default::default()
     };
-    assert_eq!(default_opts.bundle_index, -1, "默认 bundle_index 不是 -1");
+    assert_eq!(default_opts.bundle_index, -1, "default bundle_index is not -1");
     let unpinned =
-        counter_actor_create(ray, &default_opts, 3i64).expect("创建默认 options 的 actor");
+        counter_actor_create(ray, &default_opts, 3i64).expect("create default-options actor");
     let started = Instant::now();
     let value: i64 = match counter_get(ray, &unpinned)
         .await
@@ -568,13 +570,13 @@ async fn default_bundle_index_not_pinned_check(ray: &Ray, cluster: bool) {
     {
         Ok(value) => value,
         Err(error) => panic!(
-            "默认 bundle_index 的 actor 第一次调用没有在期限内完成（bundle 0 已被占住，只有 bundle 1 能跑）: {}",
+            "default bundle_index actor first call did not finish within deadline (bundle 0 held, bundle 1 free): {}",
             error
         ),
     };
-    assert_eq!(value, 3, "默认 bundle_index 的 actor 读到 {}", value);
+    assert_eq!(value, 3, "default bundle_index actor returned {}", value);
     println!(
-        "  默认 bundle_index 的 actor → get() = {}，耗时 {:?}（只能在 bundle 1 上跑）",
+        "  default bundle_index actor -> get() = {} in {:?} (ran on bundle 1)",
         value,
         started.elapsed()
     );
@@ -583,7 +585,7 @@ async fn default_bundle_index_not_pinned_check(ray: &Ray, cluster: bool) {
     let pinned_opts = ActorOptions::new()
         .placement_group(pg_id.clone(), 0)
         .resource("CPU", 1.0);
-    let pinned = counter_actor_create(ray, &pinned_opts, 4i64).expect("创建绑 bundle 0 的 actor");
+    let pinned = counter_actor_create(ray, &pinned_opts, 4i64).expect("create bundle-0 actor");
     let started = Instant::now();
     match counter_get(ray, &pinned)
         .await
@@ -591,14 +593,14 @@ async fn default_bundle_index_not_pinned_check(ray: &Ray, cluster: bool) {
         .get_timeout(BLOCKED_TIMEOUT_MS)
     {
         Err(RayError::Timeout(msg)) => println!(
-            "  绑 bundle 0 的 actor get_timeout({}ms) → Timeout（{:?}）：{}",
+            "  bundle-0 actor get_timeout({}ms) -> Timeout ({:?}): {}",
             BLOCKED_TIMEOUT_MS,
             started.elapsed(),
             msg
         ),
-        Err(other) => panic!("绑 bundle 0 的 actor 返回了别的错误变体: {}", other),
+        Err(other) => panic!("bundle-0 actor returned unexpected error variant: {}", other),
         Ok(value) => panic!(
-            "bundle 0 被长任务占着，绑 bundle 0 的 actor 却完成了（{}）——绑定的对照不成立",
+            "bundle-0 actor finished ({}) while bundle 0 was held by long task",
             value
         ),
     }
@@ -606,20 +608,20 @@ async fn default_bundle_index_not_pinned_check(ray: &Ray, cluster: bool) {
     // e) 收尾：cancel 长任务，移除组。
     ray.cancel(long.id(), false, true)
         .expect("cancel the long task with its handle alive");
-    println!("  长任务已 cancel");
+    println!("  long task cancelled");
     ray.placement_group_remove(&pg_id)
         .expect("remove the placement group after the cancellation");
-    println!("  placement group 已 remove");
+    println!("  placement group removed");
 
     // f) 正向对照：组没了之后，不绑组的 actor 仍然能建并调通。
-    let plain = counter_actor_create(ray, &ActorOptions::new(), 5i64).expect("创建不绑组的 actor");
+    let plain = counter_actor_create(ray, &ActorOptions::new(), 5i64).expect("create plain actor");
     let value: i64 = counter_get(ray, &plain)
         .await
         .expect("submit get")
         .get_timeout(ACTOR_START_TIMEOUT_MS)
         .expect("read get");
-    assert_eq!(value, 5, "不绑组的 actor 读到 {}", value);
-    println!("  移除组后不绑组的 actor → get() = 5（上面的超时来自绑定）");
+    assert_eq!(value, 5, "plain actor returned {}", value);
+    println!("  plain actor after group removal -> get() = 5");
 
     // g) 对照：换一个全新的两 bundle 组，bundle 0 空着。同一条绑定路径（显式
     //    bundle_index = 0 + CPU 1.0）应该很快就绪，所以 d) 的超时来自「bundle 被占住」，
@@ -628,66 +630,66 @@ async fn default_bundle_index_not_pinned_check(ray: &Ray, cluster: bool) {
         .placement_group_create("rayrust_actor_options_fresh", r#"[{"CPU":1},{"CPU":1}]"#, 0)
         .expect("create the fresh two-bundle placement group");
     println!(
-        "  新组 placement_group_create([CPU 1, CPU 1]) → {} 字节 id",
+        "  fresh group placement_group_create([CPU 1, CPU 1]) -> {}-byte id",
         fresh_id.len()
     );
     let fresh_opts = ActorOptions::new()
         .placement_group(fresh_id.clone(), 0)
         .resource("CPU", 1.0);
-    let fresh = counter_actor_create(ray, &fresh_opts, 6i64).expect("创建绑新组 bundle 0 的 actor");
+    let fresh = counter_actor_create(ray, &fresh_opts, 6i64).expect("create fresh bundle-0 actor");
     let started = Instant::now();
     let value: i64 = counter_get(ray, &fresh)
         .await
         .expect("submit get")
         .get_timeout(ACTOR_START_TIMEOUT_MS)
-        .expect("bundle 0 空着时，绑 bundle 0 的 actor 第一次调用必须在期限内完成");
-    assert_eq!(value, 6, "新组里绑 bundle 0 的 actor 读到 {}", value);
+        .expect("bundle-0 actor on free bundle must finish within deadline");
+    assert_eq!(value, 6, "fresh bundle-0 actor returned {}", value);
     println!(
-        "  新组里 bundle 0 空着，同一个绑定路径 → get() = {}，耗时 {:?}",
+        "  same binding path with free bundle 0 -> get() = {} in {:?}",
         value,
         started.elapsed()
     );
     ray.placement_group_remove(&fresh_id)
         .expect("remove the fresh placement group");
-    println!("  新组已 remove");
+    println!("  fresh group removed");
 }
 
 /// 8. 本地模式：任何带组的 options 都在进 SDK 之前报错。
 async fn local_mode_check(ray: &Ray, cluster: bool) {
-    println!("\n--- 8. 本地模式 ---");
+    println!("\n--- 8. Local mode ---");
     if cluster {
-        println!("  集群模式跳过：这条断言只在 RayConfig::local() 下成立。");
+        println!("  skipped in cluster mode: assertion only applies under RayConfig::local().");
         return;
     }
     let opts = ActorOptions::new().placement_group(vec![0u8; 18], 0);
     expect_ffi_containing(
-        "本地模式 + 带组的 ActorOptions",
+        "local mode + grouped ActorOptions",
         create_counter(ray, &opts),
         "local mode",
     );
 
-    let handle = counter_actor_create(ray, &ActorOptions::new(), 11i64).expect("本地创建 Counter");
+    let handle = counter_actor_create(ray, &ActorOptions::new(), 11i64).expect("create local Counter");
     let value: i64 = counter_get(ray, &handle)
         .await
         .expect("submit get")
         .get_timeout(GET_TIMEOUT_MS)
         .expect("read get");
-    assert_eq!(value, 11, "本地模式的 actor 读到 {}", value);
-    println!("  不带组照常：本地 actor 的 get() = 11，进程存活");
+    assert_eq!(value, 11, "local actor returned {}", value);
+    println!("  ungrouped local actor -> get() = 11, process alive");
 }
 
 /// 9. 只有手写 options JSON 才能到达的 C 侧分支：类型错误与缺组。
 fn raw_decode_branches_check() {
-    println!("\n--- 9. 只能由原始 ABI 到达的解码分支 ---");
+    println!("\n--- 9. Decode branches reachable only via raw ABI ---");
     let pg_hex = hex_of(&vec![0u8; 18]);
 
     expect_ffi_containing(
-        "bundle_index 没有组（{\"bundle_index\":0}）",
+        "bundle_index without group ({\"bundle_index\":0})",
         create_actor_with_raw_options(r#"{"bundle_index":0}"#),
         "bundle_index requires placement_group_id",
     );
     expect_ffi_containing(
-        "bundle_index 不是 JSON 整数（1.5）",
+        "non-integer bundle_index (1.5)",
         create_actor_with_raw_options(&format!(
             r#"{{"placement_group_id":"{}","bundle_index":1.5}}"#,
             pg_hex
@@ -695,35 +697,33 @@ fn raw_decode_branches_check() {
         "must be a JSON integer",
     );
     expect_ffi_containing(
-        "placement_group_id 不是字符串（123）",
+        "non-string placement_group_id (123)",
         create_actor_with_raw_options(r#"{"placement_group_id":123}"#),
         "must be a JSON string of hex",
     );
-    println!("  三条都在进 SDK 之前拒绝，进程存活（类别都是 Generic）");
+    println!("  all 3 refused before entering SDK, process alive (Generic kind)");
 }
 
 /// 10. actor 的语言判定：入口要求的语言与 handle 登记的语言必须一致。
 async fn actor_language_checks(ray: &Ray, cluster: bool) {
-    println!("\n--- 10. actor 的语言判定 ---");
+    println!("\n--- 10. Actor language checks ---");
 
     // 两种模式都跑：16 字节未登记的 id 在 crate 侧被拒，两种模式都要求登记。
     let unknown = [0x11u8; 16];
     expect_ffi_containing(
-        "actor_call(16 字节未登记 id)",
+        "actor_call(16-byte unregistered id)",
         ray.actor_call(&unknown, "increment", &[], &[]),
         "is not registered in this process",
     );
 
     if !cluster {
-        println!(
-            "  本地模式到此为止：本地模式没有 Python actor 可建（actor_create_python 拒绝），"
-        );
-        println!("  actor_call 在本地模式不做语言判定（见 Ray::actor_call 的文档）。");
+        println!("  stopping here in local mode: no Python actor can be created locally");
+        println!("  (actor_create_python refuses local mode).");
         return;
     }
 
     // C++ actor（`actor_create` 建出来的就是 C++ 语言）：Python 入口必须拒。
-    let cpp = counter_actor_create(ray, &ActorOptions::new(), 31i64).expect("创建 C++ actor");
+    let cpp = counter_actor_create(ray, &ActorOptions::new(), 31i64).expect("create C++ actor");
     expect_ffi_containing(
         "actor_call_python(C++ actor)",
         ray.actor_call_python(cpp.id(), "get", &[], &[]),
@@ -731,7 +731,7 @@ async fn actor_language_checks(ray: &Ray, cluster: bool) {
     );
 
     // Python actor：C++ 入口必须拒，Python 入口照常。
-    let python = create_counter_python(ray, &ActorOptions::new()).expect("创建 Python Counter");
+    let python = create_counter_python(ray, &ActorOptions::new()).expect("create Python Counter");
     expect_ffi_containing(
         "actor_call(Python actor)",
         ray.actor_call(python.id(), "increment", &[], &[]),
@@ -747,9 +747,9 @@ async fn actor_language_checks(ray: &Ray, cluster: bool) {
         .cast()
         .get_timeout(ACTOR_START_TIMEOUT_MS)
         .expect("read increment");
-    assert_eq!(value, 2, "Python actor 的 increment 读到 {}", value);
+    assert_eq!(value, 2, "Python actor increment returned {}", value);
     println!(
-        "  对照：同一个 Python actor 的 actor_call_python → increment(2) = {}",
+        "  control: same Python actor via actor_call_python -> increment(2) = {}",
         value
     );
 
@@ -759,9 +759,9 @@ async fn actor_language_checks(ray: &Ray, cluster: bool) {
         .expect("submit get")
         .get_timeout(GET_TIMEOUT_MS)
         .expect("read get");
-    assert_eq!(value, 31, "拒绝之后 C++ actor 的 get() 读到 {}", value);
+    assert_eq!(value, 31, "C++ actor get() after rejections returned {}", value);
     println!(
-        "  拒绝之后 C++ actor 的 get() = {}（进程与运行时都存活）",
+        "  C++ actor get() after rejections = {} (process and runtime alive)",
         value
     );
 
@@ -771,86 +771,85 @@ async fn actor_language_checks(ray: &Ray, cluster: bool) {
     // 每种语言的断言都会失败。
     let cpp_name = "__rayrust_named_cpp_actor";
     let cpp_raw_id = create_actor_with_raw_options(&format!(r#"{{"name":"{}"}}"#, cpp_name))
-        .expect("原始 ABI 建带名字的 C++ actor");
+        .expect("create named C++ actor via raw ABI");
     expect_ffi_containing(
-        "原始 C ABI 建出来的 actor 的 actor_call",
+        "actor_call on raw-C-ABI created actor",
         ray.actor_call(&cpp_raw_id, &format!("{}::get", COUNTER_FACTORY), &[], &[]),
         "is not registered in this process",
     );
     let cpp_named = ray
         .get_actor(cpp_name, "")
-        .expect("get_actor(C++ 名字)")
-        .expect("找不到刚建的带名字 C++ actor");
+        .expect("get_actor(C++ name)")
+        .expect("named C++ actor not found");
     assert_eq!(
         cpp_named.id(),
         &cpp_raw_id[..],
-        "get_actor 拿到的 C++ actor id 与创建时不同"
+        "get_actor returned different C++ actor id than creation"
     );
     expect_ffi_containing(
-        "get_actor 取回的 C++ actor → actor_call_python",
+        "C++ actor from get_actor -> actor_call_python",
         ray.actor_call_python(cpp_named.id(), "get", &[], &[]),
         "is a C++ actor",
     );
     let value: i64 = counter_get(ray, &cpp_named)
         .await
-        .expect("提交 get")
+        .expect("submit get")
         .get_timeout(ACTOR_START_TIMEOUT_MS)
-        .expect("读 get");
+        .expect("read get");
     assert_eq!(
         value, 1,
-        "get_actor 取回的 C++ actor 的 get() 读到 {}",
+        "C++ actor from get_actor returned {}",
         value
     );
-    println!("  对照：get_actor 取回的 C++ actor → get() = {}", value);
+    println!("  control: C++ actor from get_actor -> get() = {}", value);
 
     let python_name = "__rayrust_named_python_actor";
     let python_raw_id =
         create_python_actor_with_raw_options(&format!(r#"{{"name":"{}"}}"#, python_name))
-            .expect("原始 ABI 建带名字的 Python actor");
+            .expect("create named Python actor via raw ABI");
     expect_ffi_containing(
-        "原始 C ABI 建出来的 Python actor 的 actor_call",
+        "actor_call on raw-C-ABI created Python actor",
         ray.actor_call(&python_raw_id, "increment", &[], &[]),
         "is not registered in this process",
     );
     let python_named = ray
         .get_actor(python_name, "")
-        .expect("get_actor(Python 名字)")
-        .expect("找不到刚建的带名字 Python actor");
+        .expect("get_actor(Python name)")
+        .expect("named Python actor not found");
     assert_eq!(
         python_named.id(),
         &python_raw_id[..],
-        "get_actor 拿到的 Python actor id 与创建时不同"
+        "get_actor returned different Python actor id than creation"
     );
     expect_ffi_containing(
-        "get_actor 取回的 Python actor → actor_call",
+        "Python actor from get_actor -> actor_call",
         ray.actor_call(python_named.id(), "increment", &[], &[]),
         "is a Python actor",
     );
     let increment_arg = serialize(&4i64).expect("serialize the increment argument");
     let call = ray
         .actor_call_python(python_named.id(), "increment", &[&increment_arg[..]], &[])
-        .expect("提交 get_actor 取回的 Python actor 的 increment");
+        .expect("submit increment on Python actor from get_actor");
     let value: i64 = call
         .cast()
         .get_timeout(ACTOR_START_TIMEOUT_MS)
-        .expect("读 increment");
+        .expect("read increment");
     assert_eq!(
         value, 4,
-        "get_actor 取回的 Python actor 的 increment(4) 读到 {}",
+        "Python actor from get_actor increment(4) returned {}",
         value
     );
     println!(
-        "  对照：get_actor 取回的 Python actor → increment(4) = {}",
+        "  control: Python actor from get_actor -> increment(4) = {}",
         value
     );
 }
 
 /// 11. actor 写了别的资源时要预留 1 个 CPU（#55）。
 async fn default_actor_cpu_check(ray: &Ray, cluster: bool) {
-    println!("\n--- 11. actor 的默认 CPU ---");
+    println!("\n--- 11. Actor default CPU ---");
     if !cluster {
-        println!("  本地模式跳过：本地模式给任务规格传的是空资源表，资源不参与调度，");
-        println!("  两个 CPU 占不占住都是同一个结果。");
+        println!("  skipped in local mode: local mode drops resource requirements.");
         return;
     }
 
@@ -860,7 +859,7 @@ async fn default_actor_cpu_check(ray: &Ray, cluster: bool) {
     let second = sleep_for_remote_with_options(ray, &TaskOptions::new(), CPU_HOLD_S)
         .expect("submit the second CPU-holding task");
     println!(
-        "  两个默认 CPU 的任务已提交（sleep_for({}s)），等 {} s 让它们各占一个 CPU",
+        "  submitted two default-CPU tasks (sleep_for({}s)); waiting {}s for them to hold both CPUs",
         CPU_HOLD_S, CPU_HOLD_SETTLE_S
     );
     tokio::time::sleep(Duration::from_secs(CPU_HOLD_SETTLE_S)).await;
@@ -874,84 +873,84 @@ async fn default_actor_cpu_check(ray: &Ray, cluster: bool) {
         .resource("Custom", 1.0)
         .resource("CPU", 1.0);
     let explicit =
-        counter_actor_create(ray, &explicit_opts, 41i64).expect("创建显式 CPU 1 的 actor");
+        counter_actor_create(ray, &explicit_opts, 41i64).expect("create explicit CPU 1 actor");
     actors.push(explicit.clone());
     let call = counter_get_sync(ray, &explicit).expect("submit get on the CPU 1 actor");
     let started = Instant::now();
     match call.get_timeout(BLOCKED_TIMEOUT_MS) {
         Err(RayError::Timeout(msg)) => println!(
-            "  显式 Custom 1 + CPU 1 的 actor → Timeout（{:?}）：对照成立，两个 CPU 都被占住（{}）",
+            "  explicit Custom 1 + CPU 1 actor -> Timeout ({:?}): control holds, both CPUs busy ({})",
             started.elapsed(),
             msg
         ),
-        Err(other) => panic!("显式 CPU 1 的 actor 返回了别的错误变体: {}", other),
+        Err(other) => panic!("explicit CPU 1 actor returned unexpected error variant: {}", other),
         Ok(value) => panic!(
-            "显式 CPU 1 的 actor 在两个 CPU 都被占住时完成了（{}）——占 CPU 的对照不成立",
+            "explicit CPU 1 actor finished ({}) while both CPUs were held",
             value
         ),
     }
-    queued.push(("显式 CPU 1", call, 41i64));
+    queued.push(("explicit CPU 1", call, 41i64));
 
     // c) 本缺陷的判别项：只写 Custom 1 的 actor 要被补上 1 个 CPU。
     let custom_only = ActorOptions::new().resource("Custom", 1.0);
     let custom =
-        counter_actor_create(ray, &custom_only, 42i64).expect("创建只有 Custom 1 的 actor");
+        counter_actor_create(ray, &custom_only, 42i64).expect("create Custom-1-only actor");
     actors.push(custom.clone());
     let call = counter_get_sync(ray, &custom).expect("submit get on the Custom 1 actor");
     let started = Instant::now();
     match call.get_timeout(BLOCKED_TIMEOUT_MS) {
         Err(RayError::Timeout(msg)) => println!(
-            "  只有 Custom 1 的 actor → Timeout（{:?}）：补上的 1 个 CPU 拿不到（{}）",
+            "  Custom-1-only actor -> Timeout ({:?}): default 1 CPU could not be scheduled ({})",
             started.elapsed(),
             msg
         ),
-        Err(other) => panic!("只有 Custom 1 的 actor 返回了别的错误变体: {}", other),
+        Err(other) => panic!("Custom-1-only actor returned unexpected error variant: {}", other),
         Ok(value) => panic!(
-            "只有 Custom 1 的 actor 在两个 CPU 都被占住时完成了（{}）——它没有被补上 CPU",
+            "Custom-1-only actor finished ({}) while both CPUs were held (missing default CPU)",
             value
         ),
     }
-    queued.push(("只有 Custom 1", call, 42i64));
+    queued.push(("Custom-1-only", call, 42i64));
 
     // d) 显式 CPU 0 退出这一默认：不占 CPU，两个核被占住也照样完成。
     let cpu_zero_opts = ActorOptions::new()
         .resource("Custom", 1.0)
         .resource("CPU", 0.0);
     let cpu_zero =
-        counter_actor_create(ray, &cpu_zero_opts, 43i64).expect("创建显式 CPU 0 的 actor");
+        counter_actor_create(ray, &cpu_zero_opts, 43i64).expect("create explicit CPU 0 actor");
     actors.push(cpu_zero.clone());
     let value: i64 = counter_get_sync(ray, &cpu_zero)
         .expect("submit get on the CPU 0 actor")
         .get_timeout(ACTOR_START_TIMEOUT_MS)
-        .expect("显式 CPU 0 的 actor 不占 CPU，第一次调用必须在期限内完成");
-    assert_eq!(value, 43, "显式 CPU 0 的 actor 读到 {}", value);
+        .expect("explicit CPU 0 actor must finish within deadline");
+    assert_eq!(value, 43, "explicit CPU 0 actor returned {}", value);
     println!(
-        "  显式 Custom 1 + CPU 0 的 actor → get() = {}（不占 CPU）",
+        "  explicit Custom 1 + CPU 0 actor -> get() = {} (takes 0 CPU)",
         value
     );
 
     // e) 不写 resources：不占 CPU，照样完成。
     let plain = counter_actor_create(ray, &ActorOptions::new(), 44i64)
-        .expect("创建不写 resources 的 actor");
+        .expect("create actor without resources");
     actors.push(plain.clone());
     let value: i64 = counter_get_sync(ray, &plain)
         .expect("submit get on the actor without resources")
         .get_timeout(ACTOR_START_TIMEOUT_MS)
-        .expect("不写 resources 的 actor 不占 CPU，第一次调用必须在期限内完成");
-    assert_eq!(value, 44, "不写 resources 的 actor 读到 {}", value);
-    println!("  不写 resources 的 actor → get() = {}（不占 CPU）", value);
+        .expect("actor without resources must finish within deadline");
+    assert_eq!(value, 44, "actor without resources returned {}", value);
+    println!("  actor without resources -> get() = {} (takes 0 CPU)", value);
 
     // f) 只有内存键：不补 CPU，照样完成。
     let memory_only_opts = ActorOptions::new().resource("memory", 1.0);
     let memory_only =
-        counter_actor_create(ray, &memory_only_opts, 45i64).expect("创建只有 memory 1 的 actor");
+        counter_actor_create(ray, &memory_only_opts, 45i64).expect("create memory-1-only actor");
     actors.push(memory_only.clone());
     let value: i64 = counter_get_sync(ray, &memory_only)
         .expect("submit get on the memory-only actor")
         .get_timeout(ACTOR_START_TIMEOUT_MS)
-        .expect("只有 memory 的 actor 不补 CPU，第一次调用必须在期限内完成");
-    assert_eq!(value, 45, "只有 memory 的 actor 读到 {}", value);
-    println!("  只有 memory 1 的 actor → get() = {}（不补 CPU）", value);
+        .expect("memory-only actor must finish within deadline");
+    assert_eq!(value, 45, "memory-only actor returned {}", value);
+    println!("  memory-1-only actor -> get() = {} (no default CPU added)", value);
 
     // g) 把两个 CPU 还回去，前面两条排队的调用都要完成。
     ray.cancel(first.id(), false, true)
@@ -959,7 +958,7 @@ async fn default_actor_cpu_check(ray: &Ray, cluster: bool) {
     ray.cancel(second.id(), false, true)
         .expect("cancel the second CPU-holding task with its handle alive");
     println!(
-        "  两个占 CPU 的任务已 cancel，等 {} s",
+        "  cancelled both CPU-holding tasks; waiting {}s",
         CPU_RELEASE_SETTLE_S
     );
     tokio::time::sleep(Duration::from_secs(CPU_RELEASE_SETTLE_S)).await;
@@ -967,11 +966,11 @@ async fn default_actor_cpu_check(ray: &Ray, cluster: bool) {
         let value: i64 = call
             .get_timeout(ACTOR_START_TIMEOUT_MS)
             .unwrap_or_else(|error| {
-                panic!("释放 CPU 之后 {} 的 actor 调用仍没完成: {}", label, error)
+                panic!("{} actor call still did not finish after releasing CPUs: {}", label, error)
             });
-        assert_eq!(value, expected, "{} 的 actor 读到 {}", label, value);
+        assert_eq!(value, expected, "{} actor returned {}", label, value);
         println!(
-            "  释放 CPU 之后 {} 的 actor → get() = {}（前面的超时来自 CPU 被占住）",
+            "  {} actor after releasing CPUs -> get() = {} (prior timeout was due to held CPUs)",
             label, value
         );
     }
@@ -979,9 +978,9 @@ async fn default_actor_cpu_check(ray: &Ray, cluster: bool) {
     // h) 收尾：这一项建的 actor 全 kill，不给下一项留下活 actor。
     for handle in &actors {
         ray.kill_actor(handle, false)
-            .unwrap_or_else(|error| panic!("kill_actor 失败: {}", error));
+            .unwrap_or_else(|error| panic!("kill_actor failed: {}", error));
     }
-    println!("  第 11 项建的 {} 个 actor 已 kill", actors.len());
+    println!("  killed all {} actors from step 11", actors.len());
 }
 
 #[tokio::main]
@@ -989,7 +988,7 @@ async fn main() {
     let mode = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "cluster".to_string());
-    println!("=== ActorOptions 的 placement group 字段 ({}) ===", mode);
+    println!("=== ActorOptions placement group fields ({}) ===", mode);
     clean_own_output();
     let cluster = mode == "cluster";
     let config = if cluster {
@@ -1014,5 +1013,5 @@ async fn main() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     clean_own_output();
-    println!("\n✓ ActorOptions 检查全部通过");
+    println!("\nPASS: all ActorOptions checks passed");
 }

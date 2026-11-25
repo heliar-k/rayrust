@@ -137,14 +137,14 @@ fn exit_from_task() -> i64 {
 #[rayrust::remote]
 fn handle_handoff(serialized: Vec<u8>, raw_id: Vec<u8>) -> (Vec<u8>, Vec<u8>, String, String) {
     let restored = match ActorHandle::from_serialized(&serialized) {
-        Ok(handle) => format!("Ok({} 字节 id)", handle.id().len()),
+        Ok(handle) => format!("Ok({}-byte id)", handle.id().len()),
         Err(error) => format!("Err({})", error),
     };
     (
         serialized,
         raw_id,
         restored,
-        "本地进程不重复尝试".to_string(),
+        "local process does not retry".to_string(),
     )
 }
 
@@ -261,7 +261,10 @@ const ACTOR_HANDLE_CREATION_JOB_ID: u32 = 4;
 /// protobuf 的长度前缀字段编码：字段号左移 3 位再加 wire type 2（长度前缀），
 /// 后面是一字节长度与载荷。这里用到的载荷都短于 128 字节，一字节长度就够。
 fn proto_bytes_field(field_number: u32, payload: &[u8]) -> Vec<u8> {
-    assert!(payload.len() < 128, "载荷长度必须能用一字节的长度前缀表示");
+    assert!(
+        payload.len() < 128,
+        "payload length must fit in one-byte varint"
+    );
     let mut out = vec![((field_number << 3) | 2) as u8, payload.len() as u8];
     out.extend_from_slice(payload);
     out
@@ -299,16 +302,20 @@ fn assert_payload_rejected(label: &str, payload: &[u8], expected: &[&str]) {
             for word in expected {
                 assert!(
                     message.contains(word),
-                    "{} 的错误里没有「{}」: {}",
+                    "{} error message missing {:?}: {}",
                     label,
                     word,
                     message
                 );
             }
-            println!("  {} → Ffi({})", label, message);
+            println!("  {} -> Ffi({})", label, message);
         }
-        Err(other) => panic!("{} 返回了别的错误变体: {}", label, other),
-        Ok(handle) => panic!("{} 被收下了，得到 {} 字节 id", label, handle.id().len()),
+        Err(other) => panic!("{} returned unexpected error variant: {}", label, other),
+        Ok(handle) => panic!(
+            "{} was unexpectedly accepted with {}-byte id",
+            label,
+            handle.id().len()
+        ),
     }
 }
 
@@ -316,16 +323,16 @@ fn assert_payload_rejected(label: &str, payload: &[u8], expected: &[&str]) {
 /// 长度合法但 nil、手写的合法载荷。除了全 `0x00`、全 `0xff` 与对照三条，其余都在
 /// 载荷校验处被拒（不需要运行时）；那三条过了载荷校验，会真的登记，需要集群运行时。
 fn actor_handle_payload_checks(ray: &Ray) {
-    println!("\n--- 载荷校验（rpc.ActorHandle 的两个 id 字段）---");
+    println!("\n--- Payload validation (rpc.ActorHandle id fields) ---");
     // 0x5a 是字段 11、wire type 2，长度前缀 90 超出剩下的 62 字节。
     assert_payload_rejected(
-        "from_serialized(64 字节 0x5a)",
+        "from_serialized(64 bytes of 0x5a)",
         &[0x5au8; 64],
         &["well-formed", "90"],
     );
     // 字段 1 `actor_id` 只有 3 字节：登记阶段会命中 ActorID::FromBinary 的 RAY_CHECK。
     assert_payload_rejected(
-        "from_serialized(actor_id 3 字节)",
+        "from_serialized(3-byte actor_id)",
         &proto_bytes_field(ACTOR_HANDLE_ACTOR_ID, &[1, 2, 3]),
         &["actor_id", "3 bytes", "16 bytes"],
     );
@@ -334,32 +341,32 @@ fn actor_handle_payload_checks(ray: &Ray) {
     let mut short_job_id = proto_bytes_field(ACTOR_HANDLE_ACTOR_ID, &[0x11; 16]);
     short_job_id.extend(proto_bytes_field(ACTOR_HANDLE_CREATION_JOB_ID, &[1, 2, 3]));
     assert_payload_rejected(
-        "from_serialized(actor_id 16 字节 + creation_job_id 3 字节)",
+        "from_serialized(16-byte actor_id + 3-byte creation_job_id)",
         &short_job_id,
         &["creation_job_id", "3 bytes", "4 bytes"],
     );
     // 缺字段 4：上游接受，但 nil job id 让 actor 的 worker 在 job id 检查处终止，
     // 所以这条只能在 from_serialized 断言。
     assert_payload_rejected(
-        "from_serialized(只有 actor_id 16 字节)",
+        "from_serialized(16-byte actor_id only)",
         &proto_bytes_field(ACTOR_HANDLE_ACTOR_ID, &[0x11; 16]),
         &["no creation_job_id field"],
     );
     // 缺字段 1：上游把它登记成 nil actor。
     assert_payload_rejected(
-        "from_serialized(只有 creation_job_id 4 字节)",
+        "from_serialized(4-byte creation_job_id only)",
         &proto_bytes_field(ACTOR_HANDLE_CREATION_JOB_ID, &[0x22; 4]),
         &["no actor_id field"],
     );
     // 长度都合法、内容全 0：不属于任何 actor，由登记后的检查拒掉。
     assert_payload_rejected(
-        "from_serialized(actor_id 16 个 0x00 + creation_job_id 4 个 0x00)",
+        "from_serialized(16x 0x00 actor_id + 4x 0x00 creation_job_id)",
         &well_formed_handle_payload(0x00, 0x00),
         &["all 0x00", "no actor has"],
     );
     // 长度都合法、内容全 0xff：就是 nil id，同样被登记后的检查拒掉。
     assert_payload_rejected(
-        "from_serialized(actor_id 16 个 0xff + creation_job_id 4 个 0x00)",
+        "from_serialized(16x 0xff actor_id + 4x 0x00 creation_job_id)",
         &well_formed_handle_payload(0xff, 0x00),
         &["all 0xff", "the nil id"],
     );
@@ -369,7 +376,7 @@ fn actor_handle_payload_checks(ray: &Ray) {
     let mut overflowing_key = well_formed_handle_payload(0x11, 0x22);
     overflowing_key.extend_from_slice(&[0x8a, 0x80, 0x80, 0x80, 0x10, 0x03, 1, 2, 3]);
     assert_payload_rejected(
-        "from_serialized(5 字节 key，值超过 32 位，随后 3 字节)",
+        "from_serialized(5-byte key > 32 bits followed by 3 bytes)",
         &overflowing_key,
         &["field key", "32 bits"],
     );
@@ -380,7 +387,7 @@ fn actor_handle_payload_checks(ray: &Ray) {
     non_minimal_length.extend_from_slice(&[0x11u8; 16]);
     non_minimal_length.extend(proto_bytes_field(ACTOR_HANDLE_CREATION_JOB_ID, &[0x22; 4]));
     assert_payload_rejected(
-        "from_serialized(长度前缀 4 字节，非最短编码)",
+        "from_serialized(4-byte non-minimally encoded length prefix)",
         &non_minimal_length,
         &["length prefix", "not minimally encoded"],
     );
@@ -396,18 +403,18 @@ fn actor_handle_payload_checks(ray: &Ray) {
         payload
     };
     assert_payload_rejected(
-        "from_serialized(3 字节 actor_id + 损坏 owner_address + 16 字节 actor_id)",
+        "from_serialized(3-byte actor_id + truncated owner_address + 16-byte actor_id)",
         &bypass(proto_bytes_field(ACTOR_HANDLE_OWNER_ADDRESS, &[0xff])),
         &["owner_address", "truncated"],
     );
     assert_payload_rejected(
-        "from_serialized(3 字节 actor_id + 损坏 FunctionDescriptor + 16 字节 actor_id)",
+        "from_serialized(3-byte actor_id + truncated FunctionDescriptor + 16-byte actor_id)",
         &bypass(proto_bytes_field(ACTOR_HANDLE_FUNCTION_DESCRIPTOR, &[0xff])),
         // 冒号紧跟字段名，才能与下面那条「子消息里损坏」的路径区分开。
         &["actor_creation_task_function_descriptor: ", "truncated"],
     );
     assert_payload_rejected(
-        "from_serialized(3 字节 actor_id + 损坏 PythonFunctionDescriptor + 16 字节 actor_id)",
+        "from_serialized(3-byte actor_id + truncated PythonFunctionDescriptor + 16-byte actor_id)",
         &bypass(proto_bytes_field(
             ACTOR_HANDLE_FUNCTION_DESCRIPTOR,
             &proto_bytes_field(FUNCTION_DESCRIPTOR_PYTHON, &[0xff]),
@@ -415,12 +422,12 @@ fn actor_handle_payload_checks(ray: &Ray) {
         &["python_function_descriptor: ", "truncated"],
     );
     assert_payload_rejected(
-        "from_serialized(3 字节 actor_id + 损坏 labels entry + 16 字节 actor_id)",
+        "from_serialized(3-byte actor_id + truncated labels entry + 16-byte actor_id)",
         &bypass(proto_bytes_field(ACTOR_HANDLE_LABELS, &[0xff])),
         &["labels: ", "truncated"],
     );
     assert_payload_rejected(
-        "from_serialized(3 字节 actor_id + 非 UTF-8 的 labels entry value + 16 字节 actor_id)",
+        "from_serialized(3-byte actor_id + non-UTF-8 labels entry value + 16-byte actor_id)",
         &bypass(proto_bytes_field(
             ACTOR_HANDLE_LABELS,
             &proto_bytes_field(LABELS_ENTRY_VALUE, &[0xff]),
@@ -428,7 +435,7 @@ fn actor_handle_payload_checks(ray: &Ray) {
         &["labels.value", "UTF-8"],
     );
     assert_payload_rejected(
-        "from_serialized(3 字节 actor_id + 非 UTF-8 的 name + 16 字节 actor_id)",
+        "from_serialized(3-byte actor_id + non-UTF-8 name + 16-byte actor_id)",
         &bypass(proto_bytes_field(ACTOR_HANDLE_NAME, &[0xff])),
         &["name", "UTF-8"],
     );
@@ -438,7 +445,7 @@ fn actor_handle_payload_checks(ray: &Ray) {
     stripped_job_id.extend(proto_bytes_field(ACTOR_HANDLE_OWNER_ADDRESS, &[0xff]));
     stripped_job_id.extend(proto_bytes_field(ACTOR_HANDLE_CREATION_JOB_ID, &[0x22; 4]));
     assert_payload_rejected(
-        "from_serialized(16 字节 actor_id + 损坏 owner_address + creation_job_id)",
+        "from_serialized(16-byte actor_id + truncated owner_address + creation_job_id)",
         &stripped_job_id,
         &["owner_address", "truncated"],
     );
@@ -447,7 +454,7 @@ fn actor_handle_payload_checks(ray: &Ray) {
     match ActorHandle::from_serialized(&well_formed_handle_payload(0x11, 0x22)) {
         Ok(handle) => {
             println!(
-                "  对照 from_serialized(actor_id 16 个 0x11 + creation_job_id 4 个 0x22) → Ok({} 字节 id)",
+                "  control from_serialized(16x 0x11 actor_id + 4x 0x22 creation_job_id) -> Ok({}-byte id)",
                 handle.id().len()
             );
             // 这份载荷没有字段 6，handle 里因此没有创建描述符；Python 入口必须在进 SDK
@@ -456,18 +463,21 @@ fn actor_handle_payload_checks(ray: &Ray) {
                 Err(RayError::Ffi(message)) => {
                     assert!(
                         message.contains("no Python creation descriptor"),
-                        "缺创建描述符的 handle 没有报描述符: {}",
+                        "handle without creation descriptor did not report missing descriptor: {}",
                         message
                     );
-                    println!("  对照 handle 的 actor_call_python → Ffi({})", message);
+                    println!("  control handle actor_call_python -> Ffi({})", message);
                 }
-                Err(other) => panic!("缺创建描述符的 handle 返回了别的错误变体: {}", other),
-                Ok(_) => panic!("缺创建描述符的 handle 被 Python 入口提交了"),
+                Err(other) => panic!(
+                    "handle without creation descriptor returned unexpected error variant: {}",
+                    other
+                ),
+                Ok(_) => panic!("handle without creation descriptor was submitted to Python entry"),
             }
         }
-        Err(error) => panic!("结构良好的载荷被拒了: {}", error),
+        Err(error) => panic!("well-formed payload was rejected: {}", error),
     }
-    println!("  进程存活：以上载荷要么在进 Ray 之前被拒，要么在登记之后被拒；最后一条对照成功登记，它的 Python 入口也在进 SDK 之前被拒");
+    println!("  process alive: invalid payloads rejected before entering Ray or after registration; control registered and Python entry refused before SDK");
 }
 
 /// actor 名字与命名空间的边界：空名字在 C 入口被拒绝（集群模式里它会命中
@@ -475,19 +485,19 @@ fn actor_handle_payload_checks(ray: &Ray) {
 /// 名字与命名空间在 Rust FFI 边界被拒绝并点名字段，只有空白字符的名字合法、按原样去查。
 /// 两种模式判定相同，集群与本地各跑一遍。
 fn actor_name_boundary_checks(ray: &Ray) {
-    println!("\n--- actor 名字的边界 ---");
+    println!("\n--- Actor name boundaries ---");
     match ray.get_actor("", "") {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains("empty"),
-                "get_actor(\"\", \"\") 的错误里没有说明名字为空: {}",
+                "get_actor(\"\", \"\") error does not mention empty: {}",
                 message
             );
-            println!("  get_actor(\"\", \"\") → Ffi({})", message);
+            println!("  get_actor(\"\", \"\") -> Ffi({})", message);
         }
-        Err(other) => panic!("get_actor(\"\", \"\") 返回了别的错误变体: {}", other),
+        Err(other) => panic!("get_actor(\"\", \"\") returned unexpected error variant: {}", other),
         Ok(found) => panic!(
-            "get_actor(\"\", \"\") 返回了 Ok({} 个结果)",
+            "get_actor(\"\", \"\") returned Ok(found={})",
             found.is_some()
         ),
     }
@@ -504,28 +514,28 @@ fn actor_name_boundary_checks(ray: &Ray) {
             Err(RayError::Ffi(message)) => {
                 assert!(
                     message.contains(expected_field) && message.contains("interior NUL"),
-                    "{} 的错误里没有点名 {} 与 interior NUL: {}",
+                    "{} error does not mention {} and interior NUL: {}",
                     label,
                     expected_field,
                     message
                 );
-                println!("  {} → Ffi({})", label, message);
+                println!("  {} -> Ffi({})", label, message);
             }
-            Err(other) => panic!("{} 返回了别的错误变体: {}", label, other),
-            Ok(found) => panic!("{} 返回了 Ok({} 个结果)", label, found.is_some()),
+            Err(other) => panic!("{} returned unexpected error variant: {}", label, other),
+            Ok(found) => panic!("{} returned Ok(found={})", label, found.is_some()),
         }
     }
     match ray.get_actor(" ", "") {
         Ok(None) => {
-            println!("  get_actor(\" \", \"\") → Ok(None)（只有空白字符的名字合法、不 trim）")
+            println!("  get_actor(\" \", \"\") -> Ok(None) (whitespace-only name is valid, not trimmed)")
         }
         Ok(Some(handle)) => panic!(
-            "get_actor(\" \") 找到了 {} 字节 id，这个名字没有注册过",
+            "get_actor(\" \") unexpectedly found {}-byte id",
             handle.id().len()
         ),
-        Err(error) => panic!("get_actor(\" \") 报错: {}", error),
+        Err(error) => panic!("get_actor(\" \") failed: {}", error),
     }
-    println!("  进程存活：空名字与含内部 NUL 的名字及命名空间在进 Ray 之前被拒绝");
+    println!("  process alive: empty and interior-NUL actor names/namespaces refused before Ray");
 }
 
 /// 本地模式 init 时配的 namespace，第 1 项的断言要拿它对比。
@@ -548,10 +558,10 @@ fn cluster_config() -> RayConfig {
 fn is_local_mode_check(ray: &Ray, cluster: bool) {
     println!("\n--- 1. is_local_mode ---");
     let reported = ray.is_local_mode();
-    println!("  is_local_mode() → {}", reported);
+    println!("  is_local_mode() -> {}", reported);
     assert_eq!(
         reported, !cluster,
-        "is_local_mode() 报 {}，与本次运行的模式（cluster = {}）不符",
+        "is_local_mode() returned {} for cluster = {}",
         reported, cluster
     );
 
@@ -561,17 +571,17 @@ fn is_local_mode_check(ray: &Ray, cluster: bool) {
         LOCAL_NAMESPACE
     };
     let namespace = ray.namespace().expect("namespace query");
-    println!("  namespace() → {:?}", namespace);
+    println!("  namespace() -> {:?}", namespace);
     assert_eq!(
         namespace, expected,
-        "namespace() 报 {:?}，配置的是 {:?}（cluster = {}）",
+        "namespace() returned {:?}, expected {:?} (cluster = {})",
         namespace, expected, cluster
     );
 }
 
 /// 2. placement group 全流程。
 async fn placement_group_flow(ray: &Ray) {
-    println!("\n--- 2. placement group 全流程 ---");
+    println!("\n--- 2. Placement group flow ---");
     let name = format!("rayrust_runtime_api_pg_{}", std::process::id());
     let group_id = ray
         .placement_group_create(&name, r#"[{"CPU":0.5}]"#, PG_STRATEGY)
@@ -579,11 +589,11 @@ async fn placement_group_flow(ray: &Ray) {
     assert_eq!(
         group_id.len(),
         18,
-        "group id 是 {} 字节，PlacementGroupID 的长度是 18",
+        "group id is {} bytes, expected 18",
         group_id.len()
     );
     println!(
-        "  placement_group_create({}, CPU 0.5, STRICT_PACK) → {} 字节 id {}",
+        "  placement_group_create({}, CPU 0.5, STRICT_PACK) -> {}-byte id {}",
         name,
         group_id.len(),
         hex(&group_id)
@@ -592,26 +602,26 @@ async fn placement_group_flow(ray: &Ray) {
     let ready = ray
         .placement_group_wait_ready(&group_id, 10)
         .expect("placement_group_wait_ready");
-    assert!(ready, "组在 10 秒内没有就绪");
-    println!("  placement_group_wait_ready(group, 10) → true");
+    assert!(ready, "group did not become ready within 10s");
+    println!("  placement_group_wait_ready(group, 10) -> true");
 
     let by_id = ray
         .placement_group_by_id(&group_id)
         .expect("placement_group_by_id");
-    assert_eq!(by_id.id, group_id, "by_id 拿到的 id 与建组返回的不一样");
-    assert_eq!(by_id.name, name, "by_id 拿到的名字不对");
+    assert_eq!(by_id.id, group_id, "by_id returned different id");
+    assert_eq!(by_id.name, name, "by_id returned wrong name");
     assert_eq!(
         by_id.state, PG_STATE_CREATED,
-        "by_id 的 state 是 {}，CREATED 是 {}",
+        "by_id state is {}, expected CREATED ({})",
         by_id.state, PG_STATE_CREATED
     );
     assert_eq!(
         by_id.strategy, PG_STRATEGY,
-        "by_id 的 strategy 是 {}，建组时传的是 {}",
+        "by_id strategy is {}, expected {}",
         by_id.strategy, PG_STRATEGY
     );
     println!(
-        "  placement_group_by_id → id 一致、name {:?}、state {} (CREATED)、strategy {} (STRICT_PACK)",
+        "  placement_group_by_id -> id matches, name {:?}, state {} (CREATED), strategy {} (STRICT_PACK)",
         by_id.name, by_id.state, by_id.strategy
     );
 
@@ -631,9 +641,9 @@ async fn placement_group_flow(ray: &Ray) {
             PG_STATE_CREATED,
             PG_STRATEGY
         ),
-        "by_name 拿到的四个字段与 by_id 不一致"
+        "by_name fields differ from by_id"
     );
-    println!("  placement_group_by_name → 同样四个字段");
+    println!("  placement_group_by_name -> matching four fields");
 
     let all = ray.placement_groups().expect("placement_groups");
     let listed = all
@@ -641,7 +651,7 @@ async fn placement_group_flow(ray: &Ray) {
         .find(|group| group.id == group_id)
         .unwrap_or_else(|| {
             panic!(
-                "placement_groups() 的 {} 个组里没有本轮的 {}",
+                "placement_groups() ({} groups) missing {}",
                 all.len(),
                 hex(&group_id)
             )
@@ -649,7 +659,7 @@ async fn placement_group_flow(ray: &Ray) {
     assert_eq!(listed.state, PG_STATE_CREATED);
     assert_eq!(listed.strategy, PG_STRATEGY);
     println!(
-        "  placement_groups() → {} 个组，其中有它（state {}、strategy {}）",
+        "  placement_groups() -> {} groups, found entry (state {}, strategy {})",
         all.len(),
         listed.state,
         listed.strategy
@@ -657,14 +667,14 @@ async fn placement_group_flow(ray: &Ray) {
 
     ray.placement_group_remove(&group_id)
         .expect("placement_group_remove");
-    println!("  placement_group_remove → 已返回");
+    println!("  placement_group_remove -> returned");
 
     // 移除是同步 RPC：GCS 先删名字映射、把状态改成 REMOVED、写回表项，回调里才回复，
     // 所以 remove 返回后的第一次查询就该看到 state 3 与 by_name 报错。表项不会消失
     // （GCS 保留历史行），晚一些才归还的是节点上预留的那份资源。
     let by_id = ray
         .placement_group_by_id(&group_id)
-        .expect("remove 返回后 by_id");
+        .expect("by_id after remove");
     let by_name = ray.placement_group_by_name(&name);
     let all = ray.placement_groups().expect("placement_groups");
     let listed_state = all
@@ -673,73 +683,73 @@ async fn placement_group_flow(ray: &Ray) {
         .map(|group| group.state);
     assert_eq!(
         by_id.state, PG_STATE_REMOVED,
-        "remove 返回后 by_id 的 state 是 {}",
+        "by_id state after remove is {}",
         by_id.state
     );
     assert_eq!(
         listed_state,
         Some(PG_STATE_REMOVED),
-        "remove 返回后 placement_groups() 里这一行的 state 是 {:?}",
+        "placement_groups() state after remove is {:?}",
         listed_state
     );
     let by_name_error = match by_name {
         Err(error) => error.to_string(),
-        Ok(found) => panic!("remove 返回后 by_name 还查到了 state {}", found.state),
+        Ok(found) => panic!("by_name after remove still found state {}", found.state),
     };
     assert!(
         by_name_error.contains(&name),
-        "by_name 的错误里没有查询用的名字: {}",
+        "by_name error does not mention queried name: {}",
         by_name_error
     );
     println!(
-        "  remove 返回后第一次查询：by_id state {} (REMOVED)、placement_groups() 里 state {:?}、by_name 报错",
+        "  first query after remove: by_id state {} (REMOVED), placement_groups() state {:?}, by_name errored",
         by_id.state, listed_state
     );
-    println!("  by_name 的错误文本带上名字: {}", by_name_error);
+    println!("  by_name error includes name: {}", by_name_error);
 }
 
 /// 3. 非法长度与查不到：全部是提交侧的错误，进程存活。
 fn placement_group_rejections(ray: &Ray) {
-    println!("\n--- 3. 非法与未知的 placement group ---");
+    println!("\n--- 3. Invalid and unknown placement groups ---");
     for (label, id) in [
-        ("17 字节", vec![0u8; 17]),
-        ("19 字节", vec![0u8; 19]),
-        ("空字节", Vec::new()),
+        ("17-byte", vec![0u8; 17]),
+        ("19-byte", vec![0u8; 19]),
+        ("empty", Vec::new()),
     ] {
         match ray.placement_group_by_id(&id) {
             Err(RayError::Ffi(message)) => {
                 assert!(
                     message.contains("18"),
-                    "{} 的 by_id 错误里没有说明长度: {}",
+                    "by_id({}) error missing expected length: {}",
                     label,
                     message
                 );
-                println!("  by_id({}) → Ffi({})", label, message);
+                println!("  by_id({}) -> Ffi({})", label, message);
             }
-            Err(other) => panic!("by_id({}) 返回了别的错误变体: {}", label, other),
-            Ok(group) => panic!("by_id({}) 成功返回了 {:?}", label, group),
+            Err(other) => panic!("by_id({}) returned unexpected error variant: {}", label, other),
+            Ok(group) => panic!("by_id({}) unexpectedly returned {:?}", label, group),
         }
         match ray.placement_group_wait_ready(&id, 1) {
             Err(RayError::Ffi(message)) => {
                 assert!(
                     message.contains("18"),
-                    "{} 的 wait_ready 错误里没有说明长度: {}",
+                    "wait_ready({}) error missing expected length: {}",
                     label,
                     message
                 );
-                println!("  wait_ready({}) → Ffi({})", label, message);
+                println!("  wait_ready({}) -> Ffi({})", label, message);
             }
-            Err(other) => panic!("wait_ready({}) 返回了别的错误变体: {}", label, other),
-            Ok(ready) => panic!("wait_ready({}) 成功返回了 {}", label, ready),
+            Err(other) => panic!("wait_ready({}) returned unexpected error variant: {}", label, other),
+            Ok(ready) => panic!("wait_ready({}) unexpectedly returned {}", label, ready),
         }
     }
 
     // 非法长度之后合法调用照常完成：失败在进 SDK 之前，运行时不处于坏状态。
     let all = ray
         .placement_groups()
-        .expect("非法长度之后 placement_groups()");
+        .expect("placement_groups() after invalid lengths");
     println!(
-        "  进程存活，随后 placement_groups() 照常返回 {} 个组",
+        "  process alive; placement_groups() still returned {} groups",
         all.len()
     );
 
@@ -748,13 +758,13 @@ fn placement_group_rejections(ray: &Ray) {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains(&hex(&unknown)),
-                "未知 id 的错误里没有查询用的 id: {}",
+                "unknown id error missing queried id: {}",
                 message
             );
-            println!("  by_id(未知 18 字节) → Ffi({})", message);
+            println!("  by_id(unknown 18-byte) -> Ffi({})", message);
         }
-        Err(other) => panic!("未知 18 字节 id 返回了别的错误变体: {}", other),
-        Ok(group) => panic!("未知 18 字节 id 成功返回了 {:?}", group),
+        Err(other) => panic!("unknown 18-byte id returned unexpected error variant: {}", other),
+        Ok(group) => panic!("unknown 18-byte id unexpectedly returned {:?}", group),
     }
 
     let unknown_name = "rayrust_no_such_placement_group";
@@ -762,34 +772,34 @@ fn placement_group_rejections(ray: &Ray) {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains(unknown_name),
-                "未知名字的错误里没有查询用的名字: {}",
+                "unknown name error missing queried name: {}",
                 message
             );
-            println!("  by_name(未知名字) → Ffi({})", message);
+            println!("  by_name(unknown name) -> Ffi({})", message);
         }
-        Err(other) => panic!("未知名字返回了别的错误变体: {}", other),
-        Ok(group) => panic!("未知名字成功返回了 {:?}", group),
+        Err(other) => panic!("unknown name returned unexpected error variant: {}", other),
+        Ok(group) => panic!("unknown name unexpectedly returned {:?}", group),
     }
 }
 
 /// 3c. `placement_group_remove` 的宽度检查与错误出口，两个模式都跑。
 fn placement_group_remove_checks(ray: &Ray) {
-    println!("\n--- 3c. placement_group_remove 的守卫与错误出口 ---");
+    println!("\n--- 3c. placement_group_remove guards and error exits ---");
 
     // a) 宽度不对：两道检查里 crate 内侧那一道先返回，进不了 FFI。
-    for (label, id) in [("3 字节", vec![0u8; 3]), ("空字节", Vec::new())] {
+    for (label, id) in [("3-byte", vec![0u8; 3]), ("empty", Vec::new())] {
         match ray.placement_group_remove(&id) {
             Err(RayError::Ffi(message)) => {
                 assert!(
                     message.contains("18 bytes") && message.contains(&id.len().to_string()),
-                    "{} 的 remove 错误里没有说明长度: {}",
+                    "remove({}) error missing length detail: {}",
                     label,
                     message
                 );
-                println!("  remove({}) → Ffi({})", label, message);
+                println!("  remove({}) -> Ffi({})", label, message);
             }
-            Err(other) => panic!("remove({}) 返回了别的错误变体: {}", label, other),
-            Ok(()) => panic!("remove({}) 成功了", label),
+            Err(other) => panic!("remove({}) returned unexpected error variant: {}", label, other),
+            Ok(()) => panic!("remove({}) unexpectedly succeeded", label),
         }
     }
 
@@ -800,48 +810,48 @@ fn placement_group_remove_checks(ray: &Ray) {
     let ret = unsafe {
         rayrust::sys::ray_placement_group_remove(short.as_ptr() as *const _, short.len())
     };
-    assert_eq!(ret, -1, "C 入口对 3 字节 id 返回了 {}", ret);
+    assert_eq!(ret, -1, "C entry returned {} for 3-byte id", ret);
     match rayrust::sys::last_error() {
         Some(message) => {
             assert!(
                 message.contains("placement group id must be 18 bytes"),
-                "C 入口的错误文本不对: {}",
+                "C entry error text mismatch: {}",
                 message
             );
-            println!("  C ABI remove(3 字节) → {}，last_error: {}", ret, message);
+            println!("  C ABI remove(3-byte) -> {}, last_error: {}", ret, message);
         }
-        None => panic!("C 入口接受了 3 字节 id"),
+        None => panic!("C entry accepted 3-byte id"),
     }
 
     // b2) 空指针：入口先看指针再看长度，不能拿它构造 std::string。
     for len in [0usize, 18] {
         rayrust::sys::clear_error();
         let ret = unsafe { rayrust::sys::ray_placement_group_remove(std::ptr::null(), len) };
-        assert_eq!(ret, -1, "C 入口对 (NULL, {}) 返回了 {}", len, ret);
+        assert_eq!(ret, -1, "C entry returned {} for (NULL, {})", len, ret);
         match rayrust::sys::last_error() {
             Some(message) => assert!(
                 message.contains("empty"),
-                "C 入口对 (NULL, {}) 的错误文本不对: {}",
+                "C entry (NULL, {}) error text mismatch: {}",
                 len,
                 message
             ),
-            None => panic!("C 入口接受了 (NULL, {})", len),
+            None => panic!("C entry accepted (NULL, {})", len),
         }
         println!(
-            "  C ABI remove(NULL, {}) → -1，last_error 说明 id 为空",
+            "  C ABI remove(NULL, {}) -> -1, last_error reports empty id",
             len
         );
     }
-    println!("  进程存活：两道宽度检查与空指针检查都在进 Ray 之前返回");
+    println!("  process alive: both width checks and null check return before Ray");
 
     // c) 未知的 18 字节 id：两个模式都返回 Ok(())，上游按「已经移除」处理。
     let unknown = [0x5au8; 18];
     match ray.placement_group_remove(&unknown) {
         Ok(()) => println!(
-            "  remove(未知 18 字节 {}) → Ok(())（GCS 与本地 map 都把它当已经移除）",
+            "  remove(unknown 18-byte {}) -> Ok(()) (treated as already removed)",
             hex(&unknown)
         ),
-        Err(error) => panic!("未知 18 字节 id 返回了 {}", error),
+        Err(error) => panic!("unknown 18-byte id returned {}", error),
     }
 
     // d) 同一个组 remove 两次：两次都 Ok(())，进程存活。集群模式下两次走的是不同的上游分支
@@ -851,21 +861,26 @@ fn placement_group_remove_checks(ray: &Ray) {
     let group_id = ray
         .placement_group_create(&name, r#"[{"CPU":0.5}]"#, PG_STRATEGY)
         .expect("remove_twice: placement_group_create");
-    assert_eq!(group_id.len(), 18, "建组返回了 {} 字节 id", group_id.len());
+    assert_eq!(
+        group_id.len(),
+        18,
+        "placement_group_create returned {}-byte id",
+        group_id.len()
+    );
     println!(
-        "  建组 {} → {} 字节 id {}",
+        "  created group {} -> {}-byte id {}",
         name,
         group_id.len(),
         hex(&group_id)
     );
     ray.placement_group_remove(&group_id)
-        .expect("第一次 remove");
-    println!("  第一次 remove → Ok(())");
+        .expect("first remove");
+    println!("  first remove -> Ok(())");
     match ray.placement_group_remove(&group_id) {
-        Ok(()) => println!("  第二次 remove → Ok(())"),
-        Err(error) => panic!("第二次 remove 返回了 {}", error),
+        Ok(()) => println!("  second remove -> Ok(())"),
+        Err(error) => panic!("second remove returned {}", error),
     }
-    println!("  进程存活：重复移除同一个组没有报错");
+    println!("  process alive: removing the same group twice succeeded");
 }
 
 /// 3b. actor id 宽度：短 id 只能从 C ABI 传进 `ray_actor_kill`。
@@ -877,7 +892,7 @@ fn placement_group_remove_checks(ray: &Ray) {
 /// 所以这条断言在集群里是承重的。合法的 `kill_actor` 由第 4 项的重启对照证实仍按
 /// 原样工作。
 fn actor_kill_id_width_c_abi() {
-    println!("\n--- 3b. actor id 宽度（C ABI 直接调用 ray_actor_kill）---");
+    println!("\n--- 3b. Actor id width (direct C ABI ray_actor_kill) ---");
     rayrust::sys::clear_error();
     let short_actor_id = [1u8, 2, 3];
     // 指针与长度描述的是这个函数内的数组本身，数组在调用返回之前一直活着。
@@ -888,17 +903,17 @@ fn actor_kill_id_width_c_abi() {
         Some(message) => {
             assert!(
                 message.contains("actor id must be 16 bytes"),
-                "ray_actor_kill 的错误里没有长度要求: {}",
+                "ray_actor_kill error missing length requirement: {}",
                 message
             );
             println!(
-                "  ray_actor_kill(3 字节 actor id) → last_error({})",
+                "  ray_actor_kill(3-byte actor id) -> last_error({})",
                 message
             );
         }
-        None => panic!("ray_actor_kill 接受了 3 字节 actor id"),
+        None => panic!("ray_actor_kill accepted 3-byte actor id"),
     }
-    println!("  进程存活：错误在进 Ray 之前返回");
+    println!("  process alive: error returned before entering Ray");
 }
 
 /// 4. exit_actor：集群模式下 actor 自己结束且不被 max_restarts 重启；本地模式下这个调用
@@ -907,50 +922,50 @@ async fn exit_actor_check(ray: &Ray, cluster: bool) {
     println!("\n--- 4. exit_actor ---");
     let name = format!("rayrust_runtime_api_exiting_{}", std::process::id());
     let opts = ActorOptions::new().name(name.clone()).max_restarts(2);
-    let handle = selfexiting_actor_create(ray, &opts, 7).expect("创建 SelfExiting");
+    let handle = selfexiting_actor_create(ray, &opts, 7).expect("create SelfExiting");
     let before = selfexiting_get_sync(ray, &handle)
-        .expect("调用 exit 之前的 get")
+        .expect("submit get before exit")
         .get_timeout(GET_TIMEOUT_MS)
-        .expect("读 exit 之前的 get");
-    assert_eq!(before, 7, "actor 的初值不对");
-    println!("  exit 之前 get() → {}", before);
+        .expect("read get before exit");
+    assert_eq!(before, 7, "initial actor value mismatch");
+    println!("  get() before exit -> {}", before);
 
     if !cluster {
         // 本地模式：先给 actor 留下一个可辨认的状态，再证明 exit_actor() 什么都没做。
         // 用带返回值的方法：退出状态路径上它的返回值会被错误载荷顶掉（`Serialization`），
         // 空操作路径上拿到的就是 9。
         let bumped = selfexiting_increment_and_exit_sync(ray, &handle, 2)
-            .expect("调用 increment_and_exit")
+            .expect("call increment_and_exit")
             .get_timeout(EXIT_TIMEOUT_MS)
-            .expect("本地模式里 exit_actor() 是空操作，方法必须返回它自己的值");
-        assert_eq!(bumped, 9, "方法自己的返回值不对");
+            .expect("local mode exit_actor() is a no-op; method must return its own value");
+        assert_eq!(bumped, 9, "method return value mismatch");
         println!(
-            "  increment_and_exit(2) → {}（本地模式 exit_actor() 是空操作，方法返回自己的值）",
+            "  increment_and_exit(2) -> {} (local mode exit_actor() is a no-op)",
             bumped
         );
 
         let exit_value = selfexiting_exit_sync(ray, &handle)
-            .expect("调用 exit()")
+            .expect("call exit()")
             .get_timeout(EXIT_TIMEOUT_MS)
-            .expect("本地模式的 () 方法必须正常返回");
+            .expect("local mode () method must return normally");
         println!(
-            "  exit() 的对象 → Ok({:?})（本地模式 () 方法正常返回）",
+            "  exit() result -> Ok({:?}) (local mode () method returns normally)",
             exit_value
         );
 
         let after = selfexiting_get_sync(ray, &handle)
-            .expect("调用 exit 之后的 get")
+            .expect("submit get after exit")
             .get_timeout(GET_TIMEOUT_MS)
-            .expect("本地模式的 exit_actor() 之后 actor 必须还能用");
-        assert_eq!(after, 9, "本地模式的 exit_actor() 不该改变 actor 的状态");
-        println!("  exit 之后 get() → {}（actor 仍然可用，状态没变）", after);
+            .expect("actor must stay usable after local mode exit_actor()");
+        assert_eq!(after, 9, "local mode exit_actor() should not alter actor state");
+        println!("  get() after exit -> {} (actor still alive, state unchanged)", after);
         return;
     }
 
-    let exited = selfexiting_exit_sync(ray, &handle).expect("调用 exit()");
+    let exited = selfexiting_exit_sync(ray, &handle).expect("call exit()");
     match exited.get_timeout(EXIT_TIMEOUT_MS) {
-        Ok(()) => panic!("exit() 的对象拿到结果了，退出路径不该写结果"),
-        Err(error) => println!("  exit() 的对象 → {}（退出路径不写结果）", error),
+        Ok(()) => panic!("exit() unexpectedly returned Ok(())"),
+        Err(error) => println!("  exit() result -> {} (exit path writes no result)", error),
     }
 
     let after = match selfexiting_get_sync(ray, &handle) {
@@ -958,22 +973,22 @@ async fn exit_actor_check(ray: &Ray, cluster: bool) {
         Err(error) => Err(error),
     };
     match after {
-        Err(RayError::Actor(message)) => println!("  exit 之后 get() → Actor({})", message),
-        Err(other) => panic!("exit 之后 get() 返回了别的错误变体: {}", other),
+        Err(RayError::Actor(message)) => println!("  get() after exit -> Actor({})", message),
+        Err(other) => panic!("get() after exit returned unexpected error variant: {}", other),
         Ok(value) => panic!(
-            "actor 退出之后 get() 还返回了 {}——说明它被 max_restarts=2 重启了",
+            "get() after actor exit still returned {} (restarted despite max_restarts=2)",
             value
         ),
     }
 
     match ray.get_actor(&name, "") {
         Ok(Some(found)) => println!(
-            "  get_actor → 拿到 {} 字节 id，与原 handle 相同: {}（驱动进程的 core worker 缓存了名字映射，actor 本身已经没了）",
+            "  get_actor -> {}-byte id, matches original handle: {} (driver core worker caches name mapping while actor is gone)",
             found.id().len(),
             found.id() == handle.id()
         ),
-        Ok(None) => println!("  get_actor → None（名字随 actor 一起消失）"),
-        Err(error) => println!("  get_actor → {}（查询本身失败）", error),
+        Ok(None) => println!("  get_actor -> None (name removed with actor)"),
+        Err(error) => println!("  get_actor -> {} (query failed)", error),
     }
 
     // 正向对照：同一个集群、同样的 `max_restarts=2`，`kill_actor(no_restart = false)`
@@ -981,16 +996,16 @@ async fn exit_actor_check(ray: &Ray, cluster: bool) {
     // 「actor 永远没了」与「这次调用正好在重启窗口里」。
     let control_name = format!("rayrust_runtime_api_restart_{}", std::process::id());
     let control_opts = ActorOptions::new().name(control_name).max_restarts(2);
-    let control = selfexiting_actor_create(ray, &control_opts, 7).expect("创建重启对照 actor");
+    let control = selfexiting_actor_create(ray, &control_opts, 7).expect("create restart control actor");
     let before_kill = selfexiting_increment_sync(ray, &control, 2)
-        .expect("对照 actor 的 increment")
+        .expect("control actor increment")
         .get_timeout(GET_TIMEOUT_MS)
-        .expect("读对照 actor 的 increment");
-    assert_eq!(before_kill, 9, "对照 actor 的计数不对");
+        .expect("read control actor increment");
+    assert_eq!(before_kill, 9, "control actor count mismatch");
     ray.kill_actor(&control, false)
         .expect("kill_actor(no_restart = false)");
     println!(
-        "  对照：increment(2) → {}，kill_actor(no_restart = false) 已提交",
+        "  control: increment(2) -> {}, kill_actor(no_restart = false) submitted",
         before_kill
     );
 
@@ -1003,29 +1018,32 @@ async fn exit_actor_check(ray: &Ray, cluster: bool) {
             tokio::time::sleep(Duration::from_millis(RESTART_POLL_INTERVAL_MS)).await;
         }
         match selfexiting_get_sync(ray, &control)
-            .expect("对照 actor 提交 get")
+            .expect("control actor submit get")
             .get_timeout(RESTART_GET_TIMEOUT_MS)
         {
             Ok(value) if value == 7 => {
-                println!("  第 {} 次轮询：get() → {}（回到初值）", attempt, value);
+                println!(
+                    "  poll {}: get() -> {} (reset to initial value)",
+                    attempt, value
+                );
                 restarted = Some(value);
                 break;
             }
             Ok(value) => println!(
-                "  第 {} 次轮询：get() → {}（还没回到初值，重启窗口里的读数不能当判据）",
+                "  poll {}: get() -> {} (still awaiting reset)",
                 attempt, value
             ),
-            Err(error) => println!("  第 {} 次轮询：get() → {}（还没就绪）", attempt, error),
+            Err(error) => println!("  poll {}: get() -> {} (pending)", attempt, error),
         }
     }
     let restarted = restarted.unwrap_or_else(|| {
         panic!(
-            "kill_actor(no_restart = false) 之后 {} 次轮询（{}ms 一次）没看到计数回到初值 7",
+            "did not observe reset to 7 across {} polls ({}ms each) after kill_actor(no_restart = false)",
             RESTART_POLL_TIMES, RESTART_POLL_INTERVAL_MS
         )
     });
     println!(
-        "  重启前计数 {} → 重启后计数 {}（这个集群确实会重启这个 actor）",
+        "  before restart {} -> after restart {} (cluster restarts this actor)",
         before_kill, restarted
     );
 }
@@ -1033,15 +1051,15 @@ async fn exit_actor_check(ray: &Ray, cluster: bool) {
 /// 5. 任务里调 exit_actor()：集群模式下该次调用失败、消息里是我们自己抛的文案；
 /// 本地模式下这个调用是空操作，任务照常返回它自己的值。
 async fn exit_from_task_check(ray: &Ray, cluster: bool) {
-    println!("\n--- 5. 任务里调 exit_actor() ---");
-    let object = exit_from_task_remote(ray).expect("提交 exit_from_task");
+    println!("\n--- 5. exit_actor() from a task ---");
+    let object = exit_from_task_remote(ray).expect("submit exit_from_task");
     if !cluster {
         let value = object
             .get_timeout(EXIT_TIMEOUT_MS)
-            .expect("本地模式里 exit_actor() 是空操作，任务必须正常返回");
-        assert_eq!(value, 1, "exit_from_task 的返回值不对");
+            .expect("local mode exit_actor() is a no-op; task must return normally");
+        assert_eq!(value, 1, "exit_from_task return value mismatch");
         println!(
-            "  exit_from_task → Ok({})（本地模式 exit_actor() 是空操作，任务照常返回）",
+            "  exit_from_task -> Ok({}) (local mode exit_actor() is a no-op)",
             value
         );
         return;
@@ -1050,34 +1068,34 @@ async fn exit_from_task_check(ray: &Ray, cluster: bool) {
         Err(RayError::Task(message)) => {
             assert!(
                 message.contains("exit_actor"),
-                "任务失败的消息里没有我们自己抛的文案: {}",
+                "task error message missing exit_actor text: {}",
                 message
             );
-            println!("  exit_from_task → Task({})", message);
+            println!("  exit_from_task -> Task({})", message);
         }
-        Err(other) => panic!("任务失败返回了别的错误变体: {}", other),
-        Ok(value) => panic!("任务里调用 exit_actor() 还拿到了结果 {}", value),
+        Err(other) => panic!("task failure returned unexpected error variant: {}", other),
+        Ok(value) => panic!("exit_actor() in task unexpectedly returned {}", value),
     }
-    println!("  进程存活：这次调用只是失败，没有停在任务里");
+    println!("  process alive: task failed cleanly without terminating worker");
 }
 
 /// 8. 构造函数里调 exit_actor()：集群模式创建任务失败、第一次调用报 `Actor`；
 /// 本地模式那个调用是空操作，actor 正常创建。
 async fn ctor_exit_check(ray: &Ray, cluster: bool) {
-    println!("\n--- 8. 构造函数里调 exit_actor() ---");
+    println!("\n--- 8. exit_actor() inside constructor ---");
     let name = format!("rayrust_runtime_api_ctor_exiting_{}", std::process::id());
     let opts = ActorOptions::new().name(name).max_restarts(0);
-    let handle = ctorexiting_actor_create(ray, &opts, 11).expect("actor_create 照常返回 handle");
-    println!("  actor_create → {} 字节 id", handle.id().len());
+    let handle = ctorexiting_actor_create(ray, &opts, 11).expect("actor_create returns handle");
+    println!("  actor_create -> {}-byte id", handle.id().len());
 
     if !cluster {
         let value = ctorexiting_get_sync(ray, &handle)
-            .expect("本地模式提交 get")
+            .expect("local mode submit get")
             .get_timeout(GET_TIMEOUT_MS)
-            .expect("本地模式构造里的 exit_actor() 是空操作，actor 必须能用");
-        assert_eq!(value, 11, "本地模式构造出来的 actor 值不对");
+            .expect("local mode exit_actor() in constructor is a no-op");
+        assert_eq!(value, 11, "local mode actor value mismatch");
         println!(
-            "  第一次 get() → {}（本地模式构造里的 exit_actor() 同样是空操作）",
+            "  first get() -> {} (local mode exit_actor() in constructor is also a no-op)",
             value
         );
         return;
@@ -1089,87 +1107,92 @@ async fn ctor_exit_check(ray: &Ray, cluster: bool) {
     };
     match outcome {
         Err(RayError::Actor(message)) => println!(
-            "  第一次 get() → Actor({})（构造任务失败，actor 从未启动）",
+            "  first get() -> Actor({}) (creation task failed, actor never started)",
             message
         ),
-        Err(other) => panic!("构造函数退出之后 get() 返回了别的错误变体: {}", other),
-        Ok(value) => panic!("构造函数里 exit_actor() 之后 get() 还拿到了 {}", value),
+        Err(other) => panic!("after constructor exit get() returned unexpected error: {}", other),
+        Ok(value) => panic!("after constructor exit_actor() get() unexpectedly returned {}", value),
     }
-    println!("  进程存活：actor_create 与 get 都没有把进程停住");
+    println!("  process alive: neither actor_create nor get hung or crashed");
 }
 
 /// 6. handle 交接：字节穿过工人进程再回来，驱动用它复原 handle 并调用。
 async fn handle_handoff_check(ray: &Ray) {
-    println!("\n--- 6. actor handle 交接 ---");
-    let handle = counter_actor_create(ray, &ActorOptions::new(), 21).expect("创建 Counter");
+    println!("\n--- 6. Actor handle handoff ---");
+    let handle = counter_actor_create(ray, &ActorOptions::new(), 21).expect("create Counter");
     let incremented = counter_increment_sync(ray, &handle, 4)
-        .expect("调用 increment")
+        .expect("call increment")
         .get_timeout(GET_TIMEOUT_MS)
-        .expect("读 increment");
-    assert_eq!(incremented, 25, "actor 的计数不对");
-    println!("  increment(4) → {}", incremented);
+        .expect("read increment");
+    assert_eq!(incremented, 25, "actor count mismatch");
+    println!("  increment(4) -> {}", incremented);
 
     let serialized = handle.serialize().expect("serialize");
-    assert!(!serialized.is_empty(), "serialize 返回了空字节");
+    assert!(!serialized.is_empty(), "serialize returned empty bytes");
     println!(
-        "  handle.serialize() → {} 字节（actor id 是 {} 字节）",
+        "  handle.serialize() -> {} bytes (actor id is {} bytes)",
         serialized.len(),
         handle.id().len()
     );
 
     let object = handle_handoff_remote(ray, serialized.clone(), handle.id().to_vec())
-        .expect("提交 handle_handoff");
+        .expect("submit handle_handoff");
     let (back_serialized, back_id, restored_in_worker, called_in_worker) = object
         .get_timeout(EXIT_TIMEOUT_MS)
-        .expect("读 handle_handoff 的结果");
+        .expect("read handle_handoff result");
     assert_eq!(
         back_serialized, serialized,
-        "序列化字节穿过工人进程之后变了"
+        "serialized bytes changed after round-trip through worker"
     );
-    assert_eq!(back_id, handle.id(), "裸 id 穿过工人进程之后变了");
+    assert_eq!(
+        back_id,
+        handle.id(),
+        "raw id changed after round-trip through worker"
+    );
     println!(
-        "  工人交回 {} 字节序列化 handle 与 {} 字节裸 id，都与原值相同",
+        "  worker returned {} serialized bytes and {}-byte raw id intact",
         back_serialized.len(),
         back_id.len()
     );
-    println!("  工人侧 from_serialized → {}", restored_in_worker);
-    println!("  工人侧裸 id 调用 → {}", called_in_worker);
+    println!("  worker-side from_serialized -> {}", restored_in_worker);
+    println!("  worker-side raw id call -> {}", called_in_worker);
     assert_eq!(
-        restored_in_worker, "Ok(16 字节 id)",
-        "工人侧复原 handle 失败"
+        restored_in_worker, "Ok(16-byte id)",
+        "worker-side from_serialized failed"
     );
     assert_eq!(
-        called_in_worker, "Ok(28 字节 object id)",
-        "工人侧裸 id 调用失败"
+        called_in_worker, "Ok(28-byte object id)",
+        "worker-side raw id call failed"
     );
 
-    let restored = ActorHandle::from_serialized(&back_serialized).expect("驱动侧复原 handle");
+    let restored =
+        ActorHandle::from_serialized(&back_serialized).expect("driver-side from_serialized");
     assert_eq!(
         restored.id(),
         handle.id(),
-        "复原出来的 actor id 与原 handle 不同"
+        "restored actor id differs from original handle"
     );
     println!(
-        "  驱动侧 from_serialized → {} 字节 id，与原 handle 相同",
+        "  driver-side from_serialized -> {}-byte id, matches original handle",
         restored.id().len()
     );
     let value = counter_get_sync(ray, &restored)
-        .expect("调用复原的 handle")
+        .expect("call restored handle")
         .get_timeout(GET_TIMEOUT_MS)
-        .expect("读复原 handle 的 get");
-    assert_eq!(value, 25, "复原的 handle 拿到的值不对");
-    println!("  复原的 handle 调 get() → {}", value);
+        .expect("read get on restored handle");
+    assert_eq!(value, 25, "restored handle returned wrong value");
+    println!("  restored handle get() -> {}", value);
 
     // 对照：同一个 actor 的裸 id 在驱动侧同样能调用——驱动进程登记过这个 handle。
     let by_raw_id: i64 = ray
         .actor_call(handle.id(), COUNTER_GET, &[], &[])
-        .expect("用裸 id 提交")
+        .expect("submit by raw id")
         .cast()
         .get_timeout(GET_TIMEOUT_MS)
-        .expect("读裸 id 的结果");
-    assert_eq!(by_raw_id, 25, "裸 id 调用拿到的值不对");
+        .expect("read raw id result");
+    assert_eq!(by_raw_id, 25, "raw id call returned wrong value");
     println!(
-        "  对照：驱动侧直接用裸 id 提交同一个方法 → {}（驱动登记过这个 handle）",
+        "  control: driver direct raw id call -> {} (driver registered handle)",
         by_raw_id
     );
 
@@ -1181,116 +1204,119 @@ async fn handle_handoff_check(ray: &Ray) {
 /// 7. 本地模式：这四条查询/等待、两个 handle 接口、kill_actor、cancel、
 /// actor_create_python 与 actor_call_python 都必须报错，进程存活。
 async fn local_mode_rejections(ray: &Ray) {
-    println!("\n--- 7. 本地模式的拒绝 ---");
+    println!("\n--- 7. Local mode rejections ---");
     let group_id = [0xa1u8; 18];
     match ray.placement_group_wait_ready(&group_id, 1) {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains("local mode"),
-                "wait_ready 的错误没有说明本地模式: {}",
+                "wait_ready error does not mention local mode: {}",
                 message
             );
-            println!("  wait_ready → Ffi({})", message);
+            println!("  wait_ready -> Ffi({})", message);
         }
-        Err(other) => panic!("本地模式 wait_ready 返回了别的错误变体: {}", other),
-        Ok(ready) => panic!("本地模式 wait_ready 返回了 {}", ready),
+        Err(other) => panic!("local mode wait_ready returned unexpected error: {}", other),
+        Ok(ready) => panic!("local mode wait_ready unexpectedly returned {}", ready),
     }
     match ray.placement_groups() {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains("local mode"),
-                "placement_groups 的错误没有说明本地模式: {}",
+                "placement_groups error does not mention local mode: {}",
                 message
             );
-            println!("  placement_groups → Ffi({})", message);
+            println!("  placement_groups -> Ffi({})", message);
         }
-        Err(other) => panic!("本地模式 placement_groups 返回了别的错误变体: {}", other),
-        Ok(groups) => panic!("本地模式 placement_groups 返回了 {} 个组", groups.len()),
+        Err(other) => panic!("local mode placement_groups returned unexpected error: {}", other),
+        Ok(groups) => panic!("local mode placement_groups returned {} groups", groups.len()),
     }
     match ray.placement_group_by_id(&group_id) {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains("local mode"),
-                "by_id 的错误没有说明本地模式: {}",
+                "by_id error does not mention local mode: {}",
                 message
             );
-            println!("  placement_group_by_id → Ffi({})", message);
+            println!("  placement_group_by_id -> Ffi({})", message);
         }
-        Err(other) => panic!("本地模式 by_id 返回了别的错误变体: {}", other),
-        Ok(group) => panic!("本地模式 by_id 返回了 {:?}", group),
+        Err(other) => panic!("local mode by_id returned unexpected error: {}", other),
+        Ok(group) => panic!("local mode by_id unexpectedly returned {:?}", group),
     }
     match ray.placement_group_by_name("rayrust_local") {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains("local mode"),
-                "by_name 的错误没有说明本地模式: {}",
+                "by_name error does not mention local mode: {}",
                 message
             );
-            println!("  placement_group_by_name → Ffi({})", message);
+            println!("  placement_group_by_name -> Ffi({})", message);
         }
-        Err(other) => panic!("本地模式 by_name 返回了别的错误变体: {}", other),
-        Ok(group) => panic!("本地模式 by_name 返回了 {:?}", group),
+        Err(other) => panic!("local mode by_name returned unexpected error: {}", other),
+        Ok(group) => panic!("local mode by_name unexpectedly returned {:?}", group),
     }
 
-    let handle = counter_actor_create(ray, &ActorOptions::new(), 1).expect("本地创建 Counter");
+    let handle = counter_actor_create(ray, &ActorOptions::new(), 1).expect("create local Counter");
     let incremented = counter_increment_sync(ray, &handle, 0)
-        .expect("本地 increment")
+        .expect("local increment")
         .get_timeout(GET_TIMEOUT_MS)
-        .expect("本地读 increment");
-    assert_eq!(incremented, 1, "本地的 Counter 计数不对");
+        .expect("read local increment");
+    assert_eq!(incremented, 1, "local Counter count mismatch");
     println!(
-        "  本地模式的 actor 本身可用：increment(0) → {}",
+        "  local mode actor itself works: increment(0) -> {}",
         incremented
     );
     match ray.kill_actor(&handle, true) {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains("local mode"),
-                "kill_actor 的错误没有说明本地模式: {}",
+                "kill_actor error does not mention local mode: {}",
                 message
             );
-            println!("  kill_actor → Ffi({})", message);
+            println!("  kill_actor -> Ffi({})", message);
         }
-        Err(other) => panic!("本地模式 kill_actor 返回了别的错误变体: {}", other),
-        Ok(()) => panic!("本地模式 kill_actor 返回了 Ok"),
+        Err(other) => panic!("local mode kill_actor returned unexpected error: {}", other),
+        Ok(()) => panic!("local mode kill_actor unexpectedly returned Ok"),
     }
     let after_kill = counter_increment_sync(ray, &handle, 1)
-        .expect("本地 kill 被拒之后 increment")
+        .expect("local increment after kill refusal")
         .get_timeout(GET_TIMEOUT_MS)
-        .expect("本地 kill 被拒之后读 increment");
-    assert_eq!(after_kill, 2, "本地 kill 被拒之后的计数不对");
+        .expect("read local increment after kill refusal");
+    assert_eq!(after_kill, 2, "local count mismatch after kill refusal");
     println!(
-        "  kill 被拒之后 actor 仍可用：increment(1) → {}",
+        "  actor still usable after kill refusal: increment(1) -> {}",
         after_kill
     );
     match handle.serialize() {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains("local mode"),
-                "serialize 的错误没有说明本地模式: {}",
+                "serialize error does not mention local mode: {}",
                 message
             );
-            println!("  serialize → Ffi({})", message);
+            println!("  serialize -> Ffi({})", message);
         }
-        Err(other) => panic!("本地模式 serialize 返回了别的错误变体: {}", other),
-        Ok(bytes) => panic!("本地模式 serialize 返回了 {} 字节", bytes.len()),
+        Err(other) => panic!("local mode serialize returned unexpected error: {}", other),
+        Ok(bytes) => panic!("local mode serialize unexpectedly returned {} bytes", bytes.len()),
     }
     // 载荷畸形的：载荷校验在本地模式判定之前，错误文本里没有 local mode。
     match ActorHandle::from_serialized(&[1u8, 2, 3]) {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains("well-formed") && !message.contains("local mode"),
-                "畸形载荷的错误应该说明载荷本身有问题: {}",
+                "malformed payload error should describe payload issue: {}",
                 message
             );
             println!(
-                "  ActorHandle::from_serialized(畸形载荷) → Ffi({})",
+                "  ActorHandle::from_serialized(malformed payload) -> Ffi({})",
                 message
             );
         }
-        Err(other) => panic!("本地模式 from_serialized 返回了别的错误变体: {}", other),
+        Err(other) => panic!(
+            "local mode from_serialized returned unexpected error: {}",
+            other
+        ),
         Ok(handle) => panic!(
-            "本地模式 from_serialized 收下了畸形载荷，返回 {} 字节 id",
+            "local mode from_serialized accepted malformed payload with {}-byte id",
             handle.id().len()
         ),
     }
@@ -1299,40 +1325,43 @@ async fn local_mode_rejections(ray: &Ray) {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains("local mode"),
-                "from_serialized 的错误没有说明本地模式: {}",
+                "from_serialized error does not mention local mode: {}",
                 message
             );
             println!(
-                "  ActorHandle::from_serialized(结构良好的载荷) → Ffi({})",
+                "  ActorHandle::from_serialized(well-formed payload) -> Ffi({})",
                 message
             );
         }
-        Err(other) => panic!("本地模式 from_serialized 返回了别的错误变体: {}", other),
+        Err(other) => panic!(
+            "local mode from_serialized returned unexpected error: {}",
+            other
+        ),
         Ok(handle) => panic!(
-            "本地模式 from_serialized 返回了 {} 字节 id",
+            "local mode from_serialized unexpectedly returned {}-byte id",
             handle.id().len()
         ),
     }
-    let put_ref = ray.put(&7i64).expect("本地 put");
+    let put_ref = ray.put(&7i64).expect("local put");
     match ray.cancel(put_ref.id(), false, false) {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains("local mode"),
-                "cancel 的错误没有说明本地模式: {}",
+                "cancel error does not mention local mode: {}",
                 message
             );
-            println!("  cancel → Ffi({})", message);
+            println!("  cancel -> Ffi({})", message);
         }
-        Err(other) => panic!("本地模式 cancel 返回了别的错误变体: {}", other),
-        Ok(()) => panic!("本地模式 cancel 返回了 Ok"),
+        Err(other) => panic!("local mode cancel returned unexpected error: {}", other),
+        Ok(()) => panic!("local mode cancel unexpectedly returned Ok"),
     }
     let after_cancel = counter_increment_sync(ray, &handle, 2)
-        .expect("本地 cancel 被拒之后 increment")
+        .expect("local increment after cancel refusal")
         .get_timeout(GET_TIMEOUT_MS)
-        .expect("本地 cancel 被拒之后读 increment");
-    assert_eq!(after_cancel, 4, "本地 cancel 被拒之后的计数不对");
+        .expect("read local increment after cancel refusal");
+    assert_eq!(after_cancel, 4, "local count mismatch after cancel refusal");
     println!(
-        "  cancel 被拒之后进程仍可用：increment(2) → {}",
+        "  process still usable after cancel refusal: increment(2) -> {}",
         after_cancel
     );
     // 一个活着的本地 actor 的 id：入口在拿 id 之前就拒绝，所以传哪个 id 都一样。
@@ -1340,27 +1369,30 @@ async fn local_mode_rejections(ray: &Ray) {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains("local mode"),
-                "actor_call_python 的错误没有说明本地模式: {}",
+                "actor_call_python error does not mention local mode: {}",
                 message
             );
-            println!("  actor_call_python → Ffi({})", message);
+            println!("  actor_call_python -> Ffi({})", message);
         }
-        Err(other) => panic!("本地模式 actor_call_python 返回了别的错误变体: {}", other),
+        Err(other) => panic!(
+            "local mode actor_call_python returned unexpected error: {}",
+            other
+        ),
         Ok(reference) => panic!(
-            "本地模式 actor_call_python 返回了 {} 字节 ref",
+            "local mode actor_call_python unexpectedly returned {}-byte ref",
             reference.id().len()
         ),
     }
     let after_py_call = counter_increment_sync(ray, &handle, 3)
-        .expect("本地 actor_call_python 被拒之后 increment")
+        .expect("local increment after actor_call_python refusal")
         .get_timeout(GET_TIMEOUT_MS)
-        .expect("本地 actor_call_python 被拒之后读 increment");
+        .expect("read local increment after actor_call_python refusal");
     assert_eq!(
         after_py_call, 7,
-        "本地 actor_call_python 被拒之后的计数不对"
+        "local count mismatch after actor_call_python refusal"
     );
     println!(
-        "  actor_call_python 被拒之后 actor 仍可用：increment(3) → {}",
+        "  actor still usable after actor_call_python refusal: increment(3) -> {}",
         after_py_call
     );
     let python_name = "rayrust_local_py";
@@ -1373,38 +1405,43 @@ async fn local_mode_rejections(ray: &Ray) {
         Err(RayError::Ffi(message)) => {
             assert!(
                 message.contains("local mode"),
-                "actor_create_python 的错误没有说明本地模式: {}",
+                "actor_create_python error does not mention local mode: {}",
                 message
             );
-            println!("  actor_create_python → Ffi({})", message);
+            println!("  actor_create_python -> Ffi({})", message);
         }
-        Err(other) => panic!("本地模式 actor_create_python 返回了别的错误变体: {}", other),
+        Err(other) => panic!(
+            "local mode actor_create_python returned unexpected error: {}",
+            other
+        ),
         Ok(handle) => panic!(
-            "本地模式 actor_create_python 返回了 {} 字节 id",
+            "local mode actor_create_python unexpectedly returned {}-byte id",
             handle.id().len()
         ),
     }
     match ray.get_actor(python_name, "") {
-        Ok(None) => println!("  get_actor({python_name}) → None（名字没有进本地名字表）"),
+        Ok(None) => println!(
+            "  get_actor({python_name}) -> None (name not added to local name table)"
+        ),
         Ok(Some(handle)) => panic!(
-            "被拒的创建登记了名字，get_actor 拿到 {} 字节 id",
+            "refused creation registered name and get_actor returned {}-byte id",
             handle.id().len()
         ),
-        Err(error) => panic!("本地 get_actor({python_name}) 报错: {}", error),
+        Err(error) => panic!("local get_actor({python_name}) failed: {}", error),
     }
     let after_py_create = counter_increment_sync(ray, &handle, 4)
-        .expect("本地 actor_create_python 被拒之后 increment")
+        .expect("local increment after actor_create_python refusal")
         .get_timeout(GET_TIMEOUT_MS)
-        .expect("本地 actor_create_python 被拒之后读 increment");
+        .expect("read local increment after actor_create_python refusal");
     assert_eq!(
         after_py_create, 11,
-        "本地 actor_create_python 被拒之后的计数不对"
+        "local count mismatch after actor_create_python refusal"
     );
     println!(
-        "  actor_create_python 被拒之后 actor 仍可用：increment(4) → {}",
+        "  actor still usable after actor_create_python refusal: increment(4) -> {}",
         after_py_create
     );
-    println!("  进程存活：以上被拒的调用都是提交侧的报错，没有 abort");
+    println!("  process alive: all refused calls errored on submission without aborting");
 
     actor_name_boundary_checks(ray);
 }
@@ -1414,7 +1451,7 @@ async fn main() {
     let mode = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "cluster".to_string());
-    println!("=== RayRuntime 接口 ({}) ===", mode);
+    println!("=== RayRuntime API ({}) ===", mode);
     let cluster = mode == "cluster";
     let config = if cluster {
         cluster_config()
@@ -1430,12 +1467,11 @@ async fn main() {
         actor_kill_id_width_c_abi();
         actor_name_boundary_checks(&ray);
     } else {
-        println!("\n--- 2、3. placement group 流程与非法输入 ---");
-        println!("  本地模式跳过：三个查询在本地模式没有 GCS accessor，C 侧直接报错；");
-        println!("  第 7 项会实际跑这四条报错。");
-        println!("  第 3b 项（C ABI 传 3 字节 actor id）也跳过：它的承重性来自集群模式下");
-        println!("  修复前会终止进程；本地模式那条报错由第 7 项的 kill_actor 覆盖。");
-        println!("  第 3 项的 actor 名字边界与第 7 项跑同一组断言。");
+        println!("\n--- 2, 3. Placement group flow and invalid inputs ---");
+        println!("  skipped in local mode: queries have no GCS accessor and error in C;");
+        println!("  step 7 exercises all four rejections.");
+        println!("  step 3b (3-byte actor id via C ABI) skipped: cluster-specific abort guard;");
+        println!("  step 7 covers local kill_actor error.");
     }
     placement_group_remove_checks(&ray);
     exit_actor_check(&ray, cluster).await;
@@ -1444,13 +1480,13 @@ async fn main() {
     if cluster {
         handle_handoff_check(&ray).await;
     } else {
-        println!("\n--- 6. handle 交接的集群部分 ---");
-        println!("  本地模式跳过：本地模式不启动 core worker 进程，两个 handle 接口都报错");
-        println!("  （第 7 项实际跑这两个报错）；交接到工人进程的流程需要真实工人。");
+        println!("\n--- 6. Cluster part of handle handoff ---");
+        println!("  skipped in local mode: local mode has no core worker process;");
+        println!("  step 7 tests both handle errors, while handoff requires a real worker.");
         local_mode_rejections(&ray).await;
     }
 
     // 让 blocking pool 里的 FFI 调用收尾，避免退出竞态。
     tokio::time::sleep(Duration::from_millis(200)).await;
-    println!("\n✓ RayRuntime 接口检查全部通过");
+    println!("\nPASS: all RayRuntime API checks passed");
 }
