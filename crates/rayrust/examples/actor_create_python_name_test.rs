@@ -116,7 +116,10 @@ fn main() {
             "refused creation registered the name and returned {}-byte id",
             handle.id().len()
         ),
-        Err(error) => panic!("get_actor(\"{}\") returned error: {:?}", REFUSED_NAME, error),
+        Err(error) => panic!(
+            "get_actor(\"{}\") returned error: {:?}",
+            REFUSED_NAME, error
+        ),
     }
 
     println!("\n--- 5. Control: real Python actor ---");

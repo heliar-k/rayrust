@@ -30,12 +30,10 @@ fn vget<'a>(val: &'a rmpv::Value, key: &str) -> Option<&'a rmpv::Value> {
 
 #[tokio::main]
 async fn main() {
-    let address = std::env::var("RAY_ADDRESS")
-        .unwrap_or_else(|_| "192.168.42.141:6379".to_string());
-    let node_ip = std::env::var("RAY_NODE_IP")
-        .unwrap_or_else(|_| "192.168.42.106".to_string());
-    let worker_so = std::env::var("RAY_WORKER_SO")
-        .unwrap_or_default();
+    let address =
+        std::env::var("RAY_ADDRESS").unwrap_or_else(|_| "192.168.42.141:6379".to_string());
+    let node_ip = std::env::var("RAY_NODE_IP").unwrap_or_else(|_| "192.168.42.106".to_string());
+    let worker_so = std::env::var("RAY_WORKER_SO").unwrap_or_default();
 
     println!("=== Cross-Language Complex Type Test ===\n");
 
@@ -52,7 +50,10 @@ async fn main() {
             c
         }
     } else {
-        println!("Using CLUSTER mode: address={}, node_ip={}", address, node_ip);
+        println!(
+            "Using CLUSTER mode: address={}, node_ip={}",
+            address, node_ip
+        );
         let mut c = RayConfig::new(&address).node_ip(&node_ip);
         if !worker_so.is_empty() {
             c = c.code_search_path(vec![worker_so.clone()]);
@@ -64,10 +65,7 @@ async fn main() {
         // Local mode: rely on PYTHONPATH env var inherited by subprocess
     } else {
         let python_dir = python_module_dir();
-        let runtime_env = format!(
-            "{{\"env_vars\": {{\"PYTHONPATH\": \"{}\"}}}}",
-            python_dir
-        );
+        let runtime_env = format!("{{\"env_vars\": {{\"PYTHONPATH\": \"{}\"}}}}", python_dir);
         config = config.runtime_env(runtime_env);
     }
     let ray = Ray::connect(&config).expect("init failed");
@@ -114,7 +112,10 @@ async fn main() {
     println!("\n--- 2. Python returns dict → HashMap<String, i64> ---");
     match ray.task_call_python("rayrust_test", "return_dict", &[], &[]) {
         Ok(obj_ref) => {
-            let val: HashMap<String, i64> = obj_ref.cast().get_async().await
+            let val: HashMap<String, i64> = obj_ref
+                .cast()
+                .get_async()
+                .await
                 .expect("return_dict failed");
             assert_eq!(val.get("a"), Some(&1));
             assert_eq!(val.get("b"), Some(&2));
@@ -128,7 +129,10 @@ async fn main() {
     println!("\n--- 3. Python returns nested → rmpv::Value ---");
     match ray.task_call_python("rayrust_test", "return_nested", &[], &[]) {
         Ok(obj_ref) => {
-            let val = obj_ref.get_value_async().await.expect("return_nested failed");
+            let val = obj_ref
+                .get_value_async()
+                .await
+                .expect("return_nested failed");
             assert!(val.is_array());
             let arr = val.as_array().unwrap();
             assert_eq!(arr.len(), 2);
@@ -143,7 +147,10 @@ async fn main() {
             assert_eq!(scores.as_array().unwrap().len(), 3);
             println!("return_nested()[0].name = {} ✓", name.as_str().unwrap());
             println!("return_nested()[0].age = {} ✓", age.as_i64().unwrap());
-            println!("return_nested()[0].scores.len = {} ✓", scores.as_array().unwrap().len());
+            println!(
+                "return_nested()[0].scores.len = {} ✓",
+                scores.as_array().unwrap().len()
+            );
         }
         Err(e) => println!("return_nested failed: {}", e),
     }
@@ -152,7 +159,10 @@ async fn main() {
     println!("\n--- 4. Python returns None → Option<i64> ---");
     match ray.task_call_python("rayrust_test", "return_none", &[], &[]) {
         Ok(obj_ref) => {
-            let val: Option<i64> = obj_ref.cast().get_async().await
+            let val: Option<i64> = obj_ref
+                .cast()
+                .get_async()
+                .await
                 .expect("return_none failed");
             assert_eq!(val, None);
             println!("return_none() = {:?} ✓", val);
@@ -164,14 +174,17 @@ async fn main() {
     println!("\n--- 5. Python returns mixed → rmpv::Value ---");
     match ray.task_call_python("rayrust_test", "return_mixed", &[], &[]) {
         Ok(obj_ref) => {
-            let val = obj_ref.get_value_async().await.expect("return_mixed failed");
+            let val = obj_ref
+                .get_value_async()
+                .await
+                .expect("return_mixed failed");
             assert!(val.is_array());
             let arr = val.as_array().unwrap();
             assert_eq!(arr.len(), 5);
-            assert_eq!(arr[0].as_i64().unwrap(), 42);       // int
-            assert_eq!(arr[1].as_str().unwrap(), "hello");  // str
-            assert!(arr[2].as_bool().unwrap());    // bool
-            assert!(arr[3].is_nil());                        // None
+            assert_eq!(arr[0].as_i64().unwrap(), 42); // int
+            assert_eq!(arr[1].as_str().unwrap(), "hello"); // str
+            assert!(arr[2].as_bool().unwrap()); // bool
+            assert!(arr[3].is_nil()); // None
             #[allow(clippy::approx_constant)]
             let expected_float = 3.14;
             assert!((arr[4].as_f64().unwrap() - expected_float).abs() < 1e-9); // float
@@ -184,7 +197,10 @@ async fn main() {
     println!("\n--- 6. Python returns string list → Vec<String> ---");
     match ray.task_call_python("rayrust_test", "return_string_list", &[], &[]) {
         Ok(obj_ref) => {
-            let val: Vec<String> = obj_ref.cast().get_async().await
+            let val: Vec<String> = obj_ref
+                .cast()
+                .get_async()
+                .await
                 .expect("return_string_list failed");
             assert_eq!(val, vec!["foo", "bar", "baz"]);
             println!("return_string_list() = {:?} ✓", val);
@@ -215,8 +231,8 @@ async fn main() {
     let args: Vec<&[u8]> = vec![&arg];
     match ray.task_call_python("rayrust_test", "echo_dict", &args, &[]) {
         Ok(obj_ref) => {
-            let val: HashMap<String, i64> = obj_ref.cast().get_async().await
-                .expect("echo_dict failed");
+            let val: HashMap<String, i64> =
+                obj_ref.cast().get_async().await.expect("echo_dict failed");
             assert_eq!(val.get("x"), Some(&100));
             assert_eq!(val.get("y"), Some(&200));
             println!("echo_dict({{x:100, y:200}}) = {:?} ✓", val);
@@ -240,23 +256,39 @@ async fn main() {
 
     // ── 10. Rust → Python: send nested dict, Python processes ───
     println!("\n--- 10. Rust → Python: process_nested ---");
-    let input = rmpv::Value::Map(vec![
-        (rmpv::Value::String("items".into()), rmpv::Value::Array(vec![
+    let input = rmpv::Value::Map(vec![(
+        rmpv::Value::String("items".into()),
+        rmpv::Value::Array(vec![
             rmpv::Value::Map(vec![
-                (rmpv::Value::String("id".into()), rmpv::Value::Integer(1.into())),
-                (rmpv::Value::String("name".into()), rmpv::Value::String("a".into())),
+                (
+                    rmpv::Value::String("id".into()),
+                    rmpv::Value::Integer(1.into()),
+                ),
+                (
+                    rmpv::Value::String("name".into()),
+                    rmpv::Value::String("a".into()),
+                ),
             ]),
             rmpv::Value::Map(vec![
-                (rmpv::Value::String("id".into()), rmpv::Value::Integer(2.into())),
-                (rmpv::Value::String("name".into()), rmpv::Value::String("b".into())),
+                (
+                    rmpv::Value::String("id".into()),
+                    rmpv::Value::Integer(2.into()),
+                ),
+                (
+                    rmpv::Value::String("name".into()),
+                    rmpv::Value::String("b".into()),
+                ),
             ]),
-        ])),
-    ]);
+        ]),
+    )]);
     let arg = rayrust::serialize(&input).unwrap();
     let args: Vec<&[u8]> = vec![&arg];
     match ray.task_call_python("rayrust_test", "process_nested", &args, &[]) {
         Ok(obj_ref) => {
-            let val = obj_ref.get_value_async().await.expect("process_nested failed");
+            let val = obj_ref
+                .get_value_async()
+                .await
+                .expect("process_nested failed");
             assert!(val.is_map());
             let count = vget(&val, "count").unwrap();
             assert_eq!(count.as_i64().unwrap(), 2);
@@ -264,7 +296,10 @@ async fn main() {
             assert_eq!(names.as_array().unwrap().len(), 2);
             assert_eq!(names.as_array().unwrap()[0].as_str().unwrap(), "a");
             assert_eq!(names.as_array().unwrap()[1].as_str().unwrap(), "b");
-            println!("process_nested() count={}, names=[a, b] ✓", count.as_i64().unwrap());
+            println!(
+                "process_nested() count={}, names=[a, b] ✓",
+                count.as_i64().unwrap()
+            );
         }
         Err(e) => println!("process_nested failed: {}", e),
     }

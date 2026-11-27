@@ -6,17 +6,15 @@
 use rayrust::prelude::*;
 
 fn main() {
-    let address = std::env::var("RAY_ADDRESS")
-        .unwrap_or_else(|_| "192.168.42.141:6379".to_string());
-    let node_ip = std::env::var("RAY_NODE_IP")
-        .unwrap_or_else(|_| "192.168.42.106".to_string());
-    let worker_so = std::env::var("RAY_WORKER_SO")
-        .unwrap_or_else(|_| {
-            eprintln!("ERROR: RAY_WORKER_SO not set. Build the worker first:");
-            eprintln!("  cargo build --release -p rayrust-example-worker");
-            eprintln!("Then set RAY_WORKER_SO to the path of librayrust_worker.so");
-            std::process::exit(1);
-        });
+    let address =
+        std::env::var("RAY_ADDRESS").unwrap_or_else(|_| "192.168.42.141:6379".to_string());
+    let node_ip = std::env::var("RAY_NODE_IP").unwrap_or_else(|_| "192.168.42.106".to_string());
+    let worker_so = std::env::var("RAY_WORKER_SO").unwrap_or_else(|_| {
+        eprintln!("ERROR: RAY_WORKER_SO not set. Build the worker first:");
+        eprintln!("  cargo build --release -p rayrust-example-worker");
+        eprintln!("Then set RAY_WORKER_SO to the path of librayrust_worker.so");
+        std::process::exit(1);
+    });
 
     println!("=== Ray Cluster Remote Task ===");
     println!("Address: {}", address);

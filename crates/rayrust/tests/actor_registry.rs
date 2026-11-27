@@ -56,7 +56,10 @@ fn actor_call_rejects_an_unregistered_actor_id() {
                 message
             );
         }
-        Err(other) => panic!("unregistered id returned unexpected error variant: {}", other),
+        Err(other) => panic!(
+            "unregistered id returned unexpected error variant: {}",
+            other
+        ),
         Ok(_) => panic!("unregistered id was unexpectedly accepted"),
     }
     // 拒绝之后进程与运行时都还能用。
@@ -94,7 +97,10 @@ fn actor_call_reports_a_short_actor_id_before_the_registry() {
                     message
                 );
             }
-            Err(other) => panic!("{} actor id returned unexpected error variant: {}", label, other),
+            Err(other) => panic!(
+                "{} actor id returned unexpected error variant: {}",
+                label, other
+            ),
             Ok(_) => panic!("{} actor id was unexpectedly accepted", label),
         }
     }
@@ -122,7 +128,10 @@ fn the_registry_forgets_the_handles_of_a_dropped_runtime() {
             "handle from current runtime was rejected as unregistered: {}",
             message
         ),
-        Err(other) => panic!("calling local actor returned unexpected error variant: {}", other),
+        Err(other) => panic!(
+            "calling local actor returned unexpected error variant: {}",
+            other
+        ),
         Ok(_) => {}
     }
     let stale = handle.id().to_vec();
@@ -200,7 +209,10 @@ fn task_call_python_rejects_a_name_registered_as_a_rust_function() {
                 message
             );
         }
-        Err(other) => panic!("colliding task_call_python returned unexpected error variant: {}", other),
+        Err(other) => panic!(
+            "colliding task_call_python returned unexpected error variant: {}",
+            other
+        ),
         Ok(_) => panic!("colliding Python task was unexpectedly submitted"),
     }
 }
@@ -267,7 +279,10 @@ fn connect_succeeds_and_keeps_clean_namespace_after_rejected_runtime_env() {
                 "rejected runtime_env message prefix mismatch: {}",
                 message
             ),
-            Err(other) => panic!("rejected runtime_env returned unexpected error variant: {}", other),
+            Err(other) => panic!(
+                "rejected runtime_env returned unexpected error variant: {}",
+                other
+            ),
             Ok(_) => panic!("invalid runtime_env was unexpectedly accepted"),
         }
     }

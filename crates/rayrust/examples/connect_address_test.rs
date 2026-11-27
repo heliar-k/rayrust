@@ -69,7 +69,10 @@ fn connect_local(label: &str, address: &str) -> Ray {
     config.address = address.to_string();
     match Ray::connect(&config) {
         Ok(ray) => ray,
-        Err(e) => panic!("{}: local mode rejected address {:?}: {}", label, address, e),
+        Err(e) => panic!(
+            "{}: local mode rejected address {:?}: {}",
+            label, address, e
+        ),
     }
 }
 

@@ -47,7 +47,8 @@ impl Counter {
 
 #[tokio::main]
 async fn main() {
-    let address = std::env::var("RAY_ADDRESS").unwrap_or_else(|_| "192.168.42.141:6379".to_string());
+    let address =
+        std::env::var("RAY_ADDRESS").unwrap_or_else(|_| "192.168.42.141:6379".to_string());
     let node_ip = std::env::var("RAY_NODE_IP").unwrap_or_else(|_| "192.168.42.106".to_string());
     let worker_so = std::env::var("RAY_WORKER_SO")
         .ok()
@@ -99,18 +100,22 @@ async fn main() {
 
     // 1. Create actor via macro-generated caller
     println!("-- 1. Create actor --");
-    let handle = counter_actor_create(&ray, &ActorOptions::new(), 100i64)
-        .expect("actor create failed");
+    let handle =
+        counter_actor_create(&ray, &ActorOptions::new(), 100i64).expect("actor create failed");
     println!("   Counter created (id_len={})\n", handle.id().len());
 
     // 2. Call methods via macro-generated async callers
     println!("-- 2. Call methods (async) --");
-    let r = counter_increment(&ray, &handle, 5).await.expect("inc failed");
+    let r = counter_increment(&ray, &handle, 5)
+        .await
+        .expect("inc failed");
     let v: i64 = r.get_async().await.expect("get failed");
     println!("   increment(5) = {} (expect 105)", v);
     assert_eq!(v, 105);
 
-    let r = counter_increment(&ray, &handle, 10).await.expect("inc failed");
+    let r = counter_increment(&ray, &handle, 10)
+        .await
+        .expect("inc failed");
     let v: i64 = r.get_async().await.expect("get failed");
     println!("   increment(10) = {} (expect 115)", v);
     assert_eq!(v, 115);
@@ -131,10 +136,14 @@ async fn main() {
 
     // 4. State isolation
     println!("-- 4. State isolation --");
-    let handle2 = counter_actor_create(&ray, &ActorOptions::new(), 0i64)
-        .expect("actor2 create failed");
-    let r1 = counter_increment(&ray, &handle, 1).await.expect("inc1 failed");
-    let r2 = counter_increment(&ray, &handle2, 1).await.expect("inc2 failed");
+    let handle2 =
+        counter_actor_create(&ray, &ActorOptions::new(), 0i64).expect("actor2 create failed");
+    let r1 = counter_increment(&ray, &handle, 1)
+        .await
+        .expect("inc1 failed");
+    let r2 = counter_increment(&ray, &handle2, 1)
+        .await
+        .expect("inc2 failed");
     let v1: i64 = r1.get_async().await.expect("get1 failed");
     let v2: i64 = r2.get_async().await.expect("get2 failed");
     println!("   actor1.increment(1) = {} (expect 116)", v1);
@@ -145,8 +154,8 @@ async fn main() {
 
     // 5. Concurrent calls
     println!("-- 5. Concurrent calls --");
-    let handle3 = counter_actor_create(&ray, &ActorOptions::new(), 0i64)
-        .expect("actor3 create failed");
+    let handle3 =
+        counter_actor_create(&ray, &ActorOptions::new(), 0i64).expect("actor3 create failed");
     let t0 = std::time::Instant::now();
     let mut futs = Vec::new();
     for _ in 0..50 {
@@ -164,7 +173,11 @@ async fn main() {
     while let Some(res) = set.join_next().await {
         sum += res.unwrap();
     }
-    println!("   50 concurrent increments: sum={} in {:?}", sum, t0.elapsed());
+    println!(
+        "   50 concurrent increments: sum={} in {:?}",
+        sum,
+        t0.elapsed()
+    );
     // Fifty increments of one from zero return 1..=50, whose sum is 1275.
     assert_eq!(sum, (1..=50).sum::<i64>(), "50 concurrent increments of 1");
     println!();
@@ -181,9 +194,7 @@ async fn main() {
 
     // 7. ActorOptions: resource scheduling + name
     println!("-- 7. ActorOptions (resource + name) --");
-    let opts = ActorOptions::new()
-        .name("counter_gpu")
-        .resource("CPU", 1.0);
+    let opts = ActorOptions::new().name("counter_gpu").resource("CPU", 1.0);
     let h = counter_actor_create(&ray, &opts, 42i64).expect("resource actor create failed");
     let r = counter_get(&ray, &h).await.expect("call failed");
     let v: i64 = r.get_async().await.expect("get failed");
@@ -195,7 +206,10 @@ async fn main() {
         .get_actor("counter_gpu", "")
         .expect("get_actor(\"counter_gpu\") failed")
         .expect("get_actor(\"counter_gpu\") did not find the named actor");
-    println!("   get_actor(\"counter_gpu\") found (id_len={})", found.id().len());
+    println!(
+        "   get_actor(\"counter_gpu\") found (id_len={})",
+        found.id().len()
+    );
     assert_eq!(found.id(), h.id(), "get_actor returns the named actor's id");
 
     let _ = ray.kill_actor(&h, true);

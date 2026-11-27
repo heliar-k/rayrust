@@ -109,8 +109,7 @@ fn call_actor_by_raw_id(actor_id: &[u8]) -> String {
         )
     };
     if out.data.is_null() {
-        let message =
-            rayrust::sys::last_error().unwrap_or_else(|| "no error recorded".to_string());
+        let message = rayrust::sys::last_error().unwrap_or_else(|| "no error recorded".to_string());
         return format!("Err({})", message);
     }
     let len = out.len;

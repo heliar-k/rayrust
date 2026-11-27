@@ -466,7 +466,10 @@ fn check_negative_timeout(ray: &Ray) {
         "normal get after rejection returned {}",
         recovered
     );
-    println!("  value.get_timeout(30000) after rejection -> {}", recovered);
+    println!(
+        "  value.get_timeout(30000) after rejection -> {}",
+        recovered
+    );
 
     cancel_running(ray, &pending, "sleeping task");
 }

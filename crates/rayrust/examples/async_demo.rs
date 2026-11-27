@@ -16,15 +16,13 @@ fn greet(name: String) -> String {
 
 #[tokio::main]
 async fn main() {
-    let address = std::env::var("RAY_ADDRESS")
-        .unwrap_or_else(|_| "192.168.42.141:6379".to_string());
-    let node_ip = std::env::var("RAY_NODE_IP")
-        .unwrap_or_else(|_| "192.168.42.106".to_string());
-    let worker_so = std::env::var("RAY_WORKER_SO")
-        .unwrap_or_else(|_| {
-            eprintln!("ERROR: RAY_WORKER_SO not set.");
-            std::process::exit(1);
-        });
+    let address =
+        std::env::var("RAY_ADDRESS").unwrap_or_else(|_| "192.168.42.141:6379".to_string());
+    let node_ip = std::env::var("RAY_NODE_IP").unwrap_or_else(|_| "192.168.42.106".to_string());
+    let worker_so = std::env::var("RAY_WORKER_SO").unwrap_or_else(|_| {
+        eprintln!("ERROR: RAY_WORKER_SO not set.");
+        std::process::exit(1);
+    });
 
     println!("=== Ray Async Demo (bounded Get on the blocking pool) ===");
     println!("Address: {}, Node: {}", address, node_ip);
@@ -50,11 +48,7 @@ async fn main() {
     let r3: ObjectRef<String> = r3.expect("greet failed");
 
     // get_async blocks one blocking-pool thread inside Get(id, timeout_ms); the tokio side stays free
-    let (v1, v2, v3) = tokio::join!(
-        r1.get_async(),
-        r2.get_async(),
-        r3.get_async(),
-    );
+    let (v1, v2, v3) = tokio::join!(r1.get_async(), r2.get_async(), r3.get_async(),);
 
     let v1: i32 = v1.expect("add(10, 32) failed");
     let v2: i32 = v2.expect("add(100, 200) failed");
@@ -75,15 +69,21 @@ async fn main() {
         submit_futs.push(add_remote_async(&ray, i, i * 2));
     }
 
-    let obj_refs: Vec<ObjectRef<i32>> = join_all(submit_futs).await
-        .into_iter().map(|r| r.expect("task failed")).collect();
+    let obj_refs: Vec<ObjectRef<i32>> = join_all(submit_futs)
+        .await
+        .into_iter()
+        .map(|r| r.expect("task failed"))
+        .collect();
 
     let mut get_futs = Vec::new();
     for obj_ref in obj_refs {
         get_futs.push(async move { obj_ref.get_async().await });
     }
-    let results: Vec<i32> = join_all(get_futs).await
-        .into_iter().map(|r| r.expect("task result failed")).collect();
+    let results: Vec<i32> = join_all(get_futs)
+        .await
+        .into_iter()
+        .map(|r| r.expect("task result failed"))
+        .collect();
 
     let mut sum = 0i32;
     for (i, val) in results.iter().enumerate() {

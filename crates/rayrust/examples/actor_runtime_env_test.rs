@@ -125,8 +125,11 @@ fn expect_python_control(ray: &Ray, label: &str) {
 /// 建一个 Rust `EnvReader` 并读 `RAYRUST_ACTOR_ENV`。
 fn rust_env_reader_read(ray: &Ray, opts: &ActorOptions) -> Result<Option<String>, RayError> {
     let handle = envreader_actor_create(ray, opts)?;
-    envreader_read_sync(ray, &handle, RUST_ENV_VAR.to_string())
-        .and_then(|reference| reference.cast::<Option<String>>().get_timeout(READ_TIMEOUT_MS))
+    envreader_read_sync(ray, &handle, RUST_ENV_VAR.to_string()).and_then(|reference| {
+        reference
+            .cast::<Option<String>>()
+            .get_timeout(READ_TIMEOUT_MS)
+    })
 }
 
 /// 1 到 4：Python actor 侧，文档被接受，坏文档在提交前被拒。

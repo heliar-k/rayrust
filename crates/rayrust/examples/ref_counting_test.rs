@@ -226,7 +226,10 @@ fn run_cluster(ray: &Ray) {
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("object should stay alive after Vec<u8> conversion");
     assert_eq!(value, 11, "unexpected value after Vec<u8> conversion");
-    println!("  rebuilt ref after Vec<u8> conversion returned {} (ref kept)", value);
+    println!(
+        "  rebuilt ref after Vec<u8> conversion returned {} (ref kept)",
+        value
+    );
 
     // ── 5. 嵌套引用不可见 ────────────────────────────────────
     println!("\n--- 5. Python returns dict containing ObjectRef ---");

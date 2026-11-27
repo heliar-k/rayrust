@@ -52,7 +52,10 @@ fn main() {
 
     // Call add(1, 2)
     let obj_ref = add_remote(&ray, 1, 2).expect("submit add(1, 2)");
-    println!("Task 'add(1, 2)' submitted → ObjectRef(id_len={})", obj_ref.id().len());
+    println!(
+        "Task 'add(1, 2)' submitted → ObjectRef(id_len={})",
+        obj_ref.id().len()
+    );
     match obj_ref.get() {
         Ok(val) => println!("Task result: {} ✓", val),
         Err(e) => println!("Task result get failed: {}", e),

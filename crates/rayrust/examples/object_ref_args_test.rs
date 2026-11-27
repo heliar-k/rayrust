@@ -143,7 +143,10 @@ async fn mixed_value_and_ref(ray: &Ray) {
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("read sub(&ref(10), 3)");
     assert_eq!(value, 7, "sub(&ref(10), 3) returned {}", value);
-    println!("  sub(&ref(10), 3) -> {} (ref first, arg order preserved)", value);
+    println!(
+        "  sub(&ref(10), 3) -> {} (ref first, arg order preserved)",
+        value
+    );
 }
 
 /// 2. 两步任务图：中间结果只以引用的形式出现在第二个任务的参数里。
@@ -244,7 +247,10 @@ async fn actor_with_ref(ray: &Ray, cluster: bool) {
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("read the async increment result");
     assert_eq!(value, 115, "increment(&ref(10)) returned {}", value);
-    println!("  increment: future created, ref dropped, then polled -> {}", value);
+    println!(
+        "  increment: future created, ref dropped, then polled -> {}",
+        value
+    );
 
     let value = counter_get_sync(ray, &handle)
         .expect("sync get()")
@@ -257,9 +263,7 @@ async fn actor_with_ref(ray: &Ray, cluster: bool) {
         let _ = ray.kill_actor(&handle, true);
         println!("  actor killed");
     } else {
-        println!(
-            "  local mode skips kill_actor (requires core worker); actor ends with process"
-        );
+        println!("  local mode skips kill_actor (requires core worker); actor ends with process");
     }
 }
 
@@ -276,7 +280,10 @@ async fn python_with_ref(ray: &Ray) {
 
     // 6a. 驱动 put_xlang 写入的对象当引用参数：携带 XLANG metadata，Python 任务正常解码。
     let driver_put = ray.put_xlang(&40i32).expect("put_xlang(40)");
-    assert!(driver_put.is_xlang(), "put_xlang should set is_xlang() == true");
+    assert!(
+        driver_put.is_xlang(),
+        "put_xlang should set is_xlang() == true"
+    );
     let sum_6a: i32 = ray
         .task_call_python(
             PYTHON_MODULE,
@@ -354,7 +361,10 @@ async fn python_with_ref(ray: &Ray) {
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("read the Python add result");
     assert_eq!(sum, 42, "Python add(&ref(40), 2) returned {}", sum);
-    println!("  Python-produced object as ref arg: add(&ref(40), 2) -> {}", sum);
+    println!(
+        "  Python-produced object as ref arg: add(&ref(40), 2) -> {}",
+        sum
+    );
 
     let start = serialize(&0i64).expect("serialize(0)");
     let handle = ray
@@ -439,7 +449,10 @@ async fn python_with_ref(ray: &Ray) {
         .cast::<i64>()
         .get_timeout(PROBE_TIMEOUT_MS)
         .expect("read get on restored Python handle");
-    assert_eq!(current, value, "restored Python handle returned wrong value");
+    assert_eq!(
+        current, value,
+        "restored Python handle returned wrong value"
+    );
     println!(
         "  Python handle round-trip: serialize {} bytes -> from_serialized -> get() -> {}",
         serialized.len(),
@@ -548,7 +561,10 @@ async fn returned_ref_is_unusable(ray: &Ray) {
     match add_remote(ray, &as_arg, 1) {
         Err(RayError::Runtime(_)) => println!("  same id as ref arg -> Runtime (caught by guard)"),
         Ok(_) => panic!("worker-returned id was unexpectedly submitted as ref arg"),
-        Err(other) => panic!("worker-returned id as ref arg returned unexpected error: {}", other),
+        Err(other) => panic!(
+            "worker-returned id as ref arg returned unexpected error: {}",
+            other
+        ),
     }
 }
 
@@ -597,7 +613,10 @@ async fn unknown_ids_are_rejected(ray: &Ray, cluster: bool) {
             println!("  add(fabricated 28-byte id, 1) (by value) -> Runtime")
         }
         Ok(_) => panic!("fabricated 28-byte id by value was unexpectedly submitted"),
-        Err(other) => panic!("fabricated id by value returned unexpected error: {}", other),
+        Err(other) => panic!(
+            "fabricated id by value returned unexpected error: {}",
+            other
+        ),
     }
 
     // 9d. 27 字节：长度不对，错误变体与消息与 C 侧一致。
@@ -617,7 +636,10 @@ async fn unknown_ids_are_rejected(ray: &Ray, cluster: bool) {
             println!("  task_call(2 args, 1 is_ref) -> Ffi({})", msg)
         }
         Ok(_) => panic!("mismatched is_ref length was unexpectedly submitted"),
-        Err(other) => panic!("mismatched is_ref returned unexpected error variant: {}", other),
+        Err(other) => panic!(
+            "mismatched is_ref returned unexpected error variant: {}",
+            other
+        ),
     }
     // 9f. 集群模式下 put_xlang 句柄交给 Rust 宏调用器：提交前立即返回 RayError::Serialization。
     if cluster {
@@ -630,7 +652,10 @@ async fn unknown_ids_are_rejected(ray: &Ray, cluster: bool) {
                 "put_xlang handle was unexpectedly submitted as Rust ref arg: {:?}",
                 obj.get_timeout(PROBE_TIMEOUT_MS)
             ),
-            Err(other) => panic!("borrowed put_xlang handle returned unexpected error: {}", other),
+            Err(other) => panic!(
+                "borrowed put_xlang handle returned unexpected error: {}",
+                other
+            ),
         }
         match add_remote(ray, driver_put, 2) {
             Err(RayError::Serialization(_)) => {
@@ -640,7 +665,10 @@ async fn unknown_ids_are_rejected(ray: &Ray, cluster: bool) {
                 "owned put_xlang handle was unexpectedly submitted as Rust ref arg: {:?}",
                 obj.get_timeout(PROBE_TIMEOUT_MS)
             ),
-            Err(other) => panic!("owned put_xlang handle returned unexpected error: {}", other),
+            Err(other) => panic!(
+                "owned put_xlang handle returned unexpected error: {}",
+                other
+            ),
         }
     }
     println!("  process continues: no GetOwnerAddressOrDie abort and no local-mode hang");
@@ -747,7 +775,10 @@ async fn id_width_rejections(ray: &Ray, cluster: bool) {
             );
             println!("  task_call(3-byte ref arg) -> Ffi({})", msg);
         }
-        Err(other) => panic!("3-byte ref arg returned unexpected error variant: {}", other),
+        Err(other) => panic!(
+            "3-byte ref arg returned unexpected error variant: {}",
+            other
+        ),
         Ok(_) => panic!("3-byte ref arg was unexpectedly submitted"),
     }
     let empty: [u8; 0] = [];
@@ -761,7 +792,10 @@ async fn id_width_rejections(ray: &Ray, cluster: bool) {
             );
             println!("  task_call(0-byte ref arg) -> Ffi({})", msg);
         }
-        Err(other) => panic!("0-byte ref arg returned unexpected error variant: {}", other),
+        Err(other) => panic!(
+            "0-byte ref arg returned unexpected error variant: {}",
+            other
+        ),
         Ok(_) => panic!("0-byte ref arg was unexpectedly submitted"),
     }
 
@@ -789,7 +823,10 @@ async fn id_width_rejections(ray: &Ray, cluster: bool) {
                 );
                 println!("  actor_call({} actor id) -> Ffi({})", label, msg);
             }
-            Err(other) => panic!("{} actor id returned unexpected error variant: {}", label, other),
+            Err(other) => panic!(
+                "{} actor id returned unexpected error variant: {}",
+                label, other
+            ),
             Ok(_) => panic!("{} actor id was unexpectedly accepted", label),
         }
     }
@@ -872,12 +909,8 @@ async fn main() {
     id_width_rejections(&ray, cluster).await;
 
     if !cluster {
-        println!(
-            "\nnote: steps 1 and 2 in local mode resolve refs via Runtime()->Get(id)"
-        );
-        println!(
-            "in build_task_args_cpp before submission; cluster mode passes the object id"
-        );
+        println!("\nnote: steps 1 and 2 in local mode resolve refs via Runtime()->Get(id)");
+        println!("in build_task_args_cpp before submission; cluster mode passes the object id");
         println!("to core worker to deliver the object value to the worker");
     }
 

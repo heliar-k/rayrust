@@ -132,10 +132,7 @@ fn main() {
                 ),
             }
         }
-        Err(error) => panic!(
-            "empty function name was unexpectedly refused: {:?}",
-            error
-        ),
+        Err(error) => panic!("empty function name was unexpectedly refused: {:?}", error),
     }
     check_control(&ray, "control after empty function name");
 

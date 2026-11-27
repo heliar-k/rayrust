@@ -76,14 +76,23 @@ fn expect_rejected<T>(
     match result {
         Err(RayError::Ffi(message)) => {
             if !message.contains(sentence) {
-                fail(format!("{}: error message missing expected phrase: {}", label, message));
+                fail(format!(
+                    "{}: error message missing expected phrase: {}",
+                    label, message
+                ));
             }
             if !message.contains("ray_wait") {
-                fail(format!("{}: error message missing entry name: {}", label, message));
+                fail(format!(
+                    "{}: error message missing entry name: {}",
+                    label, message
+                ));
             }
             println!("  {} -> Ffi({})", label, message);
         }
-        Err(other) => fail(format!("{}: returned unexpected error variant: {}", label, other)),
+        Err(other) => fail(format!(
+            "{}: returned unexpected error variant: {}",
+            label, other
+        )),
         Ok((ready, unready)) => fail(format!(
             "{}: unexpectedly succeeded, ready={}, unready={}",
             label,

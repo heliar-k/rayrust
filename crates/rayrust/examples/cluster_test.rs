@@ -13,10 +13,9 @@ fn greet(name: String) -> String {
 }
 
 fn main() {
-    let address = std::env::var("RAY_ADDRESS")
-        .unwrap_or_else(|_| "192.168.42.141:6379".to_string());
-    let node_ip = std::env::var("RAY_NODE_IP")
-        .unwrap_or_else(|_| "192.168.42.106".to_string());
+    let address =
+        std::env::var("RAY_ADDRESS").unwrap_or_else(|_| "192.168.42.141:6379".to_string());
+    let node_ip = std::env::var("RAY_NODE_IP").unwrap_or_else(|_| "192.168.42.106".to_string());
 
     // Register remote functions BEFORE init
     println!("Registering remote functions...");
@@ -24,7 +23,10 @@ fn main() {
     greet_register();
     println!("✓ Functions registered");
 
-    println!("\nConnecting to Ray cluster at {} (node_ip={}) ...", address, node_ip);
+    println!(
+        "\nConnecting to Ray cluster at {} (node_ip={}) ...",
+        address, node_ip
+    );
     let config = RayConfig::new(&address).node_ip(&node_ip);
     let ray = match Ray::connect(&config) {
         Ok(ray) => {

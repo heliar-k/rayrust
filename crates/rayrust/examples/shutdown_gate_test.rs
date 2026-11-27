@@ -545,7 +545,8 @@ fn main() {
     } else {
         cluster_config()
     };
-    let ray = Ray::connect(&config).unwrap_or_else(|e| fail(format!("initial connect failed: {}", e)));
+    let ray =
+        Ray::connect(&config).unwrap_or_else(|e| fail(format!("initial connect failed: {}", e)));
     let obj = ray
         .put(&12345i64)
         .unwrap_or_else(|e| fail(format!("initial put failed: {}", e)));
@@ -808,7 +809,10 @@ fn main() {
             ));
         }
         if !mid_empty {
-            fail("in-flight ray_put during drain was not refused (returned non-empty id)".to_string());
+            fail(
+                "in-flight ray_put during drain was not refused (returned non-empty id)"
+                    .to_string(),
+            );
         }
         if mid_raw_kind != RAY_ERROR_KIND_RUNTIME_RAW || mid_kind != ErrorKind::Runtime {
             fail(format!(
@@ -820,11 +824,17 @@ fn main() {
             Some(ref text) if text.contains(EXPECTED_CLOSING_MESSAGE) => {
                 println!("  ray_put during drain refused: Runtime({})", text);
             }
-            other => fail(format!("in-flight ray_put error message mismatch: {:?}", other)),
+            other => fail(format!(
+                "in-flight ray_put error message mismatch: {:?}",
+                other
+            )),
         }
 
         if !mid_xlang_empty {
-            fail("in-flight ray_put_xlang during drain was not refused (returned non-empty id)".to_string());
+            fail(
+                "in-flight ray_put_xlang during drain was not refused (returned non-empty id)"
+                    .to_string(),
+            );
         }
         if mid_xlang_raw_kind != RAY_ERROR_KIND_RUNTIME_RAW || mid_xlang_kind != ErrorKind::Runtime
         {

@@ -121,7 +121,10 @@ fn main() {
     assert_eq!(value, 42, "put + get after refusal returned {}", value);
     println!("  process alive, put + get returned {}", value);
 
-    println!("\n--- 2. Empty function name + name(\"{}\") ---", REFUSED_NAME);
+    println!(
+        "\n--- 2. Empty function name + name(\"{}\") ---",
+        REFUSED_NAME
+    );
     expect_refused(
         "actor_create(\"\", name)",
         ray.actor_create("", &[], &ActorOptions::new().name(REFUSED_NAME)),
@@ -132,7 +135,10 @@ fn main() {
             "refused creation registered the name and returned {}-byte id",
             handle.id().len()
         ),
-        Err(error) => panic!("get_actor(\"{}\") returned error: {:?}", REFUSED_NAME, error),
+        Err(error) => panic!(
+            "get_actor(\"{}\") returned error: {:?}",
+            REFUSED_NAME, error
+        ),
     }
 
     println!("\n--- 3. Whitespace-only function name ---");

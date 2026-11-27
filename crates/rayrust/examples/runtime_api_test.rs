@@ -495,7 +495,10 @@ fn actor_name_boundary_checks(ray: &Ray) {
             );
             println!("  get_actor(\"\", \"\") -> Ffi({})", message);
         }
-        Err(other) => panic!("get_actor(\"\", \"\") returned unexpected error variant: {}", other),
+        Err(other) => panic!(
+            "get_actor(\"\", \"\") returned unexpected error variant: {}",
+            other
+        ),
         Ok(found) => panic!(
             "get_actor(\"\", \"\") returned Ok(found={})",
             found.is_some()
@@ -527,7 +530,9 @@ fn actor_name_boundary_checks(ray: &Ray) {
     }
     match ray.get_actor(" ", "") {
         Ok(None) => {
-            println!("  get_actor(\" \", \"\") -> Ok(None) (whitespace-only name is valid, not trimmed)")
+            println!(
+                "  get_actor(\" \", \"\") -> Ok(None) (whitespace-only name is valid, not trimmed)"
+            )
         }
         Ok(Some(handle)) => panic!(
             "get_actor(\" \") unexpectedly found {}-byte id",
@@ -726,7 +731,10 @@ fn placement_group_rejections(ray: &Ray) {
                 );
                 println!("  by_id({}) -> Ffi({})", label, message);
             }
-            Err(other) => panic!("by_id({}) returned unexpected error variant: {}", label, other),
+            Err(other) => panic!(
+                "by_id({}) returned unexpected error variant: {}",
+                label, other
+            ),
             Ok(group) => panic!("by_id({}) unexpectedly returned {:?}", label, group),
         }
         match ray.placement_group_wait_ready(&id, 1) {
@@ -739,7 +747,10 @@ fn placement_group_rejections(ray: &Ray) {
                 );
                 println!("  wait_ready({}) -> Ffi({})", label, message);
             }
-            Err(other) => panic!("wait_ready({}) returned unexpected error variant: {}", label, other),
+            Err(other) => panic!(
+                "wait_ready({}) returned unexpected error variant: {}",
+                label, other
+            ),
             Ok(ready) => panic!("wait_ready({}) unexpectedly returned {}", label, ready),
         }
     }
@@ -763,7 +774,10 @@ fn placement_group_rejections(ray: &Ray) {
             );
             println!("  by_id(unknown 18-byte) -> Ffi({})", message);
         }
-        Err(other) => panic!("unknown 18-byte id returned unexpected error variant: {}", other),
+        Err(other) => panic!(
+            "unknown 18-byte id returned unexpected error variant: {}",
+            other
+        ),
         Ok(group) => panic!("unknown 18-byte id unexpectedly returned {:?}", group),
     }
 
@@ -798,7 +812,10 @@ fn placement_group_remove_checks(ray: &Ray) {
                 );
                 println!("  remove({}) -> Ffi({})", label, message);
             }
-            Err(other) => panic!("remove({}) returned unexpected error variant: {}", label, other),
+            Err(other) => panic!(
+                "remove({}) returned unexpected error variant: {}",
+                label, other
+            ),
             Ok(()) => panic!("remove({}) unexpectedly succeeded", label),
         }
     }
@@ -873,8 +890,7 @@ fn placement_group_remove_checks(ray: &Ray) {
         group_id.len(),
         hex(&group_id)
     );
-    ray.placement_group_remove(&group_id)
-        .expect("first remove");
+    ray.placement_group_remove(&group_id).expect("first remove");
     println!("  first remove -> Ok(())");
     match ray.placement_group_remove(&group_id) {
         Ok(()) => println!("  second remove -> Ok(())"),
@@ -957,8 +973,14 @@ async fn exit_actor_check(ray: &Ray, cluster: bool) {
             .expect("submit get after exit")
             .get_timeout(GET_TIMEOUT_MS)
             .expect("actor must stay usable after local mode exit_actor()");
-        assert_eq!(after, 9, "local mode exit_actor() should not alter actor state");
-        println!("  get() after exit -> {} (actor still alive, state unchanged)", after);
+        assert_eq!(
+            after, 9,
+            "local mode exit_actor() should not alter actor state"
+        );
+        println!(
+            "  get() after exit -> {} (actor still alive, state unchanged)",
+            after
+        );
         return;
     }
 
@@ -974,7 +996,10 @@ async fn exit_actor_check(ray: &Ray, cluster: bool) {
     };
     match after {
         Err(RayError::Actor(message)) => println!("  get() after exit -> Actor({})", message),
-        Err(other) => panic!("get() after exit returned unexpected error variant: {}", other),
+        Err(other) => panic!(
+            "get() after exit returned unexpected error variant: {}",
+            other
+        ),
         Ok(value) => panic!(
             "get() after actor exit still returned {} (restarted despite max_restarts=2)",
             value
@@ -996,7 +1021,8 @@ async fn exit_actor_check(ray: &Ray, cluster: bool) {
     // 「actor 永远没了」与「这次调用正好在重启窗口里」。
     let control_name = format!("rayrust_runtime_api_restart_{}", std::process::id());
     let control_opts = ActorOptions::new().name(control_name).max_restarts(2);
-    let control = selfexiting_actor_create(ray, &control_opts, 7).expect("create restart control actor");
+    let control =
+        selfexiting_actor_create(ray, &control_opts, 7).expect("create restart control actor");
     let before_kill = selfexiting_increment_sync(ray, &control, 2)
         .expect("control actor increment")
         .get_timeout(GET_TIMEOUT_MS)
@@ -1110,8 +1136,14 @@ async fn ctor_exit_check(ray: &Ray, cluster: bool) {
             "  first get() -> Actor({}) (creation task failed, actor never started)",
             message
         ),
-        Err(other) => panic!("after constructor exit get() returned unexpected error: {}", other),
-        Ok(value) => panic!("after constructor exit_actor() get() unexpectedly returned {}", value),
+        Err(other) => panic!(
+            "after constructor exit get() returned unexpected error: {}",
+            other
+        ),
+        Ok(value) => panic!(
+            "after constructor exit_actor() get() unexpectedly returned {}",
+            value
+        ),
     }
     println!("  process alive: neither actor_create nor get hung or crashed");
 }
@@ -1227,8 +1259,14 @@ async fn local_mode_rejections(ray: &Ray) {
             );
             println!("  placement_groups -> Ffi({})", message);
         }
-        Err(other) => panic!("local mode placement_groups returned unexpected error: {}", other),
-        Ok(groups) => panic!("local mode placement_groups returned {} groups", groups.len()),
+        Err(other) => panic!(
+            "local mode placement_groups returned unexpected error: {}",
+            other
+        ),
+        Ok(groups) => panic!(
+            "local mode placement_groups returned {} groups",
+            groups.len()
+        ),
     }
     match ray.placement_group_by_id(&group_id) {
         Err(RayError::Ffi(message)) => {
@@ -1296,7 +1334,10 @@ async fn local_mode_rejections(ray: &Ray) {
             println!("  serialize -> Ffi({})", message);
         }
         Err(other) => panic!("local mode serialize returned unexpected error: {}", other),
-        Ok(bytes) => panic!("local mode serialize unexpectedly returned {} bytes", bytes.len()),
+        Ok(bytes) => panic!(
+            "local mode serialize unexpectedly returned {} bytes",
+            bytes.len()
+        ),
     }
     // 载荷畸形的：载荷校验在本地模式判定之前，错误文本里没有 local mode。
     match ActorHandle::from_serialized(&[1u8, 2, 3]) {
@@ -1420,9 +1461,9 @@ async fn local_mode_rejections(ray: &Ray) {
         ),
     }
     match ray.get_actor(python_name, "") {
-        Ok(None) => println!(
-            "  get_actor({python_name}) -> None (name not added to local name table)"
-        ),
+        Ok(None) => {
+            println!("  get_actor({python_name}) -> None (name not added to local name table)")
+        }
         Ok(Some(handle)) => panic!(
             "refused creation registered name and get_actor returned {}-byte id",
             handle.id().len()

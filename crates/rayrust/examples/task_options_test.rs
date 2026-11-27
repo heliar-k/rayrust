@@ -298,7 +298,9 @@ async fn name_and_placement_group_check(ray: &Ray, cluster: bool) {
 
     // e) 引用变成失败，不再继续等资源。
     match queued.get_timeout(PG_BOUND_TIMEOUT_MS) {
-        Err(RayError::Timeout(_)) => panic!("task still timed out waiting for resources after cancel"),
+        Err(RayError::Timeout(_)) => {
+            panic!("task still timed out waiting for resources after cancel")
+        }
         Err(other) => println!("  read after cancel -> {} (ref failed)", other),
         Ok(v) => panic!("cancelled task unexpectedly returned Ok({})", v),
     }
@@ -356,7 +358,9 @@ async fn unknown_pg_check(ray: &Ray) {
         ..Default::default()
     };
     match ray.task_call("env_check", &[&name], &[], &standalone) {
-        Err(RayError::Ffi(msg)) => println!("  standalone bundle_index=0 (no group) -> Ffi({})", msg),
+        Err(RayError::Ffi(msg)) => {
+            println!("  standalone bundle_index=0 (no group) -> Ffi({})", msg)
+        }
         Err(other) => panic!(
             "standalone bundle_index returned unexpected error variant: {}",
             other

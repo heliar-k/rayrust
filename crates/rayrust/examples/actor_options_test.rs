@@ -235,8 +235,7 @@ fn create_actor_with_raw_options(options_json: &str) -> Result<Vec<u8>, RayError
             options_json,
             kind
         );
-        let message =
-            rayrust::sys::last_error().unwrap_or_else(|| "no error recorded".to_string());
+        let message = rayrust::sys::last_error().unwrap_or_else(|| "no error recorded".to_string());
         return Err(RayError::Ffi(message));
     }
     let id = unsafe { std::slice::from_raw_parts(bytes.data as *const u8, bytes.len) }.to_vec();
@@ -262,8 +261,7 @@ fn create_python_actor_with_raw_options(options_json: &str) -> Result<Vec<u8>, R
         )
     };
     if bytes.data.is_null() {
-        let message =
-            rayrust::sys::last_error().unwrap_or_else(|| "no error recorded".to_string());
+        let message = rayrust::sys::last_error().unwrap_or_else(|| "no error recorded".to_string());
         return Err(RayError::Ffi(message));
     }
     let id = unsafe { std::slice::from_raw_parts(bytes.data as *const u8, bytes.len) }.to_vec();
@@ -299,8 +297,7 @@ fn create_task_with_raw_options(options_json: &str) -> Result<Vec<u8>, RayError>
             options_json,
             kind
         );
-        let message =
-            rayrust::sys::last_error().unwrap_or_else(|| "no error recorded".to_string());
+        let message = rayrust::sys::last_error().unwrap_or_else(|| "no error recorded".to_string());
         return Err(RayError::Ffi(message));
     }
     let id = unsafe { std::slice::from_raw_parts(bytes.data as *const u8, bytes.len) }.to_vec();
@@ -412,7 +409,10 @@ async fn bundle_index_range_check(ray: &Ray, cluster: bool) {
             "-4294967297",
             "= -(2^32+1); get<int>() truncates to -1 (any bundle)",
         ),
-        ("-2147483649", "= -(2^31+1); get<int>() truncates to 2147483647"),
+        (
+            "-2147483649",
+            "= -(2^31+1); get<int>() truncates to 2147483647",
+        ),
         ("9999999999999", "get<int>() truncates to 1316134911"),
         (
             "18446744073709551615",
@@ -559,7 +559,10 @@ async fn default_bundle_index_not_pinned_check(ray: &Ray, cluster: bool) {
         resources: vec![("CPU".to_string(), 1.0)],
         ..Default::default()
     };
-    assert_eq!(default_opts.bundle_index, -1, "default bundle_index is not -1");
+    assert_eq!(
+        default_opts.bundle_index, -1,
+        "default bundle_index is not -1"
+    );
     let unpinned =
         counter_actor_create(ray, &default_opts, 3i64).expect("create default-options actor");
     let started = Instant::now();
@@ -598,7 +601,10 @@ async fn default_bundle_index_not_pinned_check(ray: &Ray, cluster: bool) {
             started.elapsed(),
             msg
         ),
-        Err(other) => panic!("bundle-0 actor returned unexpected error variant: {}", other),
+        Err(other) => panic!(
+            "bundle-0 actor returned unexpected error variant: {}",
+            other
+        ),
         Ok(value) => panic!(
             "bundle-0 actor finished ({}) while bundle 0 was held by long task",
             value
@@ -668,7 +674,8 @@ async fn local_mode_check(ray: &Ray, cluster: bool) {
         "local mode",
     );
 
-    let handle = counter_actor_create(ray, &ActorOptions::new(), 11i64).expect("create local Counter");
+    let handle =
+        counter_actor_create(ray, &ActorOptions::new(), 11i64).expect("create local Counter");
     let value: i64 = counter_get(ray, &handle)
         .await
         .expect("submit get")
@@ -759,7 +766,11 @@ async fn actor_language_checks(ray: &Ray, cluster: bool) {
         .expect("submit get")
         .get_timeout(GET_TIMEOUT_MS)
         .expect("read get");
-    assert_eq!(value, 31, "C++ actor get() after rejections returned {}", value);
+    assert_eq!(
+        value, 31,
+        "C++ actor get() after rejections returned {}",
+        value
+    );
     println!(
         "  C++ actor get() after rejections = {} (process and runtime alive)",
         value
@@ -796,11 +807,7 @@ async fn actor_language_checks(ray: &Ray, cluster: bool) {
         .expect("submit get")
         .get_timeout(ACTOR_START_TIMEOUT_MS)
         .expect("read get");
-    assert_eq!(
-        value, 1,
-        "C++ actor from get_actor returned {}",
-        value
-    );
+    assert_eq!(value, 1, "C++ actor from get_actor returned {}", value);
     println!("  control: C++ actor from get_actor -> get() = {}", value);
 
     let python_name = "__rayrust_named_python_actor";
@@ -904,7 +911,10 @@ async fn default_actor_cpu_check(ray: &Ray, cluster: bool) {
             started.elapsed(),
             msg
         ),
-        Err(other) => panic!("Custom-1-only actor returned unexpected error variant: {}", other),
+        Err(other) => panic!(
+            "Custom-1-only actor returned unexpected error variant: {}",
+            other
+        ),
         Ok(value) => panic!(
             "Custom-1-only actor finished ({}) while both CPUs were held (missing default CPU)",
             value
@@ -938,7 +948,10 @@ async fn default_actor_cpu_check(ray: &Ray, cluster: bool) {
         .get_timeout(ACTOR_START_TIMEOUT_MS)
         .expect("actor without resources must finish within deadline");
     assert_eq!(value, 44, "actor without resources returned {}", value);
-    println!("  actor without resources -> get() = {} (takes 0 CPU)", value);
+    println!(
+        "  actor without resources -> get() = {} (takes 0 CPU)",
+        value
+    );
 
     // f) 只有内存键：不补 CPU，照样完成。
     let memory_only_opts = ActorOptions::new().resource("memory", 1.0);
@@ -950,7 +963,10 @@ async fn default_actor_cpu_check(ray: &Ray, cluster: bool) {
         .get_timeout(ACTOR_START_TIMEOUT_MS)
         .expect("memory-only actor must finish within deadline");
     assert_eq!(value, 45, "memory-only actor returned {}", value);
-    println!("  memory-1-only actor -> get() = {} (no default CPU added)", value);
+    println!(
+        "  memory-1-only actor -> get() = {} (no default CPU added)",
+        value
+    );
 
     // g) 把两个 CPU 还回去，前面两条排队的调用都要完成。
     ray.cancel(first.id(), false, true)
@@ -966,7 +982,10 @@ async fn default_actor_cpu_check(ray: &Ray, cluster: bool) {
         let value: i64 = call
             .get_timeout(ACTOR_START_TIMEOUT_MS)
             .unwrap_or_else(|error| {
-                panic!("{} actor call still did not finish after releasing CPUs: {}", label, error)
+                panic!(
+                    "{} actor call still did not finish after releasing CPUs: {}",
+                    label, error
+                )
             });
         assert_eq!(value, expected, "{} actor returned {}", label, value);
         println!(
